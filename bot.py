@@ -44,7 +44,6 @@ cursor.execute(
 """
 )
 
-# Автоматически добавляем стобец premium_expires, если база уже существовала
 try:
   cursor.execute("ALTER TABLE users ADD COLUMN premium_expires TEXT DEFAULT NULL")
 except Exception:
@@ -62,11 +61,26 @@ cursor.execute(
 """
 )
 
+# Таблица промокодов с поддержкой типов, наград и лимитов
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS promocodes (
         code TEXT PRIMARY KEY,
-        reward_tokens INTEGER
+        reward_type TEXT,
+        reward_value TEXT,
+        max_uses INTEGER,
+        used_count INTEGER DEFAULT 0
+    )
+"""
+)
+
+# Таблица для отслеживания, кто какой промокод уже активировал (чтобы один юзер не ввел дважды)
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS promo_activations (
+        user_id INTEGER,
+        code TEXT,
+        PRIMARY KEY (user_id, code)
     )
 """
 )
@@ -89,8 +103,10 @@ class PromocodeState(StatesGroup):
 
 
 class CreatePromoState(StatesGroup):
-  code = State()
-  reward = State()
+  code = State(): str
+  type = State()
+  value = State()
+  uses = State()
 
 
 class GivePremiumState(StatesGroup):
@@ -221,7 +237,6 @@ async def cmd_start(message: Message, bot: Bot):
   )
 
 
-# Кнопка проверки подписки
 @router.callback_query(F.data == "check_sub")
 async def process_check_sub(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
@@ -275,7 +290,6 @@ async def menu_router(message: Message, bot: Bot):
     bought = user_data[2] if user_data else 0
     prem_expires_str = user_data[3] if user_data else None
 
-    # Проверка срока действия премиума
     prem_status = "❌ Не активна"
     if is_prem == 1 and prem_expires_str:
       try:
@@ -288,7 +302,6 @@ async def menu_router(message: Message, bot: Bot):
           formatted_date = expire_date.strftime("%d.%m.%Y")
           prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
         else:
-          # Срок истек
           cursor.execute(
               "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
               " user_id = ?",
@@ -437,6 +450,7 @@ async def menu_router(message: Message, bot: Bot):
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
 
 
+# --- АКТИВАЦИЯ ПРОМОКОДА ПОЛЬЗОВАТЕЛЕМ ---
 @router.callback_query(F.data == "enter_promocode")
 async def promo_prompt(callback: CallbackQuery, state: FSMContext):
   await callback.message.answer("🎟 Введите промокод:")
@@ -450,29 +464,81 @@ async def promo_check(message: Message, state: FSMContext):
   code_text = message.text.strip()
   await state.clear()
 
+  # Проверяем, существует ли промокод
   cursor.execute(
-      "SELECT reward_tokens FROM promocodes WHERE code = ?", (code_text,)
+      "SELECT reward_type, reward_value, max_uses, used_count FROM promocodes"
+      " WHERE code = ?",
+      (code_text,),
   )
   promo = cursor.fetchone()
 
   if not promo:
-    await message.answer("❌ Неверный или уже использованный промокод.")
+    await message.answer("❌ Неверный или уже истекший промокод.")
     return
 
-  reward = promo[0]
+  reward_type, reward_value, max_uses, used_count = promo
+
+  # Проверяем, активировал ли пользователь этот промокод ранее
   cursor.execute(
-      "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-      (reward, user_id),
+      "SELECT 1 FROM promo_activations WHERE user_id = ? AND code = ?",
+      (user_id, code_text),
   )
-  cursor.execute("DELETE FROM promocodes WHERE code = ?", (code_text,))
+  if cursor.fetchone():
+    await message.answer("❌ Вы уже активировали этот промокод!")
+    return
+
+  # Проверяем лимит использований
+  if max_uses > 0 and used_count >= max_uses:
+    await message.answer(
+        "❌ У этого промокода закончилось количество активаций."
+    )
+    return
+
+  # Начисляем награду в зависимости от типа
+  if reward_type == "tokens":
+    tokens_amount = int(reward_value)
+    cursor.execute(
+        "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+        (tokens_amount, user_id),
+    )
+    conn.commit()
+    await message.answer(
+        f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
+        " токенов**",
+        parse_mode="Markdown",
+    )
+
+  elif reward_type == "premium":
+    days = int(reward_value)
+    expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
+    expire_str = expire_date.strftime("%Y-%m-%d %H:%M:%S")
+    formatted_date = expire_date.strftime("%d.%m.%Y")
+
+    cursor.execute(
+        "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id ="
+        " ?",
+        (expire_str, user_id),
+    )
+    conn.commit()
+    await message.answer(
+        f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
+        f" **{days} дней** (до {formatted_date})!",
+        parse_mode="Markdown",
+    )
+
+  # Фиксируем активацию
+  cursor.execute(
+      "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
+      (user_id, code_text),
+  )
+  cursor.execute(
+      "UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?",
+      (code_text,),
+  )
   conn.commit()
 
-  await message.answer(
-      f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{reward} токенов**",
-      parse_mode="Markdown",
-  )
 
-
+# --- ПОКУПКА ТОВАРОВ ---
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
@@ -513,7 +579,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   referrer_id = u_data[3] if u_data else 0
   prem_expires_str = u_data[4] if u_data else None
 
-  # Проверка премиума при покупке
   if is_prem == 1 and prem_expires_str:
     try:
       expire_date = datetime.datetime.strptime(
@@ -612,7 +677,108 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   await callback.answer()
 
 
-# --- АДМИНСКИЕ ОБРАБОТЧИКИ (ВЫДАЧА ПРЕМИУМА НА СРОК) ---
+# --- АДМИНСКОЕ СОЗДАНИЕ ПРОМОКОДОВ (С НАСТРОЙКОЙ ТИПА И ЛИМИТОВ) ---
+@router.callback_query(F.data == "admin_create_promo")
+async def start_create_promo(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    return
+  await callback.message.answer(
+      "🎟 Введите текст промокода (например: `START100`):", parse_mode="Markdown"
+  )
+  await state.set_state(CreatePromoState.code)
+  await callback.answer()
+
+
+@router.message(CreatePromoState.code)
+async def process_promo_code(message: Message, state: FSMContext):
+  await state.update_data(code=message.text.strip())
+
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="🪙 Токены", callback_data="promo_type_tokens"
+              ),
+              InlineKeyboardButton(
+                  text="👑 Премиум", callback_data="promo_type_premium"
+              ),
+          ]
+      ]
+  )
+  await message.answer(
+      "🎁 Выберите, что будет давать этот промокод:", reply_markup=keyboard
+  )
+
+
+@router.callback_query(F.data.startswith("promo_type_"))
+async def process_promo_type(callback: CallbackQuery, state: FSMContext):
+  p_type = callback.data.split("_")[2]  # tokens или premium
+  await state.update_data(type=p_type)
+
+  if p_type == "tokens":
+    await callback.message.answer(
+        "💰 Введите количество токенов (число, например: 50):"
+    )
+  else:
+    await callback.message.answer(
+        "⏳ Введите количество дней Премиума (число, например: 30):"
+    )
+
+  await state.set_state(CreatePromoState.value)
+  await callback.answer()
+
+
+@router.message(CreatePromoState.value)
+async def process_promo_value(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! Введите целое число.")
+    return
+
+  await state.update_data(value=message.text)
+  await message.answer(
+      "🔢 Введите **количество использований** (лимит активаций, например: 10"
+      " или 100):\n*(Если хотите сделать безлимитным — введите 0)*",
+      parse_mode="Markdown",
+  )
+  await state.set_state(CreatePromoState.uses)
+
+
+@router.message(CreatePromoState.uses)
+async def process_promo_uses(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! Введите число использований.")
+    return
+
+  max_uses = int(message.text)
+  data = await state.get_data()
+
+  code = data["code"]
+  reward_type = data["type"]
+  reward_value = data["value"]
+  await state.clear()
+
+  cursor.execute(
+      "INSERT OR REPLACE INTO promocodes (code, reward_type, reward_value,"
+      " max_uses, used_count) VALUES (?, ?, ?, ?, 0)",
+      (code, reward_type, reward_value, max_uses),
+  )
+  conn.commit()
+
+  uses_text = f"{max_uses} раз" if max_uses > 0 else "Безлимитно"
+  reward_desc = (
+      f"{reward_value} токенов"
+      if reward_type == "tokens"
+      else f"Премиум на {reward_value} дней"
+  )
+
+  await message.answer(
+      f"✅ **Промокод успешно создан!**\n\n🎟 Код: `{code}`\n🎁 Награда:"
+      f" {reward_desc}\n👥 Лимит: {uses_text}",
+      parse_mode="Markdown",
+  )
+
+
+# --- ОСТАЛЬНЫЕ АДМИНСКИЕ ФУНКЦИИ ---
 @router.callback_query(F.data == "admin_give_premium")
 async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -633,7 +799,6 @@ async def process_give_premium_id(message: Message, state: FSMContext):
 
   target_id = int(message.text)
   await state.update_data(target_id=target_id)
-
   await message.answer(
       f"⏳ На сколько **дней** выдать Премиум пользователю `{target_id}`?\n*(Введи"
       " число, например: 30)*",
@@ -653,7 +818,6 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
   target_id = data["target_id"]
   await state.clear()
 
-  # Вычисляем дату окончания
   expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
   expire_str = expire_date.strftime("%Y-%m-%d %H:%M:%S")
   formatted_date = expire_date.strftime("%d.%m.%Y")
@@ -685,49 +849,6 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
     )
   except Exception:
     pass
-
-
-# --- ОСТАЛЬНЫЕ АДМИНСКИЕ ОБРАБОТЧИКИ ---
-@router.callback_query(F.data == "admin_create_promo")
-async def start_create_promo(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    return
-  await callback.message.answer(
-      "🎟 Введите текст промокода (например: `START100`):"
-  )
-  await state.set_state(CreatePromoState.code)
-  await callback.answer()
-
-
-@router.message(CreatePromoState.code)
-async def process_promo_code(message: Message, state: FSMContext):
-  await state.update_data(code=message.text.strip())
-  await message.answer("💰 Введите количество токенов за этот промокод (число):")
-  await state.set_state(CreatePromoState.reward)
-
-
-@router.message(CreatePromoState.reward)
-async def process_promo_reward(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Ошибка! Введите целое число токенов.")
-    return
-
-  reward = int(message.text)
-  data = await state.get_data()
-  code = data["code"]
-  await state.clear()
-
-  cursor.execute(
-      "INSERT OR REPLACE INTO promocodes (code, reward_tokens) VALUES (?, ?)",
-      (code, reward),
-  )
-  conn.commit()
-
-  await message.answer(
-      f"✅ Промокод успешно создан!\n\n🎟 Код: `{code}`\n🎁 Награда: {reward}"
-      " токенов",
-      parse_mode="Markdown",
-  )
 
 
 @router.callback_query(F.data == "add_product")
