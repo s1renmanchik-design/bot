@@ -29,7 +29,8 @@ db_pool = None
 
 async def init_db():
   global db_pool
-  db_pool = await asyncpg.create_pool(DATABASE_URL)
+  # Добавлен параметр ssl="require" для стабильного подключения к Supabase
+  db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
 
   async with db_pool.acquire() as connection:
     await connection.execute(
@@ -235,7 +236,7 @@ async def process_check_sub(callback: CallbackQuery, bot: Bot):
     )
 
 
-# --- FSM ХЕНДЛЕРЫ (должны идти до обычных текстовых кнопок) ---
+# --- FSM ХЕНДЛЕРЫ ---
 
 
 @router.message(PromocodeState.code)
@@ -543,7 +544,7 @@ async def send_broadcast(message: Message, state: FSMContext):
     )
 )
 async def menu_router(message: Message, bot: Bot, state: FSMContext):
-  await state.clear()  # Сбрасываем старые FSM состояния при нажатии на меню
+  await state.clear()
   user_id = message.from_user.id
   if not await check_subscription(user_id, bot):
     await not_subscribed_message(message)
