@@ -32,7 +32,8 @@ cursor.execute(
         user_id INTEGER PRIMARY KEY,
         tokens INTEGER DEFAULT 0,
         is_premium INTEGER DEFAULT 0,
-        bought_folders INTEGER DEFAULT 0
+        bought_folders INTEGER DEFAULT 0,
+        referrer_id INTEGER DEFAULT 0
     )
 """
 )
@@ -89,17 +90,70 @@ def get_main_keyboard(user_id):
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-# --- КОМАНДА /start ---
+# --- КОМАНДА /start С РЕФЕРАЛКОЙ ---
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, bot: Bot):
   user_id = message.from_user.id
+  args = message.text.split()
 
-  cursor.execute(
-      "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
-      " bought_folders) VALUES (?, 0, 0, 0)",
-      (user_id,),
-  )
-  conn.commit()
+  # Проверяем, есть ли реферальный аргумент (например, /start 5681420389)
+  referrer_id = None
+  if len(args) > 1 and args[1].isdigit():
+    potential_ref = int(args[1])
+    if potential_ref != user_id:  штука, чтобы не регал сам себя
+      referrer_id = potential_ref
+
+  # Проверяем, существует ли уже пользователь в базе
+  cursor.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
+  existing_user = cursor.fetchone()
+
+  if existing_user is None:
+    # Новый пользователь
+    ref_to_save = referrer_id if referrer_id else 0
+    cursor.execute(
+        "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
+        " referrer_id) VALUES (?, 0, 0, 0, ?)",
+        (user_id, ref_to_save),
+    )
+    conn.commit()
+
+    # Если реферер указан, начисляем ему 15 токенов и уведомляем
+    if referrer_id:
+      cursor.execute(
+          "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
+          (referrer_id,),
+      )
+      conn.commit()
+      try:
+        await bot.send_message(
+            referrer_id,
+            "🎉 **По реферальной ссылке зарегистрировался новый пользователь!**\n🎁"
+            " Вам начислено бонусных **15 токенов**!",
+            parse_mode="Markdown",
+        )
+      except Exception:
+        pass
+  else:
+    # Если пользователь уже есть, но referrer_id не был задан, а сейчас перешел по рефке
+    if existing_user[0] == 0 and referrer_id:
+      cursor.execute(
+          "UPDATE users SET referrer_id = ? WHERE user_id = ?",
+          (referrer_id, user_id),
+      )
+      cursor.execute(
+          "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
+          (referrer_id,),
+      )
+      conn.commit()
+      try:
+        await bot.send_message(
+            referrer_id,
+            "🎉 **По вашей реферальной ссылке активировался пользователь!**\n🎁"
+            " Вам начислено бонусных **15 токенов**!",
+            parse_mode="Markdown",
+        )
+      except Exception:
+        pass
 
   await message.answer(
       "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре"
@@ -162,11 +216,15 @@ async def promo_check(message: Message, state: FSMContext):
 async def referral_handler(message: Message):
   bot_info = await message.bot.get_me()
   ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
-  await message.answer(
-      "👥 **Реферальная система**\n\nПриглашай друзей по своей ссылке и получай"
-      f" бонусы:\n`{ref_link}`",
-      parse_mode="Markdown",
+  text = (
+      "👥 **Реферальная система**\n\n"
+      "Приглашай друзей по своей персональной ссылке:\n"
+      f"`{ref_link}`\n\n"
+      "🎁 **Бонусы:**\n"
+      "• За каждого приглашенного друга вы получаете **15 токенов**!\n"
+      "• Получайте **15%** от суммы всех покупок токенами ваших рефералов!"
   )
+  await message.answer(text, parse_mode="Markdown")
 
 
 @router.message(F.text == "🪙 Как получить токены?")
@@ -245,7 +303,7 @@ async def shop_handler(message: Message):
 
 
 @router.callback_query(F.data.startswith("buy_"))
-async def process_buy(callback: CallbackQuery):
+async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
   p_id = int(callback.data.split("_")[1])
 
@@ -261,15 +319,15 @@ async def process_buy(callback: CallbackQuery):
 
   title, price_raw, link, buyers_count = product
 
-  # Преобразуем цену в число (если введено просто "15" или "15 токенов")
   try:
     base_price = int("".join(filter(str.isdigit, str(price_raw))))
   except ValueError:
     base_price = 0
 
-  # Получаем данные пользователя
+  # Получаем данные пользователя (включая его referrer_id)
   cursor.execute(
-      "SELECT tokens, is_premium, bought_folders FROM users WHERE user_id = ?",
+      "SELECT tokens, is_premium, bought_folders, referrer_id FROM users WHERE"
+      " user_id = ?",
       (user_id,),
   )
   u_data = cursor.fetchone()
@@ -277,6 +335,7 @@ async def process_buy(callback: CallbackQuery):
   tokens = u_data[0] if u_data else 0
   is_prem = u_data[1] if u_data else 0
   bought_folders = u_data[2] if u_data else 0
+  referrer_id = u_data[3] if u_data else 0
 
   # Если есть Премиум — выдаем бесплатно
   if is_prem == 1:
@@ -300,13 +359,13 @@ async def process_buy(callback: CallbackQuery):
     await callback.answer()
     return
 
-  # Считаем итоговую цену со скидкой 80% для первого покупателя
+  # Считаем цену со скидкой 80% для первого покупателя
   if buyers_count == 0:
-    final_price = max(1, int(base_price * 0.2))  # Скидка 80% (20% от цены)
+    final_price = max(1, int(base_price * 0.2))
   else:
     final_price = base_price
 
-  # Проверяем баланс токенов
+  # Проверяем баланс
   if tokens < final_price:
     await callback.answer(
         f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
@@ -315,7 +374,7 @@ async def process_buy(callback: CallbackQuery):
     )
     return
 
-  # Списываем токены и обновляем покупки
+  # Списываем токены у покупателя и обновляем покупки
   new_tokens = tokens - final_price
   new_buyers_count = buyers_count + 1
 
@@ -328,6 +387,25 @@ async def process_buy(callback: CallbackQuery):
       (new_buyers_count, p_id),
   )
   conn.commit()
+
+  # Начисляем 15% рефереру (с округлением)
+  if referrer_id and referrer_id != 0:
+    ref_bonus = round(final_price * 0.15)
+    if ref_bonus > 0:
+      cursor.execute(
+          "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+          (ref_bonus, referrer_id),
+      )
+      conn.commit()
+      try:
+        await bot.send_message(
+            referrer_id,
+            f"💰 **Реферальный бонус!**\nВаш реферал совершил покупку.\n🎁 Вам"
+            f" начислено **{ref_bonus} токенов** (15% от покупки).",
+            parse_mode="Markdown",
+        )
+      except Exception:
+        pass
 
   if buyers_count == 0:
     text = (
@@ -412,7 +490,7 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
 
   cursor.execute(
       "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
-      " bought_folders) VALUES (?, 0, 1, 0)",
+      " bought_folders, referrer_id) VALUES (?, 0, 1, 0, 0)",
       (target_id,),
   )
   cursor.execute(
