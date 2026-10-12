@@ -1,7 +1,7 @@
 import asyncio
 import datetime
 import os
-import asyncpg
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -16,57 +16,61 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-# ТОКЕН И БАЗА ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER
+# ТОКЕН ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER
 TOKEN = os.getenv("TOKEN", "8549927929:AAE_aDtLHVjkR9h50ABM233OZprEa6l-GvM")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
 CHANNEL_ID = -1002925107145
 CHANNEL_USERNAME = "iiris_cnn_bot"
 
-db_pool = None
-
 
 async def init_db():
-  global db_pool
-  # Добавлен параметр ssl="require" для стабильного подключения к Supabase
-  db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
-
-  async with db_pool.acquire() as connection:
-    await connection.execute(
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            tokens INT DEFAULT 0,
-            is_premium INT DEFAULT 0,
-            bought_folders INT DEFAULT 0,
-            referrer_id BIGINT DEFAULT 0,
-            premium_expires TIMESTAMP DEFAULT NULL
+            user_id INTEGER PRIMARY KEY,
+            tokens INTEGER DEFAULT 0,
+            is_premium INTEGER DEFAULT 0,
+            bought_folders INTEGER DEFAULT 0,
+            referrer_id INTEGER DEFAULT 0,
+            premium_expires TEXT DEFAULT NULL
         );
-        
+    """
+    )
+    await db.execute(
+        """
         CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             price TEXT,
             link TEXT,
-            buyers_count INT DEFAULT 0
+            buyers_count INTEGER DEFAULT 0
         );
-
+    """
+    )
+    await db.execute(
+        """
         CREATE TABLE IF NOT EXISTS promocodes (
             code TEXT PRIMARY KEY,
             reward_type TEXT,
             reward_value TEXT,
-            max_uses INT,
-            used_count INT DEFAULT 0
+            max_uses INTEGER,
+            used_count INTEGER DEFAULT 0
         );
-
+    """
+    )
+    await db.execute(
+        """
         CREATE TABLE IF NOT EXISTS promo_activations (
-            user_id BIGINT,
+            user_id INTEGER,
             code TEXT,
             PRIMARY KEY (user_id, code)
         );
     """
     )
+    await db.commit()
 
 
 # Состояния FSM
@@ -166,24 +170,26 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
     if potential_ref != user_id:
       referrer_id = potential_ref
 
-  async with db_pool.acquire() as conn:
-    existing_user = await conn.fetchrow(
-        "SELECT referrer_id FROM users WHERE user_id = $1", user_id
-    )
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
+    ) as cursor:
+      existing_user = await cursor.fetchone()
 
     if existing_user is None:
       ref_to_save = referrer_id if referrer_id else 0
-      await conn.execute(
+      await db.execute(
           "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-          " referrer_id) VALUES ($1, 0, 0, 0, $2)",
-          user_id,
-          ref_to_save,
+          " referrer_id) VALUES (?, 0, 0, 0, ?)",
+          (user_id, ref_to_save),
       )
+      await db.commit()
       if referrer_id:
-        await conn.execute(
-            "UPDATE users SET tokens = tokens + 15 WHERE user_id = $1",
-            referrer_id,
+        await db.execute(
+            "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
+            (referrer_id,),
         )
+        await db.commit()
         try:
           await bot.send_message(
               referrer_id,
@@ -193,16 +199,16 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
         except Exception:
           pass
     else:
-      if existing_user["referrer_id"] == 0 and referrer_id:
-        await conn.execute(
-            "UPDATE users SET referrer_id = $1 WHERE user_id = $2",
-            referrer_id,
-            user_id,
+      if existing_user[0] == 0 and referrer_id:
+        await db.execute(
+            "UPDATE users SET referrer_id = ? WHERE user_id = ?",
+            (referrer_id, user_id),
         )
-        await conn.execute(
-            "UPDATE users SET tokens = tokens + 15 WHERE user_id = $1",
-            referrer_id,
+        await db.execute(
+            "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
+            (referrer_id,),
         )
+        await db.commit()
         try:
           await bot.send_message(
               referrer_id,
@@ -245,28 +251,26 @@ async def promo_check(message: Message, state: FSMContext):
   code_text = message.text.strip()
   await state.clear()
 
-  async with db_pool.acquire() as conn:
-    promo = await conn.fetchrow(
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
         "SELECT reward_type, reward_value, max_uses, used_count FROM promocodes"
-        " WHERE code = $1",
-        code_text,
-    )
+        " WHERE code = ?",
+        (code_text,),
+    ) as cursor:
+      promo = await cursor.fetchone()
+
     if not promo:
       await message.answer("❌ Неверный или уже использованный промокод.")
       return
 
-    reward_type, reward_value, max_uses, used_count = (
-        promo["reward_type"],
-        promo["reward_value"],
-        promo["max_uses"],
-        promo["used_count"],
-    )
+    reward_type, reward_value, max_uses, used_count = promo
 
-    used_check = await conn.fetchrow(
-        "SELECT 1 FROM promo_activations WHERE user_id = $1 AND code = $2",
-        user_id,
-        code_text,
-    )
+    async with db.execute(
+        "SELECT 1 FROM promo_activations WHERE user_id = ? AND code = ?",
+        (user_id, code_text),
+    ) as cursor:
+      used_check = await cursor.fetchone()
+
     if used_check:
       await message.answer("❌ Вы уже активировали этот промокод!")
       return
@@ -279,10 +283,9 @@ async def promo_check(message: Message, state: FSMContext):
 
     if reward_type == "tokens":
       tokens_amount = int(reward_value)
-      await conn.execute(
-          "UPDATE users SET tokens = tokens + $1 WHERE user_id = $2",
-          tokens_amount,
-          user_id,
+      await db.execute(
+          "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+          (tokens_amount, user_id),
       )
       await message.answer(
           f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
@@ -291,13 +294,16 @@ async def promo_check(message: Message, state: FSMContext):
       )
     elif reward_type == "premium":
       days = int(reward_value)
-      expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
-      formatted_date = expire_date.strftime("%d.%m.%Y")
-      await conn.execute(
-          "UPDATE users SET is_premium = 1, premium_expires = $1 WHERE user_id ="
-          " $2",
-          expire_date,
-          user_id,
+      expire_date = (
+          datetime.datetime.now() + datetime.timedelta(days=days)
+      ).strftime("%Y-%m-%d %H:%M:%S")
+      formatted_date = (
+          datetime.datetime.now() + datetime.timedelta(days=days)
+      ).strftime("%d.%m.%Y")
+      await db.execute(
+          "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id"
+          " = ?",
+          (expire_date, user_id),
       )
       await message.answer(
           f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
@@ -305,15 +311,15 @@ async def promo_check(message: Message, state: FSMContext):
           parse_mode="Markdown",
       )
 
-    await conn.execute(
-        "INSERT INTO promo_activations (user_id, code) VALUES ($1, $2)",
-        user_id,
-        code_text,
+    await db.execute(
+        "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
+        (user_id, code_text),
     )
-    await conn.execute(
-        "UPDATE promocodes SET used_count = used_count + 1 WHERE code = $1",
-        code_text,
+    await db.execute(
+        "UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?",
+        (code_text,),
     )
+    await db.commit()
 
 
 @router.message(EditProduct.new_value)
@@ -324,19 +330,20 @@ async def process_new_value(message: Message, state: FSMContext):
   new_val = message.text.strip()
   await state.clear()
 
-  async with db_pool.acquire() as conn:
+  async with aiosqlite.connect(DB_NAME) as db:
     if field == "title":
-      await conn.execute(
-          "UPDATE products SET title = $1 WHERE id = $2", new_val, p_id
+      await db.execute(
+          "UPDATE products SET title = ? WHERE id = ?", (new_val, p_id)
       )
     elif field == "price":
-      await conn.execute(
-          "UPDATE products SET price = $1 WHERE id = $2", new_val, p_id
+      await db.execute(
+          "UPDATE products SET price = ? WHERE id = ?", (new_val, p_id)
       )
     elif field == "link":
-      await conn.execute(
-          "UPDATE products SET link = $1 WHERE id = $2", new_val, p_id
+      await db.execute(
+          "UPDATE products SET link = ? WHERE id = ?", (new_val, p_id)
       )
+    await db.commit()
 
   await message.answer("✅ Товар успешно обновлен!")
 
@@ -385,16 +392,24 @@ async def process_promo_uses(message: Message, state: FSMContext):
   code, reward_type, reward_value = data["code"], data["type"], data["value"]
   await state.clear()
 
-  async with db_pool.acquire() as conn:
-    await conn.execute(
-        "INSERT INTO promocodes (code, reward_type, reward_value, max_uses,"
-        " used_count) VALUES ($1, $2, $3, $4, 0) ON CONFLICT (code) DO UPDATE"
-        " SET reward_type = $2, reward_value = $3, max_uses = $4",
-        code,
-        reward_type,
-        reward_value,
-        max_uses,
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        """
+            INSERT INTO promocodes (code, reward_type, reward_value, max_uses, used_count) 
+            VALUES (?, ?, ?, ?, 0) 
+            ON CONFLICT(code) DO UPDATE SET reward_type = ?, reward_value = ?, max_uses = ?
+        """,
+        (
+            code,
+            reward_type,
+            reward_value,
+            max_uses,
+            reward_type,
+            reward_value,
+            max_uses,
+        ),
     )
+    await db.commit()
 
   uses_text = f"{max_uses} раз" if max_uses > 0 else "Безлимитно"
   reward_desc = (
@@ -434,19 +449,23 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
   target_id = data["target_id"]
   await state.clear()
 
-  expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
-  formatted_date = expire_date.strftime("%d.%m.%Y")
+  expire_date = (
+      datetime.datetime.now() + datetime.timedelta(days=days)
+  ).strftime("%Y-%m-%d %H:%M:%S")
+  formatted_date = (
+      datetime.datetime.now() + datetime.timedelta(days=days)
+  ).strftime("%d.%m.%Y")
 
-  async with db_pool.acquire() as conn:
-    await conn.execute(
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
         """
             INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, premium_expires) 
-            VALUES ($1, 0, 1, 0, 0, $2)
-            ON CONFLICT (user_id) DO UPDATE SET is_premium = 1, premium_expires = $2
+            VALUES (?, 0, 1, 0, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
         """,
-        target_id,
-        expire_date,
+        (target_id, expire_date, expire_date),
     )
+    await db.commit()
 
   await message.answer(
       f"✅ **Премиум успешно выдан!**\n\n🆔 Пользователь: `{target_id}`\n📅"
@@ -488,14 +507,13 @@ async def process_link(message: Message, state: FSMContext):
   title, price, link = data["title"], data["price"], message.text
   await state.clear()
 
-  async with db_pool.acquire() as conn:
-    await conn.execute(
-        "INSERT INTO products (title, price, link, buyers_count) VALUES ($1,"
-        " $2, $3, 0)",
-        title,
-        price,
-        link,
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        "INSERT INTO products (title, price, link, buyers_count) VALUES (?, ?,"
+        " ?, 0)",
+        (title, price, link),
     )
+    await db.commit()
 
   await message.answer(
       f"✅ Папка успешно добавлена в магазин!\n\n📌 Название: {title}\n💰 Цена:"
@@ -507,15 +525,16 @@ async def process_link(message: Message, state: FSMContext):
 @router.message(BroadcastState.message)
 async def send_broadcast(message: Message, state: FSMContext):
   await state.clear()
-  async with db_pool.acquire() as conn:
-    users = await conn.fetch("SELECT user_id FROM users")
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute("SELECT user_id FROM users") as cursor:
+      users = await cursor.fetchall()
 
   success, fail = 0, 0
   status_msg = await message.answer("⏳ Рассылка началась...")
 
   for user in users:
     try:
-      await message.send_copy(chat_id=user["user_id"])
+      await message.send_copy(chat_id=user[0])
       success += 1
       await asyncio.sleep(0.05)
     except Exception:
@@ -553,39 +572,40 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   text = message.text
 
   if text == "👤 Мой Профиль":
-    async with db_pool.acquire() as conn:
-      user_data = await conn.fetchrow(
+    async with aiosqlite.connect(DB_NAME) as db:
+      async with db.execute(
           "SELECT tokens, is_premium, bought_folders, premium_expires FROM"
-          " users WHERE user_id = $1",
-          user_id,
-      )
+          " users WHERE user_id = ?",
+          (user_id,),
+      ) as cursor:
+        user_data = await cursor.fetchone()
 
       if not user_data:
-        await conn.execute(
+        await db.execute(
             "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-            " referrer_id) VALUES ($1, 0, 0, 0, 0)",
-            user_id,
+            " referrer_id) VALUES (?, 0, 0, 0, 0)",
+            (user_id,),
         )
+        await db.commit()
         tokens, is_prem, bought, prem_expires = 0, 0, 0, None
       else:
-        tokens = user_data["tokens"]
-        is_prem = user_data["is_premium"]
-        bought = user_data["bought_folders"]
-        prem_expires = user_data["premium_expires"]
+        tokens, is_prem, bought, prem_expires = user_data
 
     prem_status = "❌ Не активна"
     if is_prem == 1 and prem_expires:
-      if datetime.datetime.now() < prem_expires:
-        days_left = (prem_expires - datetime.datetime.now()).days
-        formatted_date = prem_expires.strftime("%d.%m.%Y")
+      exp_date = datetime.datetime.strptime(prem_expires, "%Y-%m-%d %H:%M:%S")
+      if datetime.datetime.now() < exp_date:
+        days_left = (exp_date - datetime.datetime.now()).days
+        formatted_date = exp_date.strftime("%d.%m.%Y")
         prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
       else:
-        async with db_pool.acquire() as conn:
-          await conn.execute(
+        async with aiosqlite.connect(DB_NAME) as db:
+          await db.execute(
               "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-              " user_id = $1",
-              user_id,
+              " user_id = ?",
+              (user_id,),
           )
+          await db.commit()
         prem_status = "❌ Не активна (истекла)"
 
     keyboard = InlineKeyboardMarkup(
@@ -607,8 +627,11 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     )
 
   elif text in ["🛒 Магазин", "🛍 Магазин"]:
-    async with db_pool.acquire() as conn:
-      products = await conn.fetch("SELECT id, title, price FROM products")
+    async with aiosqlite.connect(DB_NAME) as db:
+      async with db.execute(
+          "SELECT id, title, price, buyers_count FROM products"
+      ) as cursor:
+        products = await cursor.fetchall()
 
     if not products:
       await message.answer(
@@ -617,22 +640,16 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       return
 
     keyboard_buttons = []
-    async with db_pool.acquire() as conn:
-      for prod in products:
-        p_id, title, price = prod["id"], prod["title"], prod["price"]
-        res = await conn.fetchrow(
-            "SELECT buyers_count FROM products WHERE id = $1", p_id
-        )
-        buyers_count = res["buyers_count"] if res else 0
+    for prod in products:
+      p_id, title, price, buyers_count = prod
+      if buyers_count == 0:
+        btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+      else:
+        btn_text = f"📁 {title} — {price} токенов"
 
-        if buyers_count == 0:
-          btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
-        else:
-          btn_text = f"📁 {title} — {price} токенов"
-
-        keyboard_buttons.append(
-            [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
-        )
+      keyboard_buttons.append(
+          [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
+      )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await message.answer(
@@ -656,7 +673,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text == "🪙 Как получить токены?":
     tokens_text = (
         "📌 Как получить токены?\n\n1. Возьмите фото."
-        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте его в комментариях под"
+        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте его in комментариях под"
         " постами/ответами другим людям. ГЛАВНОЕ: тема должна касаться по типу"
         " сестры и брата и тд.\n3. Отправляйте доказательства (скриншоты) в"
         " директ канала. https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото"
@@ -746,56 +763,58 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
 
   p_id = int(callback.data.split("_")[1])
 
-  async with db_pool.acquire() as conn:
-    product = await conn.fetchrow(
-        "SELECT title, price, link, buyers_count FROM products WHERE id = $1",
-        p_id,
-    )
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
+        (p_id,),
+    ) as cursor:
+      product = await cursor.fetchone()
+
     if not product:
       await callback.answer("❌ Этот товар был удален.", show_alert=True)
       return
 
-    title, price_raw, link, buyers_count = (
-        product["title"],
-        product["price"],
-        product["link"],
-        product["buyers_count"],
-    )
+    title, price_raw, link, buyers_count = product
 
     try:
       base_price = int("".join(filter(str.isdigit, str(price_raw))))
     except ValueError:
       base_price = 0
 
-    u_data = await conn.fetchrow(
+    async with db.execute(
         "SELECT tokens, is_premium, bought_folders, referrer_id,"
-        " premium_expires FROM users WHERE user_id = $1",
-        user_id,
-    )
-    tokens = u_data["tokens"] if u_data else 0
-    is_prem = u_data["is_premium"] if u_data else 0
-    referrer_id = u_data["referrer_id"] if u_data else 0
-    prem_expires = u_data["premium_expires"] if u_data else None
+        " premium_expires FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+      u_data = await cursor.fetchone()
+
+    tokens = u_data[0] if u_data else 0
+    is_prem = u_data[1] if u_data else 0
+    referrer_id = u_data[3] if u_data else 0
+    prem_expires = u_data[4] if u_data else None
 
     if is_prem == 1 and prem_expires:
-      if datetime.datetime.now() >= prem_expires:
+      exp_date = datetime.datetime.strptime(prem_expires, "%Y-%m-%d %H:%M:%S")
+      if datetime.datetime.now() >= exp_date:
         is_prem = 0
-        await conn.execute(
+        await db.execute(
             "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-            " user_id = $1",
-            user_id,
+            " user_id = ?",
+            (user_id,),
         )
+        await db.commit()
 
     if is_prem == 1:
-      await conn.execute(
-          "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = $1",
-          p_id,
+      await db.execute(
+          "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
+          (p_id,),
       )
-      await conn.execute(
-          "UPDATE users SET bought_folders = bought_folders + 1 WHERE user_id ="
-          " $1",
-          user_id,
+      await db.execute(
+          "UPDATE users SET bought_folders = bought_folders + 1 WHERE user_id"
+          " = ?",
+          (user_id,),
       )
+      await db.commit()
       text = (
           f"👑 Премиум-доступ применен!\n\n✅ Вы успешно получили папку {title}"
           f" бесплатно по подписке!\n\n🔗 Ссылка на скачивание: {link}"
@@ -817,25 +836,25 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       return
 
     new_tokens = tokens - final_price
-    await conn.execute(
-        "UPDATE users SET tokens = $1, bought_folders = bought_folders + 1 WHERE"
-        " user_id = $2",
-        new_tokens,
-        user_id,
+    await db.execute(
+        "UPDATE users SET tokens = ?, bought_folders = bought_folders + 1 WHERE"
+        " user_id = ?",
+        (new_tokens, user_id),
     )
-    await conn.execute(
-        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = $1",
-        p_id,
+    await db.execute(
+        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
+        (p_id,),
     )
+    await db.commit()
 
     if referrer_id and referrer_id != 0:
       ref_bonus = round(final_price * 0.15)
       if ref_bonus > 0:
-        await conn.execute(
-            "UPDATE users SET tokens = tokens + $1 WHERE user_id = $2",
-            ref_bonus,
-            referrer_id,
+        await db.execute(
+            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+            (ref_bonus, referrer_id),
         )
+        await db.commit()
         try:
           await bot.send_message(
               referrer_id,
@@ -867,8 +886,9 @@ async def edit_product_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
-  async with db_pool.acquire() as conn:
-    products = await conn.fetch("SELECT id, title FROM products")
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute("SELECT id, title FROM products") as cursor:
+      products = await cursor.fetchall()
 
   if not products:
     await callback.message.answer("📭 Нет товаров для редактирования.")
@@ -876,7 +896,7 @@ async def edit_product_list(callback: CallbackQuery):
     return
 
   keyboard_buttons = [
-      [InlineKeyboardButton(text=f"✏️ {p['title']}", callback_data=f"edit_prod_{p['id']}")]
+      [InlineKeyboardButton(text=f"✏️ {p[1]}", callback_data=f"edit_prod_{p[0]}")]
       for p in products
   ]
   await callback.message.answer(
@@ -894,10 +914,11 @@ async def select_edit_field(callback: CallbackQuery, state: FSMContext):
   p_id = int(callback.data.split("_")[2])
   await state.update_data(product_id=p_id)
 
-  async with db_pool.acquire() as conn:
-    product = await conn.fetchrow(
-        "SELECT title, price, link FROM products WHERE id = $1", p_id
-    )
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT title, price, link FROM products WHERE id = ?", (p_id,)
+    ) as cursor:
+      product = await cursor.fetchone()
 
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -913,9 +934,9 @@ async def select_edit_field(callback: CallbackQuery, state: FSMContext):
       ]
   )
   await callback.message.answer(
-      f"✏️ **Редактирование товара:** {product['title']}\n💰 Текущая цена:"
-      f" {product['price']} токенов\n🔗 Ссылка: {product['link']}\n\nЧто именно"
-      " хочешь изменить?",
+      f"✏️ **Редактирование товара:** {product[0]}\n💰 Текущая цена:"
+      f" {product[1]} токенов\n🔗 Ссылка: {product[2]}\n\nЧто именно хочешь"
+      " изменить?",
       reply_markup=keyboard,
       parse_mode="Markdown",
   )
@@ -994,8 +1015,9 @@ async def delete_product_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
-  async with db_pool.acquire() as conn:
-    products = await conn.fetch("SELECT id, title FROM products")
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute("SELECT id, title FROM products") as cursor:
+      products = await cursor.fetchall()
 
   if not products:
     await callback.message.answer("📭 Нет товаров для удаления.")
@@ -1005,8 +1027,7 @@ async def delete_product_list(callback: CallbackQuery):
   keyboard_buttons = [
       [
           InlineKeyboardButton(
-              text=f"❌ Удалить: {p['title']}",
-              callback_data=f"del_prod_{p['id']}",
+              text=f"❌ Удалить: {p[1]}", callback_data=f"del_prod_{p[0]}"
           )
       ]
       for p in products
@@ -1024,8 +1045,9 @@ async def delete_product_execute(callback: CallbackQuery):
     await callback.answer()
     return
   p_id = int(callback.data.split("_")[2])
-  async with db_pool.acquire() as conn:
-    await conn.execute("DELETE FROM products WHERE id = $1", p_id)
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute("DELETE FROM products WHERE id = ?", (p_id,))
+    await db.commit()
 
   await callback.answer("Товар удален!", show_alert=True)
 
@@ -1049,7 +1071,7 @@ async def main():
   dp.include_router(router)
 
   await bot.delete_webhook(drop_pending_updates=True)
-  print("Бот успешно запущен на Supabase (PostgreSQL) и работает 24/7!")
+  print("Бот успешно запущен на SQLite и работает без ошибок сети!")
   await dp.start_polling(bot)
 
 
