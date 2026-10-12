@@ -51,7 +51,7 @@ cursor.execute(
 conn.commit()
 
 
-# Состояния для FSM (добавление товара, рассылка, промокод, выдача премиума)
+# Состояния для FSM
 class AddProduct(StatesGroup):
   title = State()
   price = State()
@@ -76,7 +76,7 @@ router = Router()
 # --- ГЛАВНОЕ КНОПОЧНОЕ МЕНЮ (НИЖНЕЕ) ---
 def get_main_keyboard(user_id):
   kb = [
-      [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛍 Магазин")],
+      [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛒 Магазин")],
       [
           KeyboardButton(text="👥 Реферальная система"),
           KeyboardButton(text="🪙 Как получить токены?"),
@@ -208,7 +208,7 @@ async def premium_handler(message: Message):
 
 
 # --- МАГАЗИН И ПАПКИ С АЛЬТУХАМИ ---
-@router.message(F.text == "🛍 Магазин")
+@router.message(F.text.in_({"🛍 Магазин", "🛒 Магазин"}))
 async def shop_handler(message: Message):
   cursor.execute("SELECT id, title, price FROM products")
   products = cursor.fetchall()
@@ -367,7 +367,6 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
 
   target_id = int(message.text)
 
-  # Обновляем премиум статус в базе
   cursor.execute(
       "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
       " bought_folders) VALUES (?, 0, 1, 0)",
@@ -383,7 +382,6 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
       parse_mode="Markdown",
   )
 
-  # Оповещаем пользователя
   try:
     await bot.send_message(
         target_id,
