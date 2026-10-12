@@ -227,9 +227,9 @@ async def shop_handler(message: Message):
     buyers_count = res[0] if res else 0
 
     if buyers_count == 0:
-      btn_text = f"🔥 {title} — {price} (ПЕРВАЯ ПОКУПКА СО СКИДКОЙ 80%!)"
+      btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
     else:
-      btn_text = f"📁 {title} — {price}"
+      btn_text = f"📁 {title} — {price} токенов"
 
     keyboard_buttons.append(
         [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
@@ -259,44 +259,87 @@ async def process_buy(callback: CallbackQuery):
     await callback.answer("❌ Этот товар был удален.", show_alert=True)
     return
 
-  title, price, link, buyers_count = product
+  title, price_raw, link, buyers_count = product
 
-  # Проверяем премиум
+  # Преобразуем цену в число (если введено просто "15" или "15 токенов")
+  try:
+    base_price = int("".join(filter(str.isdigit, str(price_raw))))
+  except ValueError:
+    base_price = 0
+
+  # Получаем данные пользователя
   cursor.execute(
-      "SELECT is_premium, bought_folders FROM users WHERE user_id = ?",
+      "SELECT tokens, is_premium, bought_folders FROM users WHERE user_id = ?",
       (user_id,),
   )
   u_data = cursor.fetchone()
-  is_prem = u_data[0] if u_data else 0
-  bought_folders = u_data[1] if u_data else 0
 
-  # Увеличиваем счетчик купленных папок
-  new_buyers_count = buyers_count + 1
-  cursor.execute(
-      "UPDATE products SET buyers_count = ? WHERE id = ?",
-      (new_buyers_count, p_id),
-  )
-  cursor.execute(
-      "UPDATE users SET bought_folders = ? WHERE user_id = ?",
-      (bought_folders + 1, user_id),
-  )
-  conn.commit()
+  tokens = u_data[0] if u_data else 0
+  is_prem = u_data[1] if u_data else 0
+  bought_folders = u_data[2] if u_data else 0
 
+  # Если есть Премиум — выдаем бесплатно
   if is_prem == 1:
+    new_buyers_count = buyers_count + 1
+    cursor.execute(
+        "UPDATE products SET buyers_count = ? WHERE id = ?",
+        (new_buyers_count, p_id),
+    )
+    cursor.execute(
+        "UPDATE users SET bought_folders = ? WHERE user_id = ?",
+        (bought_folders + 1, user_id),
+    )
+    conn.commit()
+
     text = (
         f"👑 **Премиум-доступ применен!**\n\n"
         f"✅ Вы успешно получили папку *{title}* бесплатно по подписке!\n\n"
         f"🔗 Ссылка на скачивание: {link}"
     )
-  elif buyers_count == 0:
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+    return
+
+  # Считаем итоговую цену со скидкой 80% для первого покупателя
+  if buyers_count == 0:
+    final_price = max(1, int(base_price * 0.2))  # Скидка 80% (20% от цены)
+  else:
+    final_price = base_price
+
+  # Проверяем баланс токенов
+  if tokens < final_price:
+    await callback.answer(
+        f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
+        f" {tokens}.",
+        show_alert=True,
+    )
+    return
+
+  # Списываем токены и обновляем покупки
+  new_tokens = tokens - final_price
+  new_buyers_count = buyers_count + 1
+
+  cursor.execute(
+      "UPDATE users SET tokens = ?, bought_folders = ? WHERE user_id = ?",
+      (new_tokens, bought_folders + 1, user_id),
+  )
+  cursor.execute(
+      "UPDATE products SET buyers_count = ? WHERE id = ?",
+      (new_buyers_count, p_id),
+  )
+  conn.commit()
+
+  if buyers_count == 0:
     text = (
         f"🎉 Поздравляем! Ты **первый покупатель** папки *{title}*!\n"
-        f"🔥 Тебе применилась **скидка 80%**!\n\n"
+        f"🔥 Применилась **скидка 80%**! Списано: {final_price} токенов.\n"
+        f"💲 Ваш остаток: {new_tokens} токенов.\n\n"
         f"🔗 Твоя ссылка на скачивание: {link}"
     )
   else:
     text = (
-        f"✅ Спасибо за покупку папки *{title}*!\n\n"
+        f"✅ Спасибо за покупку папки *{title}*!\n"
+        f"💰 Списано: {final_price} токенов. Остаток: {new_tokens} токенов.\n\n"
         f"🔗 Твоя ссылка на скачивание: {link}"
     )
 
@@ -408,7 +451,9 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
 @router.message(AddProduct.title)
 async def process_title(message: Message, state: FSMContext):
   await state.update_data(title=message.text)
-  await message.answer("💰 Введи **цену** (например: *Бесплатно* или *50 руб*):")
+  await message.answer(
+      "💰 Введи **цену в токенах** (например: *15* или *50*):"
+  )
   await state.set_state(AddProduct.price)
 
 
@@ -439,8 +484,8 @@ async def process_link(message: Message, state: FSMContext):
   await state.clear()
   await message.answer(
       f"✅ Папка успешно добавлена в магазин!\n\n📌 Название: {title}\n💰 Цена:"
-      f" {price}\n🔗 Ссылка: {link}\n🎁 *Активирована скидка 80% для первого"
-      " покупателя!*",
+      f" {price} токенов\n🔗 Ссылка: {link}\n🎁 *Активирована скидка 80% для"
+      " первого покупателя!*",
       parse_mode="Markdown",
   )
 
