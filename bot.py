@@ -23,8 +23,8 @@ PORT = int(os.getenv("PORT", 10000))
 DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
-CHANNEL_ID = -1002925107145
-CHANNEL_USERNAME = "iiris_cnn_bot"
+
+db_pool = None
 
 
 async def init_db():
@@ -111,38 +111,6 @@ class GivePremiumState(StatesGroup):
 router = Router()
 
 
-async def check_subscription(user_id: int, bot: Bot) -> bool:
-  try:
-    member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-    return member.status in ["creator", "administrator", "member"]
-  except Exception:
-    return True
-
-
-async def not_subscribed_message(message: Message):
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="📢 Подписаться на канал",
-                  url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🔄 Проверить подписку", callback_data="check_sub"
-              )
-          ],
-      ]
-  )
-  await message.answer(
-      "⛔️ **Для использования бота необходимо подписаться на наш канал!**\n\n"
-      "Подпишитесь на канал, а затем нажмите кнопку ниже:",
-      reply_markup=keyboard,
-      parse_mode="Markdown",
-  )
-
-
 def get_main_keyboard(user_id):
   kb = [
       [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛒 Магазин")],
@@ -161,9 +129,6 @@ def get_main_keyboard(user_id):
 async def cmd_start(message: Message, bot: Bot, state: FSMContext):
   await state.clear()
   user_id = message.from_user.id
-  if not await check_subscription(user_id, bot):
-    await not_subscribed_message(message)
-    return
 
   args = message.text.split()
   referrer_id = None
@@ -225,23 +190,6 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       " ниже:",
       reply_markup=get_main_keyboard(user_id),
   )
-
-
-@router.callback_query(F.data == "check_sub")
-async def process_check_sub(callback: CallbackQuery, bot: Bot):
-  user_id = callback.from_user.id
-  if await check_subscription(user_id, bot):
-    await callback.message.edit_text(
-        "✅ Подписка подтверждена! Добро пожаловать."
-    )
-    await callback.message.answer(
-        "Выбирай нужный раздел на клавиатуре:",
-        reply_markup=get_main_keyboard(user_id),
-    )
-  else:
-    await callback.answer(
-        "❌ Вы еще не подписались на канал!", show_alert=True
-    )
 
 
 # --- FSM ХЕНДЛЕРЫ ---
@@ -567,10 +515,6 @@ async def send_broadcast(message: Message, state: FSMContext):
 async def menu_router(message: Message, bot: Bot, state: FSMContext):
   await state.clear()
   user_id = message.from_user.id
-  if not await check_subscription(user_id, bot):
-    await not_subscribed_message(message)
-    return
-
   text = message.text
 
   if text == "👤 Мой Профиль":
@@ -759,10 +703,6 @@ async def promo_prompt(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
-  if not await check_subscription(user_id, bot):
-    await callback.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
-    return
-
   p_id = int(callback.data.split("_")[1])
 
   async with aiosqlite.connect(DB_NAME) as db:
@@ -1066,7 +1006,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (ЧТОБЫ ПОРТ БЫЛ ОТКРЫТ) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def handle_ping(request):
   return web.Response(text="Bot is running!")
 
@@ -1082,7 +1022,7 @@ async def start_web_server():
 
 async def main():
   await init_db()
-  await start_web_server()  # Запускаем мини-сервер для порта Render
+  await start_web_server()
 
   bot = Bot(token=TOKEN)
   dp = Dispatcher(storage=MemoryStorage())
@@ -1090,7 +1030,8 @@ async def main():
 
   await bot.delete_webhook(drop_pending_updates=True)
   print(
-      f"Бот успешно запущен на SQLite и веб-сервер слушает порт {PORT}!"
+      f"Бот успешно запущен без подписки, на SQLite и веб-сервер слушает порт"
+      f" {PORT}!"
   )
   await dp.start_polling(bot)
 
