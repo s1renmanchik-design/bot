@@ -1,7 +1,7 @@
 import asyncio
 import datetime
-import logging
-import sqlite3
+import os
+import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -16,76 +16,59 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-# ТОКЕН ТВОЕГО БОТА
-TOKEN = "8549927929:AAE_aDtLHVjkR9h50ABM233OZprEa6l-GvM"
+# ТОКЕН И БАЗА ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER
+TOKEN = os.getenv("TOKEN", "8549927929:AAE_aDtLHVjkR9h50ABM233OZprEa6l-GvM")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ТВОЙ ТЕЛЕГРАМ ID АДМИНА
 ADMIN_ID = 5681420389
-
-# КАНАЛ ДЛЯ ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ
 CHANNEL_ID = -1002925107145
 CHANNEL_USERNAME = "iiris_cnn_bot"
 
-# Инициализация базы данных SQLite
-conn = sqlite3.connect("bot_data.db", check_same_thread=False)
-cursor = conn.cursor()
+db_pool = None
 
-# Создаем таблицы, если их нет
-cursor.execute(
+
+async def init_db():
+  global db_pool
+  db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+  async with db_pool.acquire() as connection:
+    await connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            tokens INT DEFAULT 0,
+            is_premium INT DEFAULT 0,
+            bought_folders INT DEFAULT 0,
+            referrer_id BIGINT DEFAULT 0,
+            premium_expires TIMESTAMP DEFAULT NULL
+        );
+        
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            title TEXT,
+            price TEXT,
+            link TEXT,
+            buyers_count INT DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS promocodes (
+            code TEXT PRIMARY KEY,
+            reward_type TEXT,
+            reward_value TEXT,
+            max_uses INT,
+            used_count INT DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS promo_activations (
+            user_id BIGINT,
+            code TEXT,
+            PRIMARY KEY (user_id, code)
+        );
     """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        tokens INTEGER DEFAULT 0,
-        is_premium INTEGER DEFAULT 0,
-        bought_folders INTEGER DEFAULT 0,
-        referrer_id INTEGER DEFAULT 0,
-        premium_expires TEXT DEFAULT NULL
     )
-"""
-)
-
-try:
-  cursor.execute("ALTER TABLE users ADD COLUMN premium_expires TEXT DEFAULT NULL")
-except Exception:
-  pass
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        price TEXT,
-        link TEXT,
-        buyers_count INTEGER DEFAULT 0
-    )
-"""
-)
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS promocodes (
-        code TEXT PRIMARY KEY,
-        reward_type TEXT,
-        reward_value TEXT,
-        max_uses INTEGER,
-        used_count INTEGER DEFAULT 0
-    )
-"""
-)
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS promo_activations (
-        user_id INTEGER,
-        code TEXT,
-        PRIMARY KEY (user_id, code)
-    )
-"""
-)
-conn.commit()
 
 
-# Состояния для FSM
+# Состояния FSM
 class AddProduct(StatesGroup):
   title = State()
   price = State()
@@ -121,7 +104,6 @@ class GivePremiumState(StatesGroup):
 router = Router()
 
 
-# --- ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ---
 async def check_subscription(user_id: int, bot: Bot) -> bool:
   try:
     member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
@@ -156,7 +138,6 @@ async def not_subscribed_message(message: Message):
   )
 
 
-# --- ГЛАВНОЕ КНОПОЧНОЕ МЕНЮ (НИЖНЕЕ) ---
 def get_main_keyboard(user_id):
   kb = [
       [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛒 Магазин")],
@@ -168,15 +149,12 @@ def get_main_keyboard(user_id):
   ]
   if user_id == ADMIN_ID:
     kb.append([KeyboardButton(text="⚙️ Админ-панель")])
-
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-# --- КОМАНДА /start ---
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
   user_id = message.from_user.id
-
   if not await check_subscription(user_id, bot):
     await not_subscribed_message(message)
     return
@@ -188,51 +166,51 @@ async def cmd_start(message: Message, bot: Bot):
     if potential_ref != user_id:
       referrer_id = potential_ref
 
-  cursor.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
-  existing_user = cursor.fetchone()
-
-  if existing_user is None:
-    ref_to_save = referrer_id if referrer_id else 0
-    cursor.execute(
-        "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-        " referrer_id) VALUES (?, 0, 0, 0, ?)",
-        (user_id, ref_to_save),
+  async with db_pool.acquire() as conn:
+    existing_user = await conn.fetchrow(
+        "SELECT referrer_id FROM users WHERE user_id = $1", user_id
     )
-    conn.commit()
 
-    if referrer_id:
-      cursor.execute(
-          "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
-          (referrer_id,),
+    if existing_user is None:
+      ref_to_save = referrer_id if referrer_id else 0
+      await conn.execute(
+          "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
+          " referrer_id) VALUES ($1, 0, 0, 0, $2)",
+          user_id,
+          ref_to_save,
       )
-      conn.commit()
-      try:
-        await bot.send_message(
+      if referrer_id:
+        await conn.execute(
+            "UPDATE users SET tokens = tokens + 15 WHERE user_id = $1",
             referrer_id,
-            "🎉 По реферальной ссылке зарегистрировался новый пользователь!\n🎁"
-            " Вам начислено бонусных 15 токенов!",
         )
-      except Exception:
-        pass
-  else:
-    if existing_user[0] == 0 and referrer_id:
-      cursor.execute(
-          "UPDATE users SET referrer_id = ? WHERE user_id = ?",
-          (referrer_id, user_id),
-      )
-      cursor.execute(
-          "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
-          (referrer_id,),
-      )
-      conn.commit()
-      try:
-        await bot.send_message(
+        try:
+          await bot.send_message(
+              referrer_id,
+              "🎉 По реферальной ссылке зарегистрировался новый пользователь!\n🎁"
+              " Вам начислено бонусных 15 токенов!",
+          )
+        except Exception:
+          pass
+    else:
+      if existing_user["referrer_id"] == 0 and referrer_id:
+        await conn.execute(
+            "UPDATE users SET referrer_id = $1 WHERE user_id = $2",
             referrer_id,
-            "🎉 По вашей реферальной ссылке активировался пользователь!\n🎁 Вам"
-            " начислено бонусных 15 токенов!",
+            user_id,
         )
-      except Exception:
-        pass
+        await conn.execute(
+            "UPDATE users SET tokens = tokens + 15 WHERE user_id = $1",
+            referrer_id,
+        )
+        try:
+          await bot.send_message(
+              referrer_id,
+              "🎉 По вашей реферальной ссылке активировался пользователь!\n🎁 Вам"
+              " начислено бонусных 15 токенов!",
+          )
+        except Exception:
+          pass
 
   await message.answer(
       "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре"
@@ -258,7 +236,6 @@ async def process_check_sub(callback: CallbackQuery, bot: Bot):
     )
 
 
-# --- ОБРАБОТКА КНОПОК ИЗ МЕНЮ ---
 @router.message(
     F.text.in_(
         {
@@ -274,7 +251,6 @@ async def process_check_sub(callback: CallbackQuery, bot: Bot):
 )
 async def menu_router(message: Message, bot: Bot):
   user_id = message.from_user.id
-
   if not await check_subscription(user_id, bot):
     await not_subscribed_message(message)
     return
@@ -282,39 +258,32 @@ async def menu_router(message: Message, bot: Bot):
   text = message.text
 
   if text == "👤 Мой Профиль":
-    cursor.execute(
-        "SELECT tokens, is_premium, bought_folders, premium_expires FROM users"
-        " WHERE user_id = ?",
-        (user_id,),
-    )
-    user_data = cursor.fetchone()
+    async with db_pool.acquire() as conn:
+      user_data = await conn.fetchrow(
+          "SELECT tokens, is_premium, bought_folders, premium_expires FROM"
+          " users WHERE user_id = $1",
+          user_id,
+      )
 
-    tokens = user_data[0] if user_data else 0
-    is_prem = user_data[1] if user_data else 0
-    bought = user_data[2] if user_data else 0
-    prem_expires_str = user_data[3] if user_data else None
+    tokens = user_data["tokens"] if user_data else 0
+    is_prem = user_data["is_premium"] if user_data else 0
+    bought = user_data["bought_folders"] if user_data else 0
+    prem_expires = user_data["premium_expires"] if user_data else None
 
     prem_status = "❌ Не активна"
-    if is_prem == 1 and prem_expires_str:
-      try:
-        expire_date = datetime.datetime.strptime(
-            prem_expires_str, "%Y-%m-%d %H:%M:%S"
-        )
-        now = datetime.datetime.now()
-        if now < expire_date:
-          days_left = (expire_date - now).days
-          formatted_date = expire_date.strftime("%d.%m.%Y")
-          prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
-        else:
-          cursor.execute(
+    if is_prem == 1 and prem_expires:
+      if datetime.datetime.now() < prem_expires:
+        days_left = (prem_expires - datetime.datetime.now()).days
+        formatted_date = prem_expires.strftime("%d.%m.%Y")
+        prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
+      else:
+        async with db_pool.acquire() as conn:
+          await conn.execute(
               "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-              " user_id = ?",
-              (user_id,),
+              " user_id = $1",
+              user_id,
           )
-          conn.commit()
-          prem_status = "❌ Не активна (истекла)"
-      except Exception:
-        prem_status = "✅ Активна"
+        prem_status = "❌ Не активна (истекла)"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -325,19 +294,16 @@ async def menu_router(message: Message, bot: Bot):
             ]
         ]
     )
-
     profile_text = (
-        f"👤 Ваш Профиль\n\n"
-        f"🆔 Ваш ID: {user_id}\n"
-        f"💲 Баланс: {tokens} токенов\n"
-        f"👑 Премиум-подписка: {prem_status}\n"
-        f"📦 Куплено папок: {bought} шт."
+        f"👤 Ваш Профиль\n\n🆔 Ваш ID: {user_id}\n💲 Баланс: {tokens}"
+        f" токенов\n👑 Премиум-подписка: {prem_status}\n📦 Куплено папок: {bought}"
+        " шт."
     )
     await message.answer(profile_text, reply_markup=keyboard)
 
   elif text in ["🛒 Магазин", "🛍 Магазин"]:
-    cursor.execute("SELECT id, title, price FROM products")
-    products = cursor.fetchall()
+    async with db_pool.acquire() as conn:
+      products = await conn.fetch("SELECT id, title, price FROM products")
 
     if not products:
       await message.answer(
@@ -346,20 +312,22 @@ async def menu_router(message: Message, bot: Bot):
       return
 
     keyboard_buttons = []
-    for prod in products:
-      p_id, title, price = prod
-      cursor.execute("SELECT buyers_count FROM products WHERE id = ?", (p_id,))
-      res = cursor.fetchone()
-      buyers_count = res[0] if res else 0
+    async with db_pool.acquire() as conn:
+      for prod in products:
+        p_id, title, price = prod["id"], prod["title"], prod["price"]
+        res = await conn.fetchrow(
+            "SELECT buyers_count FROM products WHERE id = $1", p_id
+        )
+        buyers_count = res["buyers_count"] if res else 0
 
-      if buyers_count == 0:
-        btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
-      else:
-        btn_text = f"📁 {title} — {price} токенов"
+        if buyers_count == 0:
+          btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+        else:
+          btn_text = f"📁 {title} — {price} токенов"
 
-      keyboard_buttons.append(
-          [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
-      )
+        keyboard_buttons.append(
+            [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
+        )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await message.answer(
@@ -373,24 +341,21 @@ async def menu_router(message: Message, bot: Bot):
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     ref_text = (
-        "👥 Реферальная система\n\n"
-        "Приглашай друзей по своей персональной ссылке:\n"
-        f"{ref_link}\n\n"
-        "🎁 Бонусы:\n"
-        "• За каждого приглашенного друга вы получаете 15 токенов!\n"
-        "• Получайте 15% от суммы всех покупок токенами ваших рефералов!"
+        "👥 Реферальная система\n\nПриглашай друзей по своей персональной"
+        f" ссылке:\n{ref_link}\n\n🎁 Бонусы:\n• За каждого приглашенного друга вы"
+        " получаете 15 токенов!\n• Получайте 15% от суммы всех покупок токенами"
+        " ваших рефералов!"
     )
     await message.answer(ref_text)
 
   elif text == "🪙 Как получить токены?":
     tokens_text = (
-        "📌 Как получить токены?\n\n"
-        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
-        "2. Оставляйте его в комментариях под постами/ответами другим людям."
-        " ГЛАВНОЕ: тема должна касаться по типу сестры и брата и тд.\n"
-        "3. Отправляйте доказательства (скриншоты) в директ канала."
-        " https://t.me/JmcDeveloper?direct\n\n"
-        "💰 1 отправка фото в комментариях = 1 токен!"
+        "📌 Как получить токены?\n\n1. Возьмите фото."
+        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте его в комментариях под"
+        " постами/ответами другим людям. ГЛАВНОЕ: тема должна касаться по типу"
+        " сестры и брата и тд.\n3. Отправляйте доказательства (скриншоты) в"
+        " директ канала. https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото"
+        " в комментариях = 1 токен!"
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -406,11 +371,10 @@ async def menu_router(message: Message, bot: Bot):
         ]
     )
     prem_text = (
-        "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\n"
-        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ папки бесплатно (даже с 0 токенов на"
-        " балансе)!\n\n"
-        "💳 Стоимость:\n"
-        "• 50 Звезд (любым подарком в Telegram за 50 звезд на профиль @ucu52)."
+        "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\nДает право покупать"
+        " АБСОЛЮТНО ЛЮБЫЕ папки бесплатно (даже с 0 токенов на балансе)!\n\n💳"
+        " Стоимость:\n• 50 Звезд (любым подарком в Telegram за 50 звезд на профиль"
+        " @ucu52)."
     )
     await message.answer(prem_text, reply_markup=keyboard)
 
@@ -418,7 +382,6 @@ async def menu_router(message: Message, bot: Bot):
     if user_id != ADMIN_ID:
       await message.answer("⛔️ У тебя нет доступа!")
       return
-
     admin_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -459,7 +422,6 @@ async def menu_router(message: Message, bot: Bot):
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
 
 
-# --- АКТИВАЦИЯ ПРОМОКОДА ---
 @router.callback_query(F.data == "enter_promocode")
 async def promo_prompt(callback: CallbackQuery, state: FSMContext):
   await callback.message.answer("🎟 Введите промокод:")
@@ -473,237 +435,218 @@ async def promo_check(message: Message, state: FSMContext):
   code_text = message.text.strip()
   await state.clear()
 
-  cursor.execute(
-      "SELECT reward_type, reward_value, max_uses, used_count FROM promocodes"
-      " WHERE code = ?",
-      (code_text,),
-  )
-  promo = cursor.fetchone()
-
-  if not promo:
-    await message.answer("❌ Неверный или уже использованный промокод.")
-    return
-
-  reward_type, reward_value, max_uses, used_count = promo
-
-  cursor.execute(
-      "SELECT 1 FROM promo_activations WHERE user_id = ? AND code = ?",
-      (user_id, code_text),
-  )
-  if cursor.fetchone():
-    await message.answer("❌ Вы уже активировали этот промокод!")
-    return
-
-  if max_uses > 0 and used_count >= max_uses:
-    await message.answer(
-        "❌ У этого промокода закончилось количество активаций."
+  async with db_pool.acquire() as conn:
+    promo = await conn.fetchrow(
+        "SELECT reward_type, reward_value, max_uses, used_count FROM promocodes"
+        " WHERE code = $1",
+        code_text,
     )
-    return
+    if not promo:
+      await message.answer("❌ Неверный или уже использованный промокод.")
+      return
 
-  if reward_type == "tokens":
-    tokens_amount = int(reward_value)
-    cursor.execute(
-        "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-        (tokens_amount, user_id),
-    )
-    conn.commit()
-    await message.answer(
-        f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
-        " токенов**",
-        parse_mode="Markdown",
+    reward_type, reward_value, max_uses, used_count = (
+        promo["reward_type"],
+        promo["reward_value"],
+        promo["max_uses"],
+        promo["used_count"],
     )
 
-  elif reward_type == "premium":
-    days = int(reward_value)
-    expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
-    expire_str = expire_date.strftime("%Y-%m-%d %H:%M:%S")
-    formatted_date = expire_date.strftime("%d.%m.%Y")
-
-    cursor.execute(
-        "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id ="
-        " ?",
-        (expire_str, user_id),
+    used_check = await conn.fetchrow(
+        "SELECT 1 FROM promo_activations WHERE user_id = $1 AND code = $2",
+        user_id,
+        code_text,
     )
-    conn.commit()
-    await message.answer(
-        f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
-        f" **{days} дней** (до {formatted_date})!",
-        parse_mode="Markdown",
+    if used_check:
+      await message.answer("❌ Вы уже активировали этот промокод!")
+      return
+
+    if max_uses > 0 and used_count >= max_uses:
+      await message.answer(
+          "❌ У этого промокода закончилось количество активаций."
+      )
+      return
+
+    if reward_type == "tokens":
+      tokens_amount = int(reward_value)
+      await conn.execute(
+          "UPDATE users SET tokens = tokens + $1 WHERE user_id = $2",
+          tokens_amount,
+          user_id,
+      )
+      await message.answer(
+          f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
+          " токенов**",
+          parse_mode="Markdown",
+      )
+    elif reward_type == "premium":
+      days = int(reward_value)
+      expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
+      formatted_date = expire_date.strftime("%d.%m.%Y")
+      await conn.execute(
+          "UPDATE users SET is_premium = 1, premium_expires = $1 WHERE user_id ="
+          " $2",
+          expire_date,
+          user_id,
+      )
+      await message.answer(
+          f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
+          f" **{days} дней** (до {formatted_date})!",
+          parse_mode="Markdown",
+      )
+
+    await conn.execute(
+        "INSERT INTO promo_activations (user_id, code) VALUES ($1, $2)",
+        user_id,
+        code_text,
+    )
+    await conn.execute(
+        "UPDATE promocodes SET used_count = used_count + 1 WHERE code = $1",
+        code_text,
     )
 
-  cursor.execute(
-      "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
-      (user_id, code_text),
-  )
-  cursor.execute(
-      "UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?",
-      (code_text,),
-  )
-  conn.commit()
 
-
-# --- ПОКУПКА ---
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
-
   if not await check_subscription(user_id, bot):
     await callback.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
     return
 
   p_id = int(callback.data.split("_")[1])
 
-  cursor.execute(
-      "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
-      (p_id,),
-  )
-  product = cursor.fetchone()
+  async with db_pool.acquire() as conn:
+    product = await conn.fetchrow(
+        "SELECT title, price, link, buyers_count FROM products WHERE id = $1",
+        p_id,
+    )
+    if not product:
+      await callback.answer("❌ Этот товар был удален.", show_alert=True)
+      return
 
-  if not product:
-    await callback.answer("❌ Этот товар был удален.", show_alert=True)
-    return
+    title, price_raw, link, buyers_count = (
+        product["title"],
+        product["price"],
+        product["link"],
+        product["buyers_count"],
+    )
 
-  title, price_raw, link, buyers_count = product
-
-  try:
-    base_price = int("".join(filter(str.isdigit, str(price_raw))))
-  except ValueError:
-    base_price = 0
-
-  cursor.execute(
-      "SELECT tokens, is_premium, bought_folders, referrer_id, premium_expires"
-      " FROM users WHERE user_id = ?",
-      (user_id,),
-  )
-  u_data = cursor.fetchone()
-
-  tokens = u_data[0] if u_data else 0
-  is_prem = u_data[1] if u_data else 0
-  bought_folders = u_data[2] if u_data else 0
-  referrer_id = u_data[3] if u_data else 0
-  prem_expires_str = u_data[4] if u_data else None
-
-  if is_prem == 1 and prem_expires_str:
     try:
-      expire_date = datetime.datetime.strptime(
-          prem_expires_str, "%Y-%m-%d %H:%M:%S"
-      )
-      if datetime.datetime.now() >= expire_date:
+      base_price = int("".join(filter(str.isdigit, str(price_raw))))
+    except ValueError:
+      base_price = 0
+
+    u_data = await conn.fetchrow(
+        "SELECT tokens, is_premium, bought_folders, referrer_id,"
+        " premium_expires FROM users WHERE user_id = $1",
+        user_id,
+    )
+    tokens = u_data["tokens"] if u_data else 0
+    is_prem = u_data["is_premium"] if u_data else 0
+    bought_folders = u_data["bought_folders"] if u_data else 0
+    referrer_id = u_data["referrer_id"] if u_data else 0
+    prem_expires = u_data["premium_expires"] if u_data else None
+
+    if is_prem == 1 and prem_expires:
+      if datetime.datetime.now() >= prem_expires:
         is_prem = 0
-        cursor.execute(
+        await conn.execute(
             "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-            " user_id = ?",
-            (user_id,),
+            " user_id = $1",
+            user_id,
         )
-        conn.commit()
-    except Exception:
-      pass
 
-  if is_prem == 1:
-    new_buyers_count = buyers_count + 1
-    cursor.execute(
-        "UPDATE products SET buyers_count = ? WHERE id = ?",
-        (new_buyers_count, p_id),
-    )
-    cursor.execute(
-        "UPDATE users SET bought_folders = ? WHERE user_id = ?",
-        (bought_folders + 1, user_id),
-    )
-    conn.commit()
-
-    text = (
-        f"👑 Премиум-доступ применен!\n\n"
-        f"✅ Вы успешно получили папку {title} бесплатно по подписке!\n\n"
-        f"🔗 Ссылка на скачивание: {link}"
-    )
-    await callback.message.answer(text)
-    await callback.answer()
-    return
-
-  if buyers_count == 0:
-    final_price = max(1, int(base_price * 0.2))
-  else:
-    final_price = base_price
-
-  if tokens < final_price:
-    await callback.answer(
-        f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
-        f" {tokens}.",
-        show_alert=True,
-    )
-    return
-
-  new_tokens = tokens - final_price
-  new_buyers_count = buyers_count + 1
-
-  cursor.execute(
-      "UPDATE users SET tokens = ?, bought_folders = ? WHERE user_id = ?",
-      (new_tokens, bought_folders + 1, user_id),
-  )
-  cursor.execute(
-      "UPDATE products SET buyers_count = ? WHERE id = ?",
-      (new_buyers_count, p_id),
-  )
-  conn.commit()
-
-  if referrer_id and referrer_id != 0:
-    ref_bonus = round(final_price * 0.15)
-    if ref_bonus > 0:
-      cursor.execute(
-          "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-          (ref_bonus, referrer_id),
+    if is_prem == 1:
+      await conn.execute(
+          "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = $1",
+          p_id,
       )
-      conn.commit()
-      try:
-        await bot.send_message(
+      await conn.execute(
+          "UPDATE users SET bought_folders = bought_folders + 1 WHERE user_id ="
+          " $1",
+          user_id,
+      )
+      text = (
+          f"👑 Премиум-доступ применен!\n\n✅ Вы успешно получили папку {title}"
+          f" бесплатно по подписке!\n\n🔗 Ссылка на скачивание: {link}"
+      )
+      await callback.message.answer(text)
+      await callback.answer()
+      return
+
+    final_price = (
+        max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
+    )
+
+    if tokens < final_price:
+      await callback.answer(
+          f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
+          f" {tokens}.",
+          show_alert=True,
+      )
+      return
+
+    new_tokens = tokens - final_price
+    await conn.execute(
+        "UPDATE users SET tokens = $1, bought_folders = bought_folders + 1 WHERE"
+        " user_id = $2",
+        new_tokens,
+        user_id,
+    )
+    await conn.execute(
+        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = $1",
+        p_id,
+    )
+
+    if referrer_id and referrer_id != 0:
+      ref_bonus = round(final_price * 0.15)
+      if ref_bonus > 0:
+        await conn.execute(
+            "UPDATE users SET tokens = tokens + $1 WHERE user_id = $2",
+            ref_bonus,
             referrer_id,
-            f"💰 Реферальный бонус!\nВаш реферал совершил покупку.\n🎁 Вам"
-            f" начислено {ref_bonus} токенов (15% от покупки).",
         )
-      except Exception:
-        pass
+        try:
+          await bot.send_message(
+              referrer_id,
+              f"💰 Реферальный бонус!\nВаш реферал совершил покупку.\n🎁 Вам"
+              f" начислено {ref_bonus} токенов (15% от покупки).",
+          )
+        except Exception:
+          pass
 
   if buyers_count == 0:
     text = (
-        f"🎉 Поздравляем! Ты первый покупатель папки {title}!\n"
-        f"🔥 Применилась скидка 80%!\nСписано: {final_price} токенов.\n"
-        f"💲 Ваш остаток: {new_tokens} токенов.\n\n"
-        f"🔗 Твоя ссылка на скачивание: {link}"
+        f"🎉 Поздравляем! Ты первый покупатель папки {title}!\n🔥 Применилась"
+        f" скидка 80%!\nСписано: {final_price} токенов.\n💲 Ваш остаток:"
+        f" {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание: {link}"
     )
   else:
     text = (
-        f"✅ Спасибо за покупку папки {title}!\n"
-        f"💰 Списано: {final_price} токенов. Остаток: {new_tokens} токенов.\n\n"
-        f"🔗 Твоя ссылка на скачивание: {link}"
+        f"✅ Спасибо за покупку папки {title}!\n💰 Списано: {final_price}"
+        f" токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на"
+        f" скачивание: {link}"
     )
 
   await callback.message.answer(text)
   await callback.answer()
 
 
-# --- АДМИНСКОЕ РЕДАКТИРОВАНИЕ ТОВАРОВ ---
 @router.callback_query(F.data == "edit_product_list")
 async def edit_product_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
     return
-
-  cursor.execute("SELECT id, title FROM products")
-  products = cursor.fetchall()
+  async with db_pool.acquire() as conn:
+    products = await conn.fetch("SELECT id, title FROM products")
 
   if not products:
     await callback.message.edit_text("📭 Нет товаров для редактирования.")
     return
 
-  keyboard_buttons = []
-  for p_id, title in products:
-    keyboard_buttons.append(
-        [
-            InlineKeyboardButton(
-                text=f"✏️ {title}", callback_data=f"edit_prod_{p_id}"
-            )
-        ]
-    )
-
+  keyboard_buttons = [
+      [InlineKeyboardButton(text=f"✏️ {p['title']}", callback_data=f"edit_prod_{p['id']}")]
+      for p in products
+  ]
   await callback.message.edit_text(
       "Выбери товар для редактирования:",
       reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
@@ -714,12 +657,13 @@ async def edit_product_list(callback: CallbackQuery):
 async def select_edit_field(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     return
-
   p_id = int(callback.data.split("_")[2])
   await state.update_data(product_id=p_id)
 
-  cursor.execute("SELECT title, price, link FROM products WHERE id = ?", (p_id,))
-  product = cursor.fetchone()
+  async with db_pool.acquire() as conn:
+    product = await conn.fetchrow(
+        "SELECT title, price, link FROM products WHERE id = $1", p_id
+    )
 
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -731,19 +675,13 @@ async def select_edit_field(callback: CallbackQuery, state: FSMContext):
                   text="💰 Цену", callback_data="field_price"
               ),
           ],
-          [
-              InlineKeyboardButton(
-                  text="🔗 Ссылку", callback_data="field_link"
-              )
-          ],
+          [InlineKeyboardButton(text="🔗 Ссылку", callback_data="field_link")],
       ]
   )
-
   await callback.message.edit_text(
-      f"✏️ **Редактирование товара:** {product[0]}\n"
-      f"💰 Текущая цена: {product[1]} токенов\n"
-      f"🔗 Ссылка: {product[2]}\n\n"
-      "Что именно хочешь изменить?",
+      f"✏️ **Редактирование товара:** {product['title']}\n💰 Текущая цена:"
+      f" {product['price']} токенов\n🔗 Ссылка: {product['link']}\n\nЧто именно"
+      " хочешь изменить?",
       reply_markup=keyboard,
       parse_mode="Markdown",
   )
@@ -753,7 +691,6 @@ async def select_edit_field(callback: CallbackQuery, state: FSMContext):
 async def prompt_new_value(callback: CallbackQuery, state: FSMContext):
   field = callback.data.split("_")[1]
   await state.update_data(field=field)
-
   field_names = {
       "title": "новое название",
       "price": "новую цену в токенах",
@@ -772,18 +709,23 @@ async def process_new_value(message: Message, state: FSMContext):
   new_val = message.text.strip()
   await state.clear()
 
-  if field == "title":
-    cursor.execute("UPDATE products SET title = ? WHERE id = ?", (new_val, p_id))
-  elif field == "price":
-    cursor.execute("UPDATE products SET price = ? WHERE id = ?", (new_val, p_id))
-  elif field == "link":
-    cursor.execute("UPDATE products SET link = ? WHERE id = ?", (new_val, p_id))
+  async with db_pool.acquire() as conn:
+    if field == "title":
+      await conn.execute(
+          "UPDATE products SET title = $1 WHERE id = $2", new_val, p_id
+      )
+    elif field == "price":
+      await conn.execute(
+          "UPDATE products SET price = $1 WHERE id = $2", new_val, p_id
+      )
+    elif field == "link":
+      await conn.execute(
+          "UPDATE products SET link = $1 WHERE id = $2", new_val, p_id
+      )
 
-  conn.commit()
   await message.answer("✅ Товар успешно обновлен!")
 
 
-# --- АДМИНСКОЕ СОЗДАНИЕ ПРОМОКОДОВ ---
 @router.callback_query(F.data == "admin_create_promo")
 async def start_create_promo(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -798,7 +740,6 @@ async def start_create_promo(callback: CallbackQuery, state: FSMContext):
 @router.message(CreatePromoState.code)
 async def process_promo_code(message: Message, state: FSMContext):
   await state.update_data(code=message.text.strip())
-
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [
@@ -820,7 +761,6 @@ async def process_promo_code(message: Message, state: FSMContext):
 async def process_promo_type(callback: CallbackQuery, state: FSMContext):
   p_type = callback.data.split("_")[2]
   await state.update_data(type=p_type)
-
   if p_type == "tokens":
     await callback.message.answer(
         "💰 Введите количество токенов (число, например: 50):"
@@ -829,7 +769,6 @@ async def process_promo_type(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "⏳ Введите количество дней Премиума (число, например: 30):"
     )
-
   await state.set_state(CreatePromoState.value)
   await callback.answer()
 
@@ -839,7 +778,6 @@ async def process_promo_value(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите целое число.")
     return
-
   await state.update_data(value=message.text)
   await message.answer(
       "🔢 Введите **количество использований** (например: 10 или 100):\n*(Введите"
@@ -854,21 +792,21 @@ async def process_promo_uses(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите число использований.")
     return
-
   max_uses = int(message.text)
   data = await state.get_data()
-
-  code = data["code"]
-  reward_type = data["type"]
-  reward_value = data["value"]
+  code, reward_type, reward_value = data["code"], data["type"], data["value"]
   await state.clear()
 
-  cursor.execute(
-      "INSERT OR REPLACE INTO promocodes (code, reward_type, reward_value,"
-      " max_uses, used_count) VALUES (?, ?, ?, ?, 0)",
-      (code, reward_type, reward_value, max_uses),
-  )
-  conn.commit()
+  async with db_pool.acquire() as conn:
+    await conn.execute(
+        "INSERT INTO promocodes (code, reward_type, reward_value, max_uses,"
+        " used_count) VALUES ($1, $2, $3, $4, 0) ON CONFLICT (code) DO UPDATE"
+        " SET reward_type = $2, reward_value = $3, max_uses = $4",
+        code,
+        reward_type,
+        reward_value,
+        max_uses,
+    )
 
   uses_text = f"{max_uses} раз" if max_uses > 0 else "Безлимитно"
   reward_desc = (
@@ -876,7 +814,6 @@ async def process_promo_uses(message: Message, state: FSMContext):
       if reward_type == "tokens"
       else f"Премиум на {reward_value} дней"
   )
-
   await message.answer(
       f"✅ **Промокод успешно создан!**\n\n🎟 Код: `{code}`\n🎁 Награда:"
       f" {reward_desc}\n👥 Лимит: {uses_text}",
@@ -884,7 +821,6 @@ async def process_promo_uses(message: Message, state: FSMContext):
   )
 
 
-# --- ВЫДАЧА ПРЕМИУМА ЧЕРЕЗ АДМИНКУ ---
 @router.callback_query(F.data == "admin_give_premium")
 async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -902,7 +838,6 @@ async def process_give_premium_id(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
     return
-
   target_id = int(message.text)
   await state.update_data(target_id=target_id)
   await message.answer(
@@ -918,33 +853,30 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите число дней цифрами.")
     return
-
   days = int(message.text)
   data = await state.get_data()
   target_id = data["target_id"]
   await state.clear()
 
   expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
-  expire_str = expire_date.strftime("%Y-%m-%d %H:%M:%S")
   formatted_date = expire_date.strftime("%d.%m.%Y")
 
-  cursor.execute(
-      "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
-      " bought_folders, referrer_id) VALUES (?, 0, 1, 0, 0)",
-      (target_id,),
-  )
-  cursor.execute(
-      "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id = ?",
-      (expire_str, target_id),
-  )
-  conn.commit()
+  async with db_pool.acquire() as conn:
+    await conn.execute(
+        """
+            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, premium_expires) 
+            VALUES ($1, 0, 1, 0, 0, $2)
+            ON CONFLICT (user_id) DO UPDATE SET is_premium = 1, premium_expires = $2
+        """,
+        target_id,
+        expire_date,
+    )
 
   await message.answer(
       f"✅ **Премиум успешно выдан!**\n\n🆔 Пользователь: `{target_id}`\n📅"
       f" Срок: **{days} дней** (до {formatted_date})",
       parse_mode="Markdown",
   )
-
   try:
     await bot.send_message(
         target_id,
@@ -988,18 +920,18 @@ async def process_price(message: Message, state: FSMContext):
 @router.message(AddProduct.link)
 async def process_link(message: Message, state: FSMContext):
   data = await state.get_data()
-  title = data["title"]
-  price = data["price"]
-  link = message.text
-
-  cursor.execute(
-      "INSERT INTO products (title, price, link, buyers_count) VALUES (?, ?, ?,"
-      " 0)",
-      (title, price, link),
-  )
-  conn.commit()
-
+  title, price, link = data["title"], data["price"], message.text
   await state.clear()
+
+  async with db_pool.acquire() as conn:
+    await conn.execute(
+        "INSERT INTO products (title, price, link, buyers_count) VALUES ($1,"
+        " $2, $3, 0)",
+        title,
+        price,
+        link,
+    )
+
   await message.answer(
       f"✅ Папка успешно добавлена в магазин!\n\n📌 Название: {title}\n💰 Цена:"
       f" {price} токенов\n🔗 Ссылка: {link}\n🎁 Активирована скидка 80% для"
@@ -1011,24 +943,22 @@ async def process_link(message: Message, state: FSMContext):
 async def delete_product_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
     return
-
-  cursor.execute("SELECT id, title FROM products")
-  products = cursor.fetchall()
+  async with db_pool.acquire() as conn:
+    products = await conn.fetch("SELECT id, title FROM products")
 
   if not products:
     await callback.message.edit_text("📭 Нет товаров для удаления.")
     return
 
-  keyboard_buttons = []
-  for p_id, title in products:
-    keyboard_buttons.append(
-        [
-            InlineKeyboardButton(
-                text=f"❌ Удалить: {title}", callback_data=f"del_prod_{p_id}"
-            )
-        ]
-    )
-
+  keyboard_buttons = [
+      [
+          InlineKeyboardButton(
+              text=f"❌ Удалить: {p['title']}",
+              callback_data=f"del_prod_{p['id']}",
+          )
+      ]
+      for p in products
+  ]
   await callback.message.edit_text(
       "Выбери товар для удаления:",
       reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
@@ -1039,10 +969,9 @@ async def delete_product_list(callback: CallbackQuery):
 async def delete_product_execute(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
     return
-  p_id = callback.data.split("_")[2]
-
-  cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
-  conn.commit()
+  p_id = int(callback.data.split("_")[2])
+  async with db_pool.acquire() as conn:
+    await conn.execute("DELETE FROM products WHERE id = $1", p_id)
 
   await callback.answer("Товар удален!")
   await delete_product_list(callback)
@@ -1062,19 +991,15 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
 @router.message(BroadcastState.message)
 async def send_broadcast(message: Message, state: FSMContext):
   await state.clear()
+  async with db_pool.acquire() as conn:
+    users = await conn.fetch("SELECT user_id FROM users")
 
-  cursor.execute("SELECT user_id FROM users")
-  users = cursor.fetchall()
-
-  success = 0
-  fail = 0
-
+  success, fail = 0, 0
   status_msg = await message.answer("⏳ Рассылка началась...")
 
   for user in users:
-    u_id = user[0]
     try:
-      await message.send_copy(chat_id=u_id)
+      await message.send_copy(chat_id=user["user_id"])
       success += 1
       await asyncio.sleep(0.05)
     except Exception:
@@ -1086,14 +1011,14 @@ async def send_broadcast(message: Message, state: FSMContext):
   )
 
 
-# --- ЗАПУСК БОТА ---
 async def main():
+  await init_db()
   bot = Bot(token=TOKEN)
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
   await bot.delete_webhook(drop_pending_updates=True)
-  print("Бот успешно запущен и работает 24/7!")
+  print("Бот успешно запущен на Supabase (PostgreSQL) и работает 24/7!")
   await dp.start_polling(bot)
 
 
