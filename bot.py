@@ -18,7 +18,7 @@ from aiogram.types import (
 )
 
 # ТОКЕН ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER
-TOKEN = os.getenv("TOKEN", "8549927929:AAE_aDtLHVjkR9h50ABM233OZprEa6l-GvM")
+TOKEN = os.getenv("TOKEN", "8549927929:AAGLHW1GnV3mZq06TBELwFXo6UkjQfHi5fE")
 PORT = int(os.getenv("PORT", 10000))
 DB_NAME = "bot.db"
 
