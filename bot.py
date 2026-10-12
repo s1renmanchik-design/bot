@@ -96,19 +96,16 @@ async def cmd_start(message: Message, bot: Bot):
   user_id = message.from_user.id
   args = message.text.split()
 
-  # Проверяем, есть ли реферальный аргумент (например, /start 5681420389)
   referrer_id = None
   if len(args) > 1 and args[1].isdigit():
     potential_ref = int(args[1])
-    if potential_ref != user_id:  штука, чтобы не регал сам себя
+    if potential_ref != user_id:
       referrer_id = potential_ref
 
-  # Проверяем, существует ли уже пользователь в базе
   cursor.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
   existing_user = cursor.fetchone()
 
   if existing_user is None:
-    # Новый пользователь
     ref_to_save = referrer_id if referrer_id else 0
     cursor.execute(
         "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
@@ -117,7 +114,6 @@ async def cmd_start(message: Message, bot: Bot):
     )
     conn.commit()
 
-    # Если реферер указан, начисляем ему 15 токенов и уведомляем
     if referrer_id:
       cursor.execute(
           "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
@@ -134,7 +130,6 @@ async def cmd_start(message: Message, bot: Bot):
       except Exception:
         pass
   else:
-    # Если пользователь уже есть, но referrer_id не был задан, а сейчас перешел по рефке
     if existing_user[0] == 0 and referrer_id:
       cursor.execute(
           "UPDATE users SET referrer_id = ? WHERE user_id = ?",
@@ -324,7 +319,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   except ValueError:
     base_price = 0
 
-  # Получаем данные пользователя (включая его referrer_id)
   cursor.execute(
       "SELECT tokens, is_premium, bought_folders, referrer_id FROM users WHERE"
       " user_id = ?",
@@ -337,7 +331,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   bought_folders = u_data[2] if u_data else 0
   referrer_id = u_data[3] if u_data else 0
 
-  # Если есть Премиум — выдаем бесплатно
   if is_prem == 1:
     new_buyers_count = buyers_count + 1
     cursor.execute(
@@ -359,13 +352,11 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     return
 
-  # Считаем цену со скидкой 80% для первого покупателя
   if buyers_count == 0:
     final_price = max(1, int(base_price * 0.2))
   else:
     final_price = base_price
 
-  # Проверяем баланс
   if tokens < final_price:
     await callback.answer(
         f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
@@ -374,7 +365,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     )
     return
 
-  # Списываем токены у покупателя и обновляем покупки
   new_tokens = tokens - final_price
   new_buyers_count = buyers_count + 1
 
@@ -388,7 +378,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   )
   conn.commit()
 
-  # Начисляем 15% рефереру (с округлением)
   if referrer_id and referrer_id != 0:
     ref_bonus = round(final_price * 0.15)
     if ref_bonus > 0:
