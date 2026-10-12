@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+from aiohttp import web
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
@@ -18,6 +19,7 @@ from aiogram.types import (
 
 # ТОКЕН ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER
 TOKEN = os.getenv("TOKEN", "8549927929:AAE_aDtLHVjkR9h50ABM233OZprEa6l-GvM")
+PORT = int(os.getenv("PORT", 10000))
 DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
@@ -673,7 +675,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text == "🪙 Как получить токены?":
     tokens_text = (
         "📌 Как получить токены?\n\n1. Возьмите фото."
-        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте его in комментариях под"
+        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте его в комментариях под"
         " постами/ответами другим людям. ГЛАВНОЕ: тема должна касаться по типу"
         " сестры и брата и тд.\n3. Отправляйте доказательства (скриншоты) в"
         " директ канала. https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото"
@@ -1064,14 +1066,32 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (ЧТОБЫ ПОРТ БЫЛ ОТКРЫТ) ---
+async def handle_ping(request):
+  return web.Response(text="Bot is running!")
+
+
+async def start_web_server():
+  app = web.Application()
+  app.router.add_get("/", handle_ping)
+  runner = web.AppRunner(app)
+  await runner.setup()
+  site = web.TCPSite(runner, "0.0.0.0", PORT)
+  await site.start()
+
+
 async def main():
   await init_db()
+  await start_web_server()  # Запускаем мини-сервер для порта Render
+
   bot = Bot(token=TOKEN)
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
   await bot.delete_webhook(drop_pending_updates=True)
-  print("Бот успешно запущен на SQLite и работает без ошибок сети!")
+  print(
+      f"Бот успешно запущен на SQLite и веб-сервер слушает порт {PORT}!"
+  )
   await dp.start_polling(bot)
 
 
