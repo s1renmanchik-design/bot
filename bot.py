@@ -49,6 +49,15 @@ cursor.execute(
     )
 """
 )
+
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS promocodes (
+        code TEXT PRIMARY KEY,
+        reward_tokens INTEGER
+    )
+"""
+)
 conn.commit()
 
 
@@ -65,6 +74,11 @@ class BroadcastState(StatesGroup):
 
 class PromocodeState(StatesGroup):
   code = State()
+
+
+class CreatePromoState(StatesGroup):
+  code = State()
+  reward = State()
 
 
 class GivePremiumState(StatesGroup):
@@ -123,9 +137,8 @@ async def cmd_start(message: Message, bot: Bot):
       try:
         await bot.send_message(
             referrer_id,
-            "🎉 **По реферальной ссылке зарегистрировался новый пользователь!**\n🎁"
-            " Вам начислено бонусных **15 токенов**!",
-            parse_mode="Markdown",
+            "🎉 По реферальной ссылке зарегистрировался новый пользователь!\n🎁"
+            " Вам начислено бонусных 15 токенов!",
         )
       except Exception:
         pass
@@ -143,9 +156,8 @@ async def cmd_start(message: Message, bot: Bot):
       try:
         await bot.send_message(
             referrer_id,
-            "🎉 **По вашей реферальной ссылке активировался пользователь!**\n🎁"
-            " Вам начислено бонусных **15 токенов**!",
-            parse_mode="Markdown",
+            "🎉 По вашей реферальной ссылке активировался пользователь!\n🎁 Вам"
+            " начислено бонусных 15 токенов!",
         )
       except Exception:
         pass
@@ -184,14 +196,14 @@ async def profile_handler(message: Message):
   )
 
   text = (
-      f"👤 **Ваш Профиль**\n\n"
-      f"🆔 Ваш ID: `{user_id}`\n"
+      f"👤 Ваш Профиль\n\n"
+      f"🆔 Ваш ID: {user_id}\n"
       f"💲 Баланс: {tokens} токенов\n"
       f"👑 Премиум-подписка: {prem_status}\n"
       f"📦 Куплено папок: {bought} шт."
   )
 
-  await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+  await message.answer(text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "enter_promocode")
@@ -203,8 +215,33 @@ async def promo_prompt(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PromocodeState.code)
 async def promo_check(message: Message, state: FSMContext):
+  user_id = message.from_user.id
+  code_text = message.text.strip()
   await state.clear()
-  await message.answer("❌ Неверный или уже использованный промокод.")
+
+  cursor.execute(
+      "SELECT reward_tokens FROM promocodes WHERE code = ?", (code_text,)
+  )
+  promo = cursor.fetchone()
+
+  if not promo:
+    await message.answer("❌ Неверный или уже использованный промокод.")
+    return
+
+  reward = promo[0]
+
+  # Начисляем токены юзеру
+  cursor.execute(
+      "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+      (reward, user_id),
+  )
+  # Удаляем использованный промокод
+  cursor.execute("DELETE FROM promocodes WHERE code = ?", (code_text,))
+  conn.commit()
+
+  await message.answer(
+      f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{reward} токенов**"
+  )
 
 
 @router.message(F.text == "👥 Реферальная система")
@@ -212,30 +249,28 @@ async def referral_handler(message: Message):
   bot_info = await message.bot.get_me()
   ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
   text = (
-      "👥 **Реферальная система**\n\n"
+      "👥 Реферальная система\n\n"
       "Приглашай друзей по своей персональной ссылке:\n"
-      f"`{ref_link}`\n\n"
-      "🎁 **Бонусы:**\n"
-      "• За каждого приглашенного друга вы получаете **15 токенов**!\n"
-      "• Получайте **15%** от суммы всех покупок токенами ваших рефералов!"
+      f"{ref_link}\n\n"
+      "🎁 Бонусы:\n"
+      "• За каждого приглашенного друга вы получаете 15 токенов!\n"
+      "• Получайте 15% от суммы всех покупок токенами ваших рефералов!"
   )
-  await message.answer(text, parse_mode="Markdown")
+  await message.answer(text)
 
 
 @router.message(F.text == "🪙 Как получить токены?")
 async def tokens_handler(message: Message):
   text = (
-      "📌 **Как получить токены?**\n\n"
+      "📌 Как получить токены?\n\n"
       "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
       "2. Оставляйте его в комментариях под постами/ответами другим людям."
       " ГЛАВНОЕ: тема должна касаться по типу сестры и брата и тд.\n"
       "3. Отправляйте доказательства (скриншоты) в директ канала."
       " https://t.me/JmcDeveloper?direct\n\n"
-      "💰 **1 отправка фото в комментариях = 1 токен!**"
+      "💰 1 отправка фото в комментариях = 1 токен!"
   )
-  await message.answer(
-      text, parse_mode="Markdown", disable_web_page_preview=True
-  )
+  await message.answer(text, disable_web_page_preview=True)
 
 
 @router.message(F.text == "👑 Премиум-подписка")
@@ -251,13 +286,13 @@ async def premium_handler(message: Message):
       ]
   )
   text = (
-      "👑 **Премиум-подписка на 1 МЕСЯЦ (30 дней)**\n\n"
-      "Дает право покупать **АБСОЛЮТНО ЛЮБЫЕ** папки бесплатно (даже с 0"
-      " токенов на балансе)!\n\n"
-      "💳 **Стоимость:**\n"
+      "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\n"
+      "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ папки бесплатно (даже с 0 токенов на"
+      " балансе)!\n\n"
+      "💳 Стоимость:\n"
       "• 50 Звезд (любым подарком в Telegram за 50 звезд на профиль @ucu52)."
   )
-  await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+  await message.answer(text, reply_markup=keyboard)
 
 
 # --- МАГАЗИН И ПАПКИ С АЛЬТУХАМИ ---
@@ -290,7 +325,7 @@ async def shop_handler(message: Message):
 
   keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
   await message.answer(
-      "🛍 **Доступные папки с альтухами:**\n*(Нажми на нужную, чтобы забрать"
+      "🛍 Доступные папки с альтухами:\n*(Нажми на нужную, чтобы забрать"
       " ссылку)*",
       reply_markup=keyboard,
       parse_mode="Markdown",
@@ -344,11 +379,11 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     conn.commit()
 
     text = (
-        f"👑 **Премиум-доступ применен!**\n\n"
-        f"✅ Вы успешно получили папку *{title}* бесплатно по подписке!\n\n"
+        f"👑 Премиум-доступ применен!\n\n"
+        f"✅ Вы успешно получили папку {title} бесплатно по подписке!\n\n"
         f"🔗 Ссылка на скачивание: {link}"
     )
-    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.message.answer(text)
     await callback.answer()
     return
 
@@ -389,28 +424,27 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       try:
         await bot.send_message(
             referrer_id,
-            f"💰 **Реферальный бонус!**\nВаш реферал совершил покупку.\n🎁 Вам"
-            f" начислено **{ref_bonus} токенов** (15% от покупки).",
-            parse_mode="Markdown",
+            f"💰 Реферальный бонус!\nВаш реферал совершил покупку.\n🎁 Вам"
+            f" начислено {ref_bonus} токенов (15% от покупки).",
         )
       except Exception:
         pass
 
   if buyers_count == 0:
     text = (
-        f"🎉 Поздравляем! Ты **первый покупатель** папки *{title}*!\n"
-        f"🔥 Применилась **скидка 80%**! Списано: {final_price} токенов.\n"
+        f"🎉 Поздравляем! Ты первый покупатель папки {title}!\n"
+        f"🔥 Применилась скидка 80%!\nСписано: {final_price} токенов.\n"
         f"💲 Ваш остаток: {new_tokens} токенов.\n\n"
         f"🔗 Твоя ссылка на скачивание: {link}"
     )
   else:
     text = (
-        f"✅ Спасибо за покупку папки *{title}*!\n"
+        f"✅ Спасибо за покупку папки {title}!\n"
         f"💰 Списано: {final_price} токенов. Остаток: {new_tokens} токенов.\n\n"
         f"🔗 Твоя ссылка на скачивание: {link}"
     )
 
-  await callback.message.answer(text, parse_mode="Markdown")
+  await callback.message.answer(text)
   await callback.answer()
 
 
@@ -437,6 +471,11 @@ async def admin_panel_text(message: Message):
           ],
           [
               InlineKeyboardButton(
+                  text="🎟 Создать промокод", callback_data="admin_create_promo"
+              )
+          ],
+          [
+              InlineKeyboardButton(
                   text="👑 Выдать Премиум пользователю",
                   callback_data="admin_give_premium",
               )
@@ -449,9 +488,46 @@ async def admin_panel_text(message: Message):
       ]
   )
 
+  await message.answer("⚙️ Панель администратора:", reply_markup=keyboard)
+
+
+# --- СОЗДАНИЕ ПРОМОКОДА АДМИНОМ ---
+@router.callback_query(F.data == "admin_create_promo")
+async def start_create_promo(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    return
+  await callback.message.answer("🎟 Введите текст промокода (например: `START100`):")
+  await state.set_state(CreatePromoState.code)
+  await callback.answer()
+
+
+@router.message(CreatePromoState.code)
+async def process_promo_code(message: Message, state: FSMContext):
+  await state.update_data(code=message.text.strip())
+  await message.answer("💰 Введите количество токенов за этот промокод (число):")
+  await state.set_state(CreatePromoState.reward)
+
+
+@router.message(CreatePromoState.reward)
+async def process_promo_reward(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! Введите целое число токенов.")
+    return
+
+  reward = int(message.text)
+  data = await state.get_data()
+  code = data["code"]
+  await state.clear()
+
+  cursor.execute(
+      "INSERT OR REPLACE INTO promocodes (code, reward_tokens) VALUES (?, ?)",
+      (code, reward),
+  )
+  conn.commit()
+
   await message.answer(
-      "⚙️ **Панель администратора:**",
-      reply_markup=keyboard,
+      f"✅ Промокод успешно создан!\n\n🎟 Код: `{code}`\n🎁 Награда: {reward}"
+      " токенов",
       parse_mode="Markdown",
   )
 
@@ -462,7 +538,7 @@ async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     return
   await callback.message.answer(
-      "👑 Введи **Telegram ID** пользователя, которому нужно выдать Премиум:"
+      "👑 Введи Telegram ID пользователя, которому нужно выдать Премиум:"
   )
   await state.set_state(GivePremiumState.user_id)
   await callback.answer()
@@ -488,16 +564,14 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
   conn.commit()
 
   await message.answer(
-      f"✅ **Премиум успешно выдан пользователю с ID:** `{target_id}`",
-      parse_mode="Markdown",
+      f"✅ Премиум успешно выдан пользователю с ID: {target_id}"
   )
 
   try:
     await bot.send_message(
         target_id,
-        "🎉 **Вам активирована Премиум-подписка!**\nТеперь любые папки в"
-        " магазине доступны бесплатно.",
-        parse_mode="Markdown",
+        "🎉 Вам активирована Премиум-подписка!\nТеперь любые папки в магазине"
+        " доступны бесплатно.",
     )
   except Exception:
     pass
@@ -509,7 +583,7 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     return
   await callback.message.answer(
-      "📝 Введи **название** папки (например: *Альтухи #15*):"
+      "📝 Введи название папки (например: Альтухи #15):"
   )
   await state.set_state(AddProduct.title)
   await callback.answer()
@@ -518,9 +592,7 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
 @router.message(AddProduct.title)
 async def process_title(message: Message, state: FSMContext):
   await state.update_data(title=message.text)
-  await message.answer(
-      "💰 Введи **цену в токенах** (например: *15* или *50*):"
-  )
+  await message.answer("💰 Введи цену в токенах (например: 15 или 50):")
   await state.set_state(AddProduct.price)
 
 
@@ -528,7 +600,7 @@ async def process_title(message: Message, state: FSMContext):
 async def process_price(message: Message, state: FSMContext):
   await state.update_data(price=message.text)
   await message.answer(
-      "🔗 Отправь **ссылку** на скачивание (Mega / облако):\n\n*(⚠️ Напоминание: у"
+      "🔗 Отправь ссылку на скачивание (Mega / облако):\n\n*(⚠️ Напоминание: у"
       " первого покупателя этого товара будет скидка 80%)*"
   )
   await state.set_state(AddProduct.link)
@@ -551,9 +623,8 @@ async def process_link(message: Message, state: FSMContext):
   await state.clear()
   await message.answer(
       f"✅ Папка успешно добавлена в магазин!\n\n📌 Название: {title}\n💰 Цена:"
-      f" {price} токенов\n🔗 Ссылка: {link}\n🎁 *Активирована скидка 80% для"
-      " первого покупателя!*",
-      parse_mode="Markdown",
+      f" {price} токенов\n🔗 Ссылка: {link}\n🎁 Активирована скидка 80% для"
+      " первого покупателя!"
   )
 
 
@@ -605,8 +676,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     return
   await callback.message.answer(
-      "📢 Отправь текст, картинку или видео для рассылки **всем** пользователям"
-      " бота:"
+      "📢 Отправь текст, картинку или видео для рассылки всем пользователям бота:"
   )
   await state.set_state(BroadcastState.message)
   await callback.answer()
@@ -634,7 +704,7 @@ async def send_broadcast(message: Message, state: FSMContext):
       fail += 1
 
   await status_msg.edit_text(
-      f"✅ **Рассылка завершена!**\n\n📤 Доставлено: {success}\n❌ Заблокировали"
+      f"✅ Рассылка завершена!\n\n📤 Доставлено: {success}\n❌ Заблокировали"
       f" бота: {fail}"
   )
 
