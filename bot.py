@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import sqlite3
 from aiogram import Bot, Dispatcher, F, Router
@@ -23,7 +24,7 @@ ADMIN_ID = 5681420389
 
 # КАНАЛ ДЛЯ ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ
 CHANNEL_ID = -1002925107145
-CHANNEL_USERNAME = "iiris_cnn_bot"  # или юзернейм канала, если есть (например, "my_channel")
+CHANNEL_USERNAME = "iiris_cnn_bot"
 
 # Инициализация базы данных SQLite
 conn = sqlite3.connect("bot_data.db", check_same_thread=False)
@@ -37,10 +38,17 @@ cursor.execute(
         tokens INTEGER DEFAULT 0,
         is_premium INTEGER DEFAULT 0,
         bought_folders INTEGER DEFAULT 0,
-        referrer_id INTEGER DEFAULT 0
+        referrer_id INTEGER DEFAULT 0,
+        premium_expires TEXT DEFAULT NULL
     )
 """
 )
+
+# Автоматически добавляем стобец premium_expires, если база уже существовала
+try:
+  cursor.execute("ALTER TABLE users ADD COLUMN premium_expires TEXT DEFAULT NULL")
+except Exception:
+  pass
 
 cursor.execute(
     """
@@ -87,6 +95,7 @@ class CreatePromoState(StatesGroup):
 
 class GivePremiumState(StatesGroup):
   user_id = State()
+  days = State()
 
 
 router = Router()
@@ -96,12 +105,10 @@ router = Router()
 async def check_subscription(user_id: int, bot: Bot) -> bool:
   try:
     member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-    # Статусы, при которых считается, что пользователь подписан
     if member.status in ["creator", "administrator", "member"]:
       return True
     return False
   except Exception:
-    # Если бот не админ в канале или ошибка ID, пропускаем (но лучше сделать бота админом канала)
     return True
 
 
@@ -145,12 +152,11 @@ def get_main_keyboard(user_id):
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-# --- КОМАНДА /start С РЕФЕРАЛКОЙ И ПРОВЕРКОЙ ПОДПИСКИ ---
+# --- КОМАНДА /start ---
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
   user_id = message.from_user.id
 
-  # Проверяем подписку
   if not await check_subscription(user_id, bot):
     await not_subscribed_message(message)
     return
@@ -233,7 +239,7 @@ async def process_check_sub(callback: CallbackQuery, bot: Bot):
     )
 
 
-# --- ОБРАБОТКА КНОПОК ИЗ МЕНЮ С КОНТРОЛЕМ ПОДПИСКИ ---
+# --- ОБРАБОТКА КНОПОК ИЗ МЕНЮ ---
 @router.message(
     F.text.in_(
         {
@@ -250,7 +256,6 @@ async def process_check_sub(callback: CallbackQuery, bot: Bot):
 async def menu_router(message: Message, bot: Bot):
   user_id = message.from_user.id
 
-  # Проверяем подписку перед любым действием
   if not await check_subscription(user_id, bot):
     await not_subscribed_message(message)
     return
@@ -259,8 +264,8 @@ async def menu_router(message: Message, bot: Bot):
 
   if text == "👤 Мой Профиль":
     cursor.execute(
-        "SELECT tokens, is_premium, bought_folders FROM users WHERE user_id ="
-        " ?",
+        "SELECT tokens, is_premium, bought_folders, premium_expires FROM users"
+        " WHERE user_id = ?",
         (user_id,),
     )
     user_data = cursor.fetchone()
@@ -268,8 +273,31 @@ async def menu_router(message: Message, bot: Bot):
     tokens = user_data[0] if user_data else 0
     is_prem = user_data[1] if user_data else 0
     bought = user_data[2] if user_data else 0
+    prem_expires_str = user_data[3] if user_data else None
 
-    prem_status = "✅ Активна" if is_prem == 1 else "❌ Не активна"
+    # Проверка срока действия премиума
+    prem_status = "❌ Не активна"
+    if is_prem == 1 and prem_expires_str:
+      try:
+        expire_date = datetime.datetime.strptime(
+            prem_expires_str, "%Y-%m-%d %H:%M:%S"
+        )
+        now = datetime.datetime.now()
+        if now < expire_date:
+          days_left = (expire_date - now).days
+          formatted_date = expire_date.strftime("%d.%m.%Y")
+          prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
+        else:
+          # Срок истек
+          cursor.execute(
+              "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
+              " user_id = ?",
+              (user_id,),
+          )
+          conn.commit()
+          prem_status = "❌ Не активна (истекла)"
+      except Exception:
+        prem_status = "✅ Активна"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -450,9 +478,7 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
 
   if not await check_subscription(user_id, bot):
-    await callback.answer(
-        "❌ Сначала подпишитесь на канал!", show_alert=True
-    )
+    await callback.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
     return
 
   p_id = int(callback.data.split("_")[1])
@@ -475,8 +501,8 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     base_price = 0
 
   cursor.execute(
-      "SELECT tokens, is_premium, bought_folders, referrer_id FROM users WHERE"
-      " user_id = ?",
+      "SELECT tokens, is_premium, bought_folders, referrer_id, premium_expires"
+      " FROM users WHERE user_id = ?",
       (user_id,),
   )
   u_data = cursor.fetchone()
@@ -485,6 +511,24 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   is_prem = u_data[1] if u_data else 0
   bought_folders = u_data[2] if u_data else 0
   referrer_id = u_data[3] if u_data else 0
+  prem_expires_str = u_data[4] if u_data else None
+
+  # Проверка премиума при покупке
+  if is_prem == 1 and prem_expires_str:
+    try:
+      expire_date = datetime.datetime.strptime(
+          prem_expires_str, "%Y-%m-%d %H:%M:%S"
+      )
+      if datetime.datetime.now() >= expire_date:
+        is_prem = 0
+        cursor.execute(
+            "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
+            " user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+    except Exception:
+      pass
 
   if is_prem == 1:
     new_buyers_count = buyers_count + 1
@@ -524,8 +568,7 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   new_buyers_count = buyers_count + 1
 
   cursor.execute(
-      "UPDATE users SET tokens = tokens + ?, bought_folders = ? WHERE user_id ="
-      " ?",
+      "UPDATE users SET tokens = ?, bought_folders = ? WHERE user_id = ?",
       (new_tokens, bought_folders + 1, user_id),
   )
   cursor.execute(
@@ -569,7 +612,82 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   await callback.answer()
 
 
-# --- АДМИНСКИЕ CALLBACK ОБРАБОТЧИКИ ---
+# --- АДМИНСКИЕ ОБРАБОТЧИКИ (ВЫДАЧА ПРЕМИУМА НА СРОК) ---
+@router.callback_query(F.data == "admin_give_premium")
+async def start_give_premium(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    return
+  await callback.message.answer(
+      "👑 Введи **Telegram ID** пользователя, которому нужно выдать Премиум:",
+      parse_mode="Markdown",
+  )
+  await state.set_state(GivePremiumState.user_id)
+  await callback.answer()
+
+
+@router.message(GivePremiumState.user_id)
+async def process_give_premium_id(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
+    return
+
+  target_id = int(message.text)
+  await state.update_data(target_id=target_id)
+
+  await message.answer(
+      f"⏳ На сколько **дней** выдать Премиум пользователю `{target_id}`?\n*(Введи"
+      " число, например: 30)*",
+      parse_mode="Markdown",
+  )
+  await state.set_state(GivePremiumState.days)
+
+
+@router.message(GivePremiumState.days)
+async def process_give_premium_days(message: Message, state: FSMContext, bot: Bot):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! Введите число дней цифрами.")
+    return
+
+  days = int(message.text)
+  data = await state.get_data()
+  target_id = data["target_id"]
+  await state.clear()
+
+  # Вычисляем дату окончания
+  expire_date = datetime.datetime.now() + datetime.timedelta(days=days)
+  expire_str = expire_date.strftime("%Y-%m-%d %H:%M:%S")
+  formatted_date = expire_date.strftime("%d.%m.%Y")
+
+  cursor.execute(
+      "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
+      " bought_folders, referrer_id) VALUES (?, 0, 1, 0, 0)",
+      (target_id,),
+  )
+  cursor.execute(
+      "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id = ?",
+      (expire_str, target_id),
+  )
+  conn.commit()
+
+  await message.answer(
+      f"✅ **Премиум успешно выдан!**\n\n🆔 Пользователь: `{target_id}`\n📅"
+      f" Срок: **{days} дней** (до {formatted_date})",
+      parse_mode="Markdown",
+  )
+
+  try:
+    await bot.send_message(
+        target_id,
+        f"🎉 **Вам активирована Премиум-подписка на {days} дней!**\n📅 Срок"
+        f" действия: до **{formatted_date}**.\n\nТеперь любые папки в магазине"
+        " доступны бесплатно!",
+        parse_mode="Markdown",
+    )
+  except Exception:
+    pass
+
+
+# --- ОСТАЛЬНЫЕ АДМИНСКИЕ ОБРАБОТЧИКИ ---
 @router.callback_query(F.data == "admin_create_promo")
 async def start_create_promo(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -610,48 +728,6 @@ async def process_promo_reward(message: Message, state: FSMContext):
       " токенов",
       parse_mode="Markdown",
   )
-
-
-@router.callback_query(F.data == "admin_give_premium")
-async def start_give_premium(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    return
-  await callback.message.answer(
-      "👑 Введи Telegram ID пользователя, которому нужно выдать Премиум:"
-  )
-  await state.set_state(GivePremiumState.user_id)
-  await callback.answer()
-
-
-@router.message(GivePremiumState.user_id)
-async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
-  await state.clear()
-  if not message.text.isdigit():
-    await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
-    return
-
-  target_id = int(message.text)
-  cursor.execute(
-      "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
-      " bought_folders, referrer_id) VALUES (?, 0, 1, 0, 0)",
-      (target_id,),
-  )
-  cursor.execute(
-      "UPDATE users SET is_premium = 1 WHERE user_id = ?", (target_id,)
-  )
-  conn.commit()
-
-  await message.answer(
-      f"✅ Премиум успешно выдан пользователю с ID: {target_id}"
-  )
-  try:
-    await bot.send_message(
-        target_id,
-        "🎉 Вам активирована Премиум-подписка!\nТеперь любые папки в магазине"
-        " доступны бесплатно.",
-    )
-  except Exception:
-    pass
 
 
 @router.callback_query(F.data == "add_product")
