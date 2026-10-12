@@ -21,6 +21,10 @@ TOKEN = "8549927929:AAE_aDtLHVjkR9h50ABM233OZprEa6l-GvM"
 # ТВОЙ ТЕЛЕГРАМ ID АДМИНА
 ADMIN_ID = 5681420389
 
+# КАНАЛ ДЛЯ ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ
+CHANNEL_ID = -1002925107145
+CHANNEL_USERNAME = "iiris_cnn_bot"  # или юзернейм канала, если есть (например, "my_channel")
+
 # Инициализация базы данных SQLite
 conn = sqlite3.connect("bot_data.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -88,6 +92,43 @@ class GivePremiumState(StatesGroup):
 router = Router()
 
 
+# --- ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ---
+async def check_subscription(user_id: int, bot: Bot) -> bool:
+  try:
+    member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+    # Статусы, при которых считается, что пользователь подписан
+    if member.status in ["creator", "administrator", "member"]:
+      return True
+    return False
+  except Exception:
+    # Если бот не админ в канале или ошибка ID, пропускаем (но лучше сделать бота админом канала)
+    return True
+
+
+async def not_subscribed_message(message: Message):
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="📢 Подписаться на канал",
+                  url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="🔄 Проверить подписку", callback_data="check_sub"
+              )
+          ],
+      ]
+  )
+  await message.answer(
+      "⛔️ **Для использования бота необходимо подписаться на наш канал!**\n\n"
+      "Подпишитесь на канал, а затем нажмите кнопку ниже:",
+      reply_markup=keyboard,
+      parse_mode="Markdown",
+  )
+
+
 # --- ГЛАВНОЕ КНОПОЧНОЕ МЕНЮ (НИЖНЕЕ) ---
 def get_main_keyboard(user_id):
   kb = [
@@ -104,12 +145,17 @@ def get_main_keyboard(user_id):
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-# --- КОМАНДА /start С РЕФЕРАЛКОЙ ---
+# --- КОМАНДА /start С РЕФЕРАЛКОЙ И ПРОВЕРКОЙ ПОДПИСКИ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
   user_id = message.from_user.id
-  args = message.text.split()
 
+  # Проверяем подписку
+  if not await check_subscription(user_id, bot):
+    await not_subscribed_message(message)
+    return
+
+  args = message.text.split()
   referrer_id = None
   if len(args) > 1 and args[1].isdigit():
     potential_ref = int(args[1])
@@ -169,41 +215,198 @@ async def cmd_start(message: Message, bot: Bot):
   )
 
 
-# --- ОБРАБОТКА КНОПОК ИЗ МЕНЮ ---
-@router.message(F.text == "👤 Мой Профиль")
-async def profile_handler(message: Message):
+# Кнопка проверки подписки
+@router.callback_query(F.data == "check_sub")
+async def process_check_sub(callback: CallbackQuery, bot: Bot):
+  user_id = callback.from_user.id
+  if await check_subscription(user_id, bot):
+    await callback.message.edit_text(
+        "✅ Подписка подтверждена! Добро пожаловать."
+    )
+    await callback.message.answer(
+        "Выбирай нужный раздел на клавиатуре:",
+        reply_markup=get_main_keyboard(user_id),
+    )
+  else:
+    await callback.answer(
+        "❌ Вы еще не подписались на канал!", show_alert=True
+    )
+
+
+# --- ОБРАБОТКА КНОПОК ИЗ МЕНЮ С КОНТРОЛЕМ ПОДПИСКИ ---
+@router.message(
+    F.text.in_(
+        {
+            "👤 Мой Профиль",
+            "🛒 Магазин",
+            "🛍 Магазин",
+            "👥 Реферальная система",
+            "🪙 Как получить токены?",
+            "👑 Премиум-подписка",
+            "⚙️ Админ-панель",
+        }
+    )
+)
+async def menu_router(message: Message, bot: Bot):
   user_id = message.from_user.id
-  cursor.execute(
-      "SELECT tokens, is_premium, bought_folders FROM users WHERE user_id = ?",
-      (user_id,),
-  )
-  user_data = cursor.fetchone()
 
-  tokens = user_data[0] if user_data else 0
-  is_prem = user_data[1] if user_data else 0
-  bought = user_data[2] if user_data else 0
+  # Проверяем подписку перед любым действием
+  if not await check_subscription(user_id, bot):
+    await not_subscribed_message(message)
+    return
 
-  prem_status = "✅ Активна" if is_prem == 1 else "❌ Не активна"
+  text = message.text
 
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="🎟 Ввести промокод", callback_data="enter_promocode"
-              )
-          ]
-      ]
-  )
+  if text == "👤 Мой Профиль":
+    cursor.execute(
+        "SELECT tokens, is_premium, bought_folders FROM users WHERE user_id ="
+        " ?",
+        (user_id,),
+    )
+    user_data = cursor.fetchone()
 
-  text = (
-      f"👤 Ваш Профиль\n\n"
-      f"🆔 Ваш ID: {user_id}\n"
-      f"💲 Баланс: {tokens} токенов\n"
-      f"👑 Премиум-подписка: {prem_status}\n"
-      f"📦 Куплено папок: {bought} шт."
-  )
+    tokens = user_data[0] if user_data else 0
+    is_prem = user_data[1] if user_data else 0
+    bought = user_data[2] if user_data else 0
 
-  await message.answer(text, reply_markup=keyboard)
+    prem_status = "✅ Активна" if is_prem == 1 else "❌ Не активна"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎟 Ввести промокод", callback_data="enter_promocode"
+                )
+            ]
+        ]
+    )
+
+    profile_text = (
+        f"👤 Ваш Профиль\n\n"
+        f"🆔 Ваш ID: {user_id}\n"
+        f"💲 Баланс: {tokens} токенов\n"
+        f"👑 Премиум-подписка: {prem_status}\n"
+        f"📦 Куплено папок: {bought} шт."
+    )
+    await message.answer(profile_text, reply_markup=keyboard)
+
+  elif text in ["🛒 Магазин", "🛍 Магазин"]:
+    cursor.execute("SELECT id, title, price FROM products")
+    products = cursor.fetchall()
+
+    if not products:
+      await message.answer(
+          "📭 В магазине пока пусто. Админ еще не добавил папки с альтухами!"
+      )
+      return
+
+    keyboard_buttons = []
+    for prod in products:
+      p_id, title, price = prod
+      cursor.execute("SELECT buyers_count FROM products WHERE id = ?", (p_id,))
+      res = cursor.fetchone()
+      buyers_count = res[0] if res else 0
+
+      if buyers_count == 0:
+        btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+      else:
+        btn_text = f"📁 {title} — {price} токенов"
+
+      keyboard_buttons.append(
+          [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
+      )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await message.answer(
+        "🛍 Доступные папки с альтухами:\n*(Нажми на нужную, чтобы забрать"
+        " ссылку)*",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+  elif text == "👥 Реферальная система":
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    ref_text = (
+        "👥 Реферальная система\n\n"
+        "Приглашай друзей по своей персональной ссылке:\n"
+        f"{ref_link}\n\n"
+        "🎁 Бонусы:\n"
+        "• За каждого приглашенного друга вы получаете 15 токенов!\n"
+        "• Получайте 15% от суммы всех покупок токенами ваших рефералов!"
+    )
+    await message.answer(ref_text)
+
+  elif text == "🪙 Как получить токены?":
+    tokens_text = (
+        "📌 Как получить токены?\n\n"
+        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
+        "2. Оставляйте его в комментариях под постами/ответами другим людям."
+        " ГЛАВНОЕ: тема должна касаться по типу сестры и брата и тд.\n"
+        "3. Отправляйте доказательства (скриншоты) в директ канала."
+        " https://t.me/JmcDeveloper?direct\n\n"
+        "💰 1 отправка фото в комментариях = 1 токен!"
+    )
+    await message.answer(tokens_text, disable_web_page_preview=True)
+
+  elif text == "👑 Премиум-подписка":
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐ Отправить Подарок 50 Stars (@ucu52)",
+                    url="https://t.me/ucu52",
+                )
+            ]
+        ]
+    )
+    prem_text = (
+        "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\n"
+        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ папки бесплатно (даже с 0 токенов на"
+        " балансе)!\n\n"
+        "💳 Стоимость:\n"
+        "• 50 Звезд (любым подарком в Telegram за 50 звезд на профиль @ucu52)."
+    )
+    await message.answer(prem_text, reply_markup=keyboard)
+
+  elif text == "⚙️ Админ-панель":
+    if user_id != ADMIN_ID:
+      await message.answer("⛔️ У тебя нет доступа!")
+      return
+
+    admin_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить папки / альтухи",
+                    callback_data="add_product",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить товар", callback_data="delete_product_list"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎟 Создать промокод", callback_data="admin_create_promo"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👑 Выдать Премиум пользователю",
+                    callback_data="admin_give_premium",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Сделать рассылку всем",
+                    callback_data="start_broadcast",
+                )
+            ],
+        ]
+    )
+    await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
 
 
 @router.callback_query(F.data == "enter_promocode")
@@ -229,105 +432,15 @@ async def promo_check(message: Message, state: FSMContext):
     return
 
   reward = promo[0]
-
-  # Начисляем токены юзеру
   cursor.execute(
       "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
       (reward, user_id),
   )
-  # Удаляем использованный промокод
   cursor.execute("DELETE FROM promocodes WHERE code = ?", (code_text,))
   conn.commit()
 
   await message.answer(
-      f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{reward} токенов**"
-  )
-
-
-@router.message(F.text == "👥 Реферальная система")
-async def referral_handler(message: Message):
-  bot_info = await message.bot.get_me()
-  ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
-  text = (
-      "👥 Реферальная система\n\n"
-      "Приглашай друзей по своей персональной ссылке:\n"
-      f"{ref_link}\n\n"
-      "🎁 Бонусы:\n"
-      "• За каждого приглашенного друга вы получаете 15 токенов!\n"
-      "• Получайте 15% от суммы всех покупок токенами ваших рефералов!"
-  )
-  await message.answer(text)
-
-
-@router.message(F.text == "🪙 Как получить токены?")
-async def tokens_handler(message: Message):
-  text = (
-      "📌 Как получить токены?\n\n"
-      "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
-      "2. Оставляйте его в комментариях под постами/ответами другим людям."
-      " ГЛАВНОЕ: тема должна касаться по типу сестры и брата и тд.\n"
-      "3. Отправляйте доказательства (скриншоты) в директ канала."
-      " https://t.me/JmcDeveloper?direct\n\n"
-      "💰 1 отправка фото в комментариях = 1 токен!"
-  )
-  await message.answer(text, disable_web_page_preview=True)
-
-
-@router.message(F.text == "👑 Премиум-подписка")
-async def premium_handler(message: Message):
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="⭐ Отправить Подарок 50 Stars (@ucu52)",
-                  url="https://t.me/ucu52",
-              )
-          ]
-      ]
-  )
-  text = (
-      "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\n"
-      "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ папки бесплатно (даже с 0 токенов на"
-      " балансе)!\n\n"
-      "💳 Стоимость:\n"
-      "• 50 Звезд (любым подарком в Telegram за 50 звезд на профиль @ucu52)."
-  )
-  await message.answer(text, reply_markup=keyboard)
-
-
-# --- МАГАЗИН И ПАПКИ С АЛЬТУХАМИ ---
-@router.message(F.text.in_({"🛍 Магазин", "🛒 Магазин"}))
-async def shop_handler(message: Message):
-  cursor.execute("SELECT id, title, price FROM products")
-  products = cursor.fetchall()
-
-  if not products:
-    await message.answer(
-        "📭 В магазине пока пусто. Админ еще не добавил папки с альтухами!"
-    )
-    return
-
-  keyboard_buttons = []
-  for prod in products:
-    p_id, title, price = prod
-    cursor.execute("SELECT buyers_count FROM products WHERE id = ?", (p_id,))
-    res = cursor.fetchone()
-    buyers_count = res[0] if res else 0
-
-    if buyers_count == 0:
-      btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
-    else:
-      btn_text = f"📁 {title} — {price} токенов"
-
-    keyboard_buttons.append(
-        [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
-    )
-
-  keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-  await message.answer(
-      "🛍 Доступные папки с альтухами:\n*(Нажми на нужную, чтобы забрать"
-      " ссылку)*",
-      reply_markup=keyboard,
+      f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{reward} токенов**",
       parse_mode="Markdown",
   )
 
@@ -335,6 +448,13 @@ async def shop_handler(message: Message):
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
+
+  if not await check_subscription(user_id, bot):
+    await callback.answer(
+        "❌ Сначала подпишитесь на канал!", show_alert=True
+    )
+    return
+
   p_id = int(callback.data.split("_")[1])
 
   cursor.execute(
@@ -404,7 +524,8 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   new_buyers_count = buyers_count + 1
 
   cursor.execute(
-      "UPDATE users SET tokens = ?, bought_folders = ? WHERE user_id = ?",
+      "UPDATE users SET tokens = tokens + ?, bought_folders = ? WHERE user_id ="
+      " ?",
       (new_tokens, bought_folders + 1, user_id),
   )
   cursor.execute(
@@ -448,55 +569,14 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   await callback.answer()
 
 
-# ================= АДМИН-ПАНЕЛЬ =================
-
-
-@router.message(F.text == "⚙️ Админ-панель")
-async def admin_panel_text(message: Message):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="➕ Добавить папки / альтухи", callback_data="add_product"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🗑 Удалить товар", callback_data="delete_product_list"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🎟 Создать промокод", callback_data="admin_create_promo"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="👑 Выдать Премиум пользователю",
-                  callback_data="admin_give_premium",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="📢 Сделать рассылку всем", callback_data="start_broadcast"
-              )
-          ],
-      ]
-  )
-
-  await message.answer("⚙️ Панель администратора:", reply_markup=keyboard)
-
-
-# --- СОЗДАНИЕ ПРОМОКОДА АДМИНОМ ---
+# --- АДМИНСКИЕ CALLBACK ОБРАБОТЧИКИ ---
 @router.callback_query(F.data == "admin_create_promo")
 async def start_create_promo(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     return
-  await callback.message.answer("🎟 Введите текст промокода (например: `START100`):")
+  await callback.message.answer(
+      "🎟 Введите текст промокода (например: `START100`):"
+  )
   await state.set_state(CreatePromoState.code)
   await callback.answer()
 
@@ -532,7 +612,6 @@ async def process_promo_reward(message: Message, state: FSMContext):
   )
 
 
-# --- ВЫДАЧА ПРЕМИУМА ЧЕРЕЗ АДМИНКУ ---
 @router.callback_query(F.data == "admin_give_premium")
 async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -552,7 +631,6 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
     return
 
   target_id = int(message.text)
-
   cursor.execute(
       "INSERT OR IGNORE INTO users (user_id, tokens, is_premium,"
       " bought_folders, referrer_id) VALUES (?, 0, 1, 0, 0)",
@@ -566,7 +644,6 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
   await message.answer(
       f"✅ Премиум успешно выдан пользователю с ID: {target_id}"
   )
-
   try:
     await bot.send_message(
         target_id,
@@ -577,7 +654,6 @@ async def process_give_premium(message: Message, state: FSMContext, bot: Bot):
     pass
 
 
-# --- ДОБАВЛЕНИЕ НОВОЙ ПАПКИ ---
 @router.callback_query(F.data == "add_product")
 async def start_add_product(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -628,7 +704,6 @@ async def process_link(message: Message, state: FSMContext):
   )
 
 
-# --- УДАЛЕНИЕ ---
 @router.callback_query(F.data == "delete_product_list")
 async def delete_product_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
@@ -670,7 +745,6 @@ async def delete_product_execute(callback: CallbackQuery):
   await delete_product_list(callback)
 
 
-# --- РАССЫЛКА ---
 @router.callback_query(F.data == "start_broadcast")
 async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
