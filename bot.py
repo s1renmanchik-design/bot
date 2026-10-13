@@ -36,7 +36,7 @@ async def init_db():
             is_premium INTEGER DEFAULT 0,
             bought_folders INTEGER DEFAULT 0,
             referrer_id INTEGER DEFAULT 0,
-            ref_activated INTEGER DEFAULT 0,
+            ref_activated INTEGER DEFAULT 1,
             premium_expires TEXT DEFAULT NULL
         );
     """
@@ -147,8 +147,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
 
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT referrer_id, ref_activated FROM users WHERE user_id = ?",
-        (user_id,),
+        "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
     ) as cursor:
       existing_user = await cursor.fetchone()
 
@@ -156,50 +155,30 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       ref_to_save = referrer_id if referrer_id else 0
       await db.execute(
           "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-          " referrer_id, ref_activated) VALUES (?, 0, 0, 0, ?, 0)",
+          " referrer_id, ref_activated) VALUES (?, 0, 0, 0, ?, 1)",
           (user_id, ref_to_save),
       )
       await db.commit()
+
+      if referrer_id:
+        await db.execute(
+            "UPDATE users SET tokens = tokens + 7 WHERE user_id = ?",
+            (referrer_id,),
+        )
+        await db.commit()
+        try:
+          await bot.send_message(
+              referrer_id,
+              "🎉 По вашей реферальной ссылке зарегистрировался новый"
+              " пользователь!\n🎁 Вам начислено 7 токенов!",
+          )
+        except Exception:
+          pass
     else:
       if existing_user[0] == 0 and referrer_id:
         await db.execute(
             "UPDATE users SET referrer_id = ? WHERE user_id = ?",
             (referrer_id, user_id),
-        )
-        await db.commit()
-
-  await message.answer(
-      "👋 Привет! Добро пожаловать в бота.\n\n🔒 **Для активации и доступа к"
-      " меню отправь в чат число:** `67`",
-      reply_markup=get_main_keyboard(user_id),
-      parse_mode="Markdown",
-  )
-
-
-# --- КОМАНДА /promocode ---
-@router.message(Command("promocode"))
-async def cmd_promocode(message: Message, state: FSMContext):
-  await state.clear()
-  await message.answer("🎟 Введите промокод:")
-  await state.set_state(PromocodeState.code)
-
-
-# --- ПРОВЕРКА ЧИСЛА 67 ДЛЯ РЕФЕРАЛОВ ---
-@router.message(F.text == "67")
-async def process_ref_code(message: Message, bot: Bot):
-  user_id = message.from_user.id
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT referrer_id, ref_activated FROM users WHERE user_id = ?",
-        (user_id,),
-    ) as cursor:
-      user_data = await cursor.fetchone()
-
-    if user_data:
-      referrer_id, ref_activated = user_data
-      if referrer_id != 0 and ref_activated == 0:
-        await db.execute(
-            "UPDATE users SET ref_activated = 1 WHERE user_id = ?", (user_id,)
         )
         await db.execute(
             "UPDATE users SET tokens = tokens + 7 WHERE user_id = ?",
@@ -210,16 +189,24 @@ async def process_ref_code(message: Message, bot: Bot):
           await bot.send_message(
               referrer_id,
               "🎉 По вашей реферальной ссылке зарегистрировался новый"
-              " пользователь и подтвердил вход!\n🎁 Вам начислено бонусных 7"
-              " токенов!",
+              " пользователь!\n🎁 Вам начислено 7 токенов!",
           )
         except Exception:
           pass
 
   await message.answer(
-      "✅ Число принято! Добро пожаловать в бота, все разделы разблокированы.",
+      "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре"
+      " ниже:",
       reply_markup=get_main_keyboard(user_id),
   )
+
+
+# --- КОМАНДА /promocode ---
+@router.message(Command("promocode"))
+async def cmd_promocode(message: Message, state: FSMContext):
+  await state.clear()
+  await message.answer("🎟 Введите промокод:")
+  await state.set_state(PromocodeState.code)
 
 
 # --- FSM ХЕНДЛЕРЫ ---
@@ -300,6 +287,11 @@ async def promo_check(message: Message, state: FSMContext):
         (code_text,),
     )
     await db.commit()
+
+  # Возвращаем клавиатуру после успешного ввода промокода
+  await message.answer(
+      "Главное меню:", reply_markup=get_main_keyboard(user_id)
+  )
 
 
 @router.message(EditProduct.new_value)
@@ -623,20 +615,25 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
     prem_status = "❌ Не активна"
     if is_prem == 1 and prem_expires:
-      exp_date = datetime.datetime.strptime(prem_expires, "%Y-%m-%d %H:%M:%S")
-      if datetime.datetime.now() < exp_date:
-        days_left = (exp_date - datetime.datetime.now()).days
-        formatted_date = exp_date.strftime("%d.%m.%Y")
-        prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
-      else:
-        async with aiosqlite.connect(DB_NAME) as db:
-          await db.execute(
-              "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-              " user_id = ?",
-              (user_id,),
-          )
-          await db.commit()
-        prem_status = "❌ Не активна (истекла)"
+      try:
+        exp_date = datetime.datetime.strptime(
+            prem_expires, "%Y-%m-%d %H:%M:%S"
+        )
+        if datetime.datetime.now() < exp_date:
+          days_left = (exp_date - datetime.datetime.now()).days
+          formatted_date = exp_date.strftime("%d.%m.%Y")
+          prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
+        else:
+          async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
+                " user_id = ?",
+                (user_id,),
+            )
+            await db.commit()
+          prem_status = "❌ Не активна (истекла)"
+      except Exception:
+        prem_status = "✅ Активна"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -710,21 +707,24 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         prem_users = await cursor.fetchall()
       for p_user in prem_users:
         if p_user[2]:
-          exp_dt = datetime.datetime.strptime(p_user[2], "%Y-%m-%d %H:%M:%S")
-          if datetime.datetime.now() >= exp_dt:
-            await db.execute(
-                "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-                " user_id = ?",
-                (p_user[0],),
-            )
-            await db.commit()
+          try:
+            exp_dt = datetime.datetime.strptime(p_user[2], "%Y-%m-%d %H:%M:%S")
+            if datetime.datetime.now() >= exp_dt:
+              await db.execute(
+                  "UPDATE users SET is_premium = 0, premium_expires = NULL"
+                  " WHERE user_id = ?",
+                  (p_user[0],),
+              )
+              await db.commit()
+          except Exception:
+            pass
 
-      # Топ игроков (максимум 10 игроков, у которых от 1 подтвержденного реферала)
+      # Топ игроков (максимум 10 игроков, у которых от 1 реферала)
       async with db.execute(
           """
                 SELECT u.user_id, u.is_premium, COUNT(r.user_id) as ref_count
                 FROM users u
-                JOIN users r ON r.referrer_id = u.user_id AND r.ref_activated = 1
+                JOIN users r ON r.referrer_id = u.user_id
                 GROUP BY u.user_id
                 HAVING ref_count > 0
                 ORDER BY ref_count DESC
@@ -904,17 +904,24 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     referrer_id = u_data[3] if u_data else 0
     prem_expires = u_data[4] if u_data else None
 
+    # ПРОВЕРКА ПРЕМИУМА ПРИ ПОКУПКЕ
     if is_prem == 1 and prem_expires:
-      exp_date = datetime.datetime.strptime(prem_expires, "%Y-%m-%d %H:%M:%S")
-      if datetime.datetime.now() >= exp_date:
-        is_prem = 0
-        await db.execute(
-            "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-            " user_id = ?",
-            (user_id,),
+      try:
+        exp_date = datetime.datetime.strptime(
+            prem_expires, "%Y-%m-%d %H:%M:%S"
         )
-        await db.commit()
+        if datetime.datetime.now() >= exp_date:
+          is_prem = 0
+          await db.execute(
+              "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
+              " user_id = ?",
+              (user_id,),
+          )
+          await db.commit()
+      except Exception:
+        pass
 
+    # ЕСЛИ ЕСТЬ ПРЕМИУМ — ВЫДАЕМ БЕСПЛАТНО
     if is_prem == 1:
       await db.execute(
           "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
@@ -934,6 +941,7 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       await callback.answer()
       return
 
+    # ЕСЛИ ПРЕМИУМА НЕТ — ПОКУПКА ЗА ТОКЕНЫ
     final_price = (
         max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
     )
@@ -1198,7 +1206,7 @@ async def weekly_reset_loop(bot: Bot):
             """
                 SELECT u.user_id, COUNT(r.user_id) as ref_count
                 FROM users u
-                JOIN users r ON r.referrer_id = u.user_id AND r.ref_activated = 1
+                JOIN users r ON r.referrer_id = u.user_id
                 GROUP BY u.user_id
                 HAVING ref_count > 0
                 ORDER BY ref_count DESC
@@ -1235,7 +1243,7 @@ async def weekly_reset_loop(bot: Bot):
             pass
 
         await db.execute(
-            "UPDATE users SET referrer_id = 0, ref_activated = 0"
+            "UPDATE users SET referrer_id = 0, ref_activated = 1"
         )
         await db.commit()
 
