@@ -162,7 +162,11 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
 
       if referrer_id:
         await db.execute(
-            "UPDATE users SET tokens = tokens + 7 WHERE user_id = ?",
+            """
+                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+                    VALUES (?, 7, 0, 0, 0, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + 7
+                """,
             (referrer_id,),
         )
         await db.commit()
@@ -181,7 +185,11 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
             (referrer_id, user_id),
         )
         await db.execute(
-            "UPDATE users SET tokens = tokens + 7 WHERE user_id = ?",
+            """
+                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+                    VALUES (?, 7, 0, 0, 0, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + 7
+                """,
             (referrer_id,),
         )
         await db.commit()
@@ -255,11 +263,16 @@ async def promo_check(message: Message, state: FSMContext):
       )
       return
 
+    # Гарантированное добавление пользователя в БД перед зачислением промокода
     if reward_type == "tokens":
       tokens_amount = int(reward_value)
       await db.execute(
-          "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-          (tokens_amount, user_id),
+          """
+                INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+                VALUES (?, ?, 0, 0, 0, 1)
+                ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+            """,
+          (user_id, tokens_amount, tokens_amount),
       )
       await message.answer(
           f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
@@ -276,9 +289,12 @@ async def promo_check(message: Message, state: FSMContext):
           datetime.datetime.now() + datetime.timedelta(days=days)
       ).strftime("%d.%m.%Y")
       await db.execute(
-          "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id"
-          " = ?",
-          (expire_date, user_id),
+          """
+                INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
+                VALUES (?, 0, 1, 0, 0, 1, ?)
+                ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
+            """,
+          (user_id, expire_date, expire_date),
       )
       await message.answer(
           f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
@@ -488,22 +504,14 @@ async def process_give_tokens_amount(message: Message, state: FSMContext, bot: B
   await state.clear()
 
   async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT 1 FROM users WHERE user_id = ?", (target_id,)
-    ) as cursor:
-      user_exists = await cursor.fetchone()
-
-    if user_exists:
-      await db.execute(
-          "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-          (amount, target_id),
-      )
-    else:
-      await db.execute(
-          "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-          " referrer_id, ref_activated) VALUES (?, ?, 0, 0, 0, 1)",
-          (target_id, amount),
-      )
+    await db.execute(
+        """
+            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated) 
+            VALUES (?, ?, 0, 0, 0, 1)
+            ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+        """,
+        (target_id, amount, amount),
+    )
     await db.commit()
 
   await message.answer(
@@ -984,8 +992,12 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       ref_bonus = round(final_price * 0.15)
       if ref_bonus > 0:
         await db.execute(
-            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-            (ref_bonus, referrer_id),
+            """
+                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+                    VALUES (?, ?, 0, 0, 0, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+                """,
+            (referrer_id, ref_bonus, ref_bonus),
         )
         await db.commit()
         try:
