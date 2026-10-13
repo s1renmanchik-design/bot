@@ -36,6 +36,7 @@ async def init_db():
             is_premium INTEGER DEFAULT 0,
             bought_folders INTEGER DEFAULT 0,
             referrer_id INTEGER DEFAULT 0,
+            ref_activated INTEGER DEFAULT 0,
             premium_expires TEXT DEFAULT NULL
         );
     """
@@ -115,9 +116,12 @@ def get_main_keyboard(user_id):
       [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛒 Магазин")],
       [
           KeyboardButton(text="👥 Реферальная система"),
-          KeyboardButton(text="🪙 Как получить токены?"),
+          KeyboardButton(text="🏆 Топ игроков"),
       ],
-      [KeyboardButton(text="👑 Премиум-подписка")],
+      [
+          KeyboardButton(text="🪙 Как получить токены?"),
+          KeyboardButton(text="👑 Премиум-подписка"),
+      ],
   ]
   if user_id == ADMIN_ID:
     kb.append([KeyboardButton(text="⚙️ Админ-панель")])
@@ -138,7 +142,8 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
 
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
+        "SELECT referrer_id, ref_activated FROM users WHERE user_id = ?",
+        (user_id,),
     ) as cursor:
       existing_user = await cursor.fetchone()
 
@@ -146,47 +151,60 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       ref_to_save = referrer_id if referrer_id else 0
       await db.execute(
           "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-          " referrer_id) VALUES (?, 0, 0, 0, ?)",
+          " referrer_id, ref_activated) VALUES (?, 0, 0, 0, ?, 0)",
           (user_id, ref_to_save),
       )
       await db.commit()
-      if referrer_id:
-        await db.execute(
-            "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
-            (referrer_id,),
-        )
-        await db.commit()
-        try:
-          await bot.send_message(
-              referrer_id,
-              "🎉 По реферальной ссылке зарегистрировался новый пользователь!\n🎁"
-              " Вам начислено бонусных 15 токенов!",
-          )
-        except Exception:
-          pass
     else:
       if existing_user[0] == 0 and referrer_id:
         await db.execute(
             "UPDATE users SET referrer_id = ? WHERE user_id = ?",
             (referrer_id, user_id),
         )
+        await db.commit()
+
+  await message.answer(
+      "👋 Привет! Добро пожаловать в бота.\n\n🔒 **Для активации и доступа к"
+      " меню отправь в чат число:** `67`",
+      reply_markup=get_main_keyboard(user_id),
+      parse_mode="Markdown",
+  )
+
+
+# --- ПРОВЕРКА ЧИСЛА 67 ДЛЯ РЕФЕРАЛОВ ---
+@router.message(F.text == "67")
+async def process_ref_code(message: Message, bot: Bot):
+  user_id = message.from_user.id
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT referrer_id, ref_activated FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+      user_data = await cursor.fetchone()
+
+    if user_data:
+      referrer_id, ref_activated = user_data
+      if referrer_id != 0 and ref_activated == 0:
         await db.execute(
-            "UPDATE users SET tokens = tokens + 15 WHERE user_id = ?",
+            "UPDATE users SET ref_activated = 1 WHERE user_id = ?", (user_id,)
+        )
+        await db.execute(
+            "UPDATE users SET tokens = tokens + 7 WHERE user_id = ?",
             (referrer_id,),
         )
         await db.commit()
         try:
           await bot.send_message(
               referrer_id,
-              "🎉 По вашей реферальной ссылке активировался пользователь!\n🎁 Вам"
-              " начислено бонусных 15 токенов!",
+              "🎉 По вашей реферальной ссылке зарегистрировался новый"
+              " пользователь и подтвердил вход!\n🎁 Вам начислено бонусных 7"
+              " токенов!",
           )
         except Exception:
           pass
 
   await message.answer(
-      "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре"
-      " ниже:",
+      "✅ Число принято! Добро пожаловать в бота, все разделы разблокированы.",
       reply_markup=get_main_keyboard(user_id),
   )
 
@@ -408,8 +426,8 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
         """
-            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, premium_expires) 
-            VALUES (?, 0, 1, 0, 0, ?)
+            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires) 
+            VALUES (?, 0, 1, 0, 0, 1, ?)
             ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
         """,
         (target_id, expire_date, expire_date),
@@ -505,6 +523,7 @@ async def send_broadcast(message: Message, state: FSMContext):
             "🛒 Магазин",
             "🛍 Магазин",
             "👥 Реферальная система",
+            "🏆 Топ игроков",
             "🪙 Как получить токены?",
             "👑 Премиум-подписка",
             "⚙️ Админ-панель",
@@ -528,7 +547,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       if not user_data:
         await db.execute(
             "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-            " referrer_id) VALUES (?, 0, 0, 0, 0)",
+            " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 1)",
             (user_id,),
         )
         await db.commit()
@@ -609,11 +628,69 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     ref_text = (
         "👥 Реферальная система\n\nПриглашай друзей по своей персональной"
-        f" ссылке:\n`{ref_link}`\n\n🎁 Бонусы:\n• За каждого приглашенного друга"
-        " вы получаете 15 токенов!\n• Получайте 15% от суммы всех покупок"
-        " токенами ваших рефералов!"
+        f" ссылке:\n`{ref_link}`\n\n🎁 Бонусы:\n• За каждого приглашенного друга,"
+        " который напишет в бота число **67**, вы получаете 7 токенов!\n•"
+        " Получайте 15% от суммы всех покупок токенами ваших рефералов!"
     )
     await message.answer(ref_text, parse_mode="Markdown")
+
+  elif text == "🏆 Топ игроков":
+    async with aiosqlite.connect(DB_NAME) as db:
+      # Проверяем премиумы и обновляем статус, если истек срок
+      async with db.execute(
+          "SELECT user_id, is_premium, premium_expires FROM users WHERE"
+          " is_premium = 1"
+      ) as cursor:
+        prem_users = await cursor.fetchall()
+      for p_user in prem_users:
+        if p_user[2]:
+          exp_dt = datetime.datetime.strptime(p_user[2], "%Y-%m-%d %H:%M:%S")
+          if datetime.datetime.now() >= exp_dt:
+            await db.execute(
+                "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
+                " user_id = ?",
+                (p_user[0],),
+            )
+            await db.commit()
+
+      # Топ игроков (максимум 10 игроков, у которых от 1 подтвержденного реферала)
+      async with db.execute(
+          """
+                SELECT u.user_id, u.is_premium, COUNT(r.user_id) as ref_count
+                FROM users u
+                JOIN users r ON r.referrer_id = u.user_id AND r.ref_activated = 1
+                GROUP BY u.user_id
+                HAVING ref_count > 0
+                ORDER BY ref_count DESC
+                LIMIT 10
+            """
+      ) as cursor:
+        top_list = await cursor.fetchall()
+
+    if not top_list:
+      await message.answer(
+          "🏆 В топе пока никого нет.\nПриглашайте друзей по реферальной ссылке,"
+          " чтобы занять первое место!\n\n*(каждую неделю сбрасывается топ и"
+          " выдается премиум подписка на 14 дней)*"
+      )
+      return
+
+    text_top = "🏆 **Топ-10 игроков по рефералам:**\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+
+    for i, row in enumerate(top_list, start=1):
+      uid, is_prem, count = row
+      prefix = medals[i - 1] if i <= 3 else f"{i}."
+      crown = " 👑" if is_prem == 1 else ""
+      text_top += (
+          f"{prefix} Пользователь `{uid}`{crown} — **{count}** реф.\n"
+      )
+
+    text_top += (
+        "\n*(каждую неделю сбрасывается топ и выдается премиум подписка на 14"
+        " дней)*"
+    )
+    await message.answer(text_top, parse_mode="Markdown")
 
   elif text == "🪙 Как получить токены?":
     tokens_text = (
@@ -624,7 +701,6 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         " директ канала. https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото"
         " в комментариях = 1 токен!"
         " ГЛАВНОЕ: тема должна касаться по типу сестры и брата и тд."
-        
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -1027,14 +1103,82 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
-# --- ФОНОВАЯ ЗАДАЧА ДЛЯ АВТО-БЭКАПА КАЖДЫЕ 15 МИНУТ ---
-async def auto_backup_loop(bot: Bot):
+# --- ЕЖЕНЕДЕЛЬНЫЙ АВТО-СБРОС ТОПА И ВЫДАЧА ПРЕМИУМА НА 14 ДНЕЙ ---
+async def weekly_reset_loop(bot: Bot):
   while True:
-    await asyncio.sleep(300)  # 900 секунд = ровно 15 минут
+    await asyncio.sleep(604800)  # 604800 секунд = ровно 7 дней
+    try:
+      async with aiosqlite.connect(DB_NAME) as db:
+        # Ищем победителя (1 место по рефералам с подтвержденным входом)
+        async with db.execute(
+            """
+                SELECT u.user_id, COUNT(r.user_id) as ref_count
+                FROM users u
+                JOIN users r ON r.referrer_id = u.user_id AND r.ref_activated = 1
+                GROUP BY u.user_id
+                HAVING ref_count > 0
+                ORDER BY ref_count DESC
+                LIMIT 1
+            """
+        ) as cursor:
+          winner = await cursor.fetchone()
+
+        if winner:
+          winner_id = winner[0]
+          expire_date = (
+              datetime.datetime.now() + datetime.timedelta(days=14)
+          ).strftime("%Y-%m-%d %H:%M:%S")
+          formatted_date = (
+              datetime.datetime.now() + datetime.timedelta(days=14)
+          ).strftime("%d.%m.%Y")
+
+          # Выдаем премиум на 14 дней победителю
+          await db.execute(
+              "UPDATE users SET is_premium = 1, premium_expires = ? WHERE"
+              " user_id = ?",
+              (expire_date, winner_id),
+          )
+          await db.commit()
+
+          try:
+            await bot.send_message(
+                winner_id,
+                "🏆 **Поздравляем! Вы заняли 1 место в еженедельном топе"
+                " рефералов!**\n👑 Вам автоматически начислена Премиум-подписка"
+                f" на **14 дней** (до {formatted_date})!",
+                parse_mode="Markdown",
+            )
+          except Exception:
+            pass
+
+        # Сбрасываем реферальные привязки у всех пользователей для нового сезона
+        await db.execute(
+            "UPDATE users SET referrer_id = 0, ref_activated = 0"
+        )
+        await db.commit()
+
+      try:
+        await bot.send_message(
+            ADMIN_ID,
+            "🔄 Еженедельный топ рефералов успешно сброшен, победителю выдан"
+            " Премиум на 14 дней!",
+        )
+      except Exception:
+        pass
+
+    except Exception as e:
+      print(f"Ошибка при еженедельном сбросе топа: {e}")
+
+
+# --- ФОНОВАЯ ЗАДАЧА ДЛЯ АВТО-БЭКАПА КАЖДЫЕ 5 МИНУТ С УДАЛЕНИЕМ СТАРЫХ СООБЩЕНИЙ ---
+async def auto_backup_loop(bot: Bot):
+  backup_message_ids = []
+  while True:
+    await asyncio.sleep(300)  # 300 секунд = ровно 5 минут
     try:
       if os.path.exists(DB_NAME):
         document = FSInputFile(DB_NAME)
-        await bot.send_document(
+        sent_msg = await bot.send_document(
             ADMIN_ID,
             document,
             caption=(
@@ -1042,6 +1186,14 @@ async def auto_backup_loop(bot: Bot):
                 f"📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
             ),
         )
+        backup_message_ids.append(sent_msg.message_id)
+
+        if len(backup_message_ids) > 5:
+          old_msg_id = backup_message_ids.pop(0)
+          try:
+            await bot.delete_message(chat_id=ADMIN_ID, message_id=old_msg_id)
+          except Exception:
+            pass
     except Exception as e:
       print(f"Ошибка при отправке авто-бэкапа: {e}")
 
@@ -1068,13 +1220,14 @@ async def main():
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
-  # Запускаем фоновый цикл бэкапов каждые 15 минут
+  # Запускаем фоновые задачи: бэкапы каждые 5 минут и еженедельный сброс топа
   asyncio.create_task(auto_backup_loop(bot))
+  asyncio.create_task(weekly_reset_loop(bot))
 
   await bot.delete_webhook(drop_pending_updates=True)
   print(
-      f"Бот успешно запущен, авто-бэкап (каждые 15 минут) активен, веб-сервер"
-      f" слушает порт {PORT}!"
+      f"Бот успешно запущен, авто-бэкап (5 минут) и еженедельный сброс активны,"
+      f" веб-сервер слушает порт {PORT}!"
   )
   await dp.start_polling(bot)
 
