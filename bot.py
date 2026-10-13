@@ -425,7 +425,7 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
     await bot.send_message(
         target_id,
         f"🎉 **Вам активирована Премиум-подписка на {days} дней!**\n📅 Срок"
-        f" действия: до **{formatted_date}**.\n\nТеперь любые папки в магазине"
+        f" действия: до **{formatted_date}**.\n\nТеперь любые фулы в магазине"
         " доступны бесплатно!",
         parse_mode="Markdown",
     )
@@ -465,7 +465,7 @@ async def process_link(message: Message, state: FSMContext):
     await db.commit()
 
   await message.answer(
-      f"✅ Папка успешно добавлена в магазин!\n\n📌 Название: {title}\n💰 Цена:"
+      f"✅ Фулл успешно добавлен в магазин!\n\n📌 Название: {title}\n💰 Цена:"
       f" {price} токенов\n🔗 Ссылка: {link}\n🎁 Активирована скидка 80% для"
       " первого покупателя!"
   )
@@ -580,7 +580,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
     if not products:
       await message.answer(
-          "📭 В магазине пока пусто. Админ еще не добавил папки с альтухами!"
+          "📭 В магазине пока пусто. Либо же вы все раскупили!"
       )
       return
 
@@ -598,7 +598,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await message.answer(
-        "🛍 Доступные папки с альтухами:\n*(Нажми на нужную, чтобы забрать"
+        "🛍 Доступные фулы:\n*(Нажми на нужную, чтобы забрать"
         " ссылку)*",
         reply_markup=keyboard,
         parse_mode="Markdown",
@@ -623,6 +623,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         " сестры и брата и тд.\n3. Отправляйте доказательства (скриншоты) в"
         " директ канала. https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото"
         " в комментариях = 1 токен!"
+        " ГЛАВНОЕ: тема должна касаться по типу сестры и брата и тд."
+        
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -639,7 +641,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     )
     prem_text = (
         "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\nДает право покупать"
-        " АБСОЛЮТНО ЛЮБЫЕ папки бесплатно (даже с 0 токенов на балансе)!\n\n💳"
+        " АБСОЛЮТНО ЛЮБЫЕ фуллы бесплатно (даже с 0 токенов на балансе)!\n\n💳"
         " Стоимость:\n• 50 Звезд (любым подарком в Telegram за 50 звезд на профиль"
         " @ucu52)."
     )
@@ -653,7 +655,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➕ Добавить папки / альтухи",
+                    text="➕ Добавить фулл",
                     callback_data="add_product",
                 )
             ],
@@ -777,7 +779,7 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       )
       await db.commit()
       text = (
-          f"👑 Премиум-доступ применен!\n\n✅ Вы успешно получили папку {title}"
+          f"👑 Премиум-доступ применен!\n\n✅ Вы успешно получили фулл {title}"
           f" бесплатно по подписке!\n\n🔗 Ссылка на скачивание: {link}"
       )
       await callback.message.answer(text)
@@ -827,13 +829,13 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
 
   if buyers_count == 0:
     text = (
-        f"🎉 Поздравляем! Ты первый покупатель папки {title}!\n🔥 Применилась"
+        f"🎉 Поздравляем! Ты первый покупатель фулла {title}!\n🔥 Применилась"
         f" скидка 80%!\nСписано: {final_price} токенов.\n💲 Ваш остаток:"
         f" {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание: {link}"
     )
   else:
     text = (
-        f"✅ Спасибо за покупку папки {title}!\n💰 Списано: {final_price}"
+        f"✅ Спасибо за покупку фула {title}!\n💰 Списано: {final_price}"
         f" токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на"
         f" скачивание: {link}"
     )
@@ -965,7 +967,7 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     return
   await callback.message.answer(
-      "📝 Введи название папки (например: Альтухи #15):"
+      "📝 Введи название фула (например: Казань, Пантера):"
   )
   await state.set_state(AddProduct.title)
   await callback.answer()
@@ -1028,7 +1030,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
 # --- ФОНОВАЯ ЗАДАЧА ДЛЯ АВТО-БЭКАПА КАЖДЫЕ 15 МИНУТ ---
 async def auto_backup_loop(bot: Bot):
   while True:
-    await asyncio.sleep(900)  # 900 секунд = ровно 15 минут
+    await asyncio.sleep(300)  # 900 секунд = ровно 15 минут
     try:
       if os.path.exists(DB_NAME):
         document = FSInputFile(DB_NAME)
@@ -1036,7 +1038,7 @@ async def auto_backup_loop(bot: Bot):
             ADMIN_ID,
             document,
             caption=(
-                "⏱ Автоматический бэкап базы данных (каждые 15 минут):\n"
+                "⏱ база данных обновилась:\n"
                 f"📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
             ),
         )
