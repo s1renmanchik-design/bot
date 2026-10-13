@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -23,8 +24,6 @@ PORT = int(os.getenv("PORT", 10000))
 DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
-
-db_pool = None
 
 
 async def init_db():
@@ -685,6 +684,11 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
                     callback_data="start_broadcast",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="💾 Скачать бэкап БД", callback_data="admin_backup_db"
+                )
+            ],
         ]
     )
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
@@ -698,6 +702,21 @@ async def promo_prompt(callback: CallbackQuery, state: FSMContext):
   await callback.message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
   await callback.answer()
+
+
+@router.callback_query(F.data == "admin_backup_db")
+async def backup_database_manual(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer("⛔️ У тебя нет доступа!", show_alert=True)
+    return
+  if os.path.exists(DB_NAME):
+    document = FSInputFile(DB_NAME)
+    await callback.message.answer_document(
+        document, caption="💾 Ручной бэкап базы данных"
+    )
+    await callback.answer()
+  else:
+    await callback.answer("❌ База данных не найдена!", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("buy_"))
@@ -1006,6 +1025,25 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
+# --- ФОНОВАЯ ЗАДАЧА ДЛЯ АВТО-БЭКАПА КАЖДЫЕ 15 МИНУТ ---
+async def auto_backup_loop(bot: Bot):
+  while True:
+    await asyncio.sleep(900)  # 900 секунд = ровно 15 минут
+    try:
+      if os.path.exists(DB_NAME):
+        document = FSInputFile(DB_NAME)
+        await bot.send_document(
+            ADMIN_ID,
+            document,
+            caption=(
+                "⏱ Автоматический бэкап базы данных (каждые 15 минут):\n"
+                f"📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+            ),
+        )
+    except Exception as e:
+      print(f"Ошибка при отправке авто-бэкапа: {e}")
+
+
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def handle_ping(request):
   return web.Response(text="Bot is running!")
@@ -1028,10 +1066,13 @@ async def main():
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
+  # Запускаем фоновый цикл бэкапов каждые 15 минут
+  asyncio.create_task(auto_backup_loop(bot))
+
   await bot.delete_webhook(drop_pending_updates=True)
   print(
-      f"Бот успешно запущен без подписки, на SQLite и веб-сервер слушает порт"
-      f" {PORT}!"
+      f"Бот успешно запущен, авто-бэкап (каждые 15 минут) активен, веб-сервер"
+      f" слушает порт {PORT}!"
   )
   await dp.start_polling(bot)
 
