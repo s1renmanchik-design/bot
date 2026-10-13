@@ -227,7 +227,10 @@ async def promo_check(message: Message, state: FSMContext):
       promo = await cursor.fetchone()
 
     if not promo:
-      await message.answer("❌ Неверный или уже использованный промокод.")
+      await message.answer(
+          "❌ Неверный или уже использованный промокод.",
+          reply_markup=get_main_keyboard(user_id),
+      )
       return
 
     reward_type, reward_value, max_uses, used_count = promo
@@ -239,12 +242,16 @@ async def promo_check(message: Message, state: FSMContext):
       used_check = await cursor.fetchone()
 
     if used_check:
-      await message.answer("❌ Вы уже активировали этот промокод!")
+      await message.answer(
+          "❌ Вы уже активировали этот промокод!",
+          reply_markup=get_main_keyboard(user_id),
+      )
       return
 
     if max_uses > 0 and used_count >= max_uses:
       await message.answer(
-          "❌ У этого промокода закончилось количество активаций."
+          "❌ У этого промокода закончилось количество активаций.",
+          reply_markup=get_main_keyboard(user_id),
       )
       return
 
@@ -258,6 +265,7 @@ async def promo_check(message: Message, state: FSMContext):
           f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
           " токенов**",
           parse_mode="Markdown",
+          reply_markup=get_main_keyboard(user_id),
       )
     elif reward_type == "premium":
       days = int(reward_value)
@@ -276,6 +284,7 @@ async def promo_check(message: Message, state: FSMContext):
           f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
           f" **{days} дней** (до {formatted_date})!",
           parse_mode="Markdown",
+          reply_markup=get_main_keyboard(user_id),
       )
 
     await db.execute(
@@ -287,11 +296,6 @@ async def promo_check(message: Message, state: FSMContext):
         (code_text,),
     )
     await db.commit()
-
-  # Возвращаем клавиатуру после успешного ввода промокода
-  await message.answer(
-      "Главное меню:", reply_markup=get_main_keyboard(user_id)
-  )
 
 
 @router.message(EditProduct.new_value)
@@ -443,6 +447,7 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
       f"✅ **Премиум успешно выдан!**\n\n🆔 Пользователь: `{target_id}`\n📅"
       f" Срок: **{days} дней** (до {formatted_date})",
       parse_mode="Markdown",
+      reply_markup=get_main_keyboard(message.from_user.id),
   )
   try:
     await bot.send_message(
@@ -483,20 +488,29 @@ async def process_give_tokens_amount(message: Message, state: FSMContext, bot: B
   await state.clear()
 
   async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        """
-            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated) 
-            VALUES (?, ?, 0, 0, 0, 1)
-            ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
-        """,
-        (target_id, amount, amount),
-    )
+    async with db.execute(
+        "SELECT 1 FROM users WHERE user_id = ?", (target_id,)
+    ) as cursor:
+      user_exists = await cursor.fetchone()
+
+    if user_exists:
+      await db.execute(
+          "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+          (amount, target_id),
+      )
+    else:
+      await db.execute(
+          "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
+          " referrer_id, ref_activated) VALUES (?, ?, 0, 0, 0, 1)",
+          (target_id, amount),
+      )
     await db.commit()
 
   await message.answer(
       f"✅ **Токены успешно выданы!**\n\n🆔 Пользователь: `{target_id}`\n🪙"
       f" Начислено: **+{amount} токенов**",
       parse_mode="Markdown",
+      reply_markup=get_main_keyboard(message.from_user.id),
   )
   try:
     await bot.send_message(
