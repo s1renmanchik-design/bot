@@ -108,6 +108,11 @@ class GivePremiumState(StatesGroup):
   days = State()
 
 
+class GiveTokensState(StatesGroup):
+  user_id = State()
+  amount = State()
+
+
 router = Router()
 
 
@@ -169,6 +174,14 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       reply_markup=get_main_keyboard(user_id),
       parse_mode="Markdown",
   )
+
+
+# --- КОМАНДА /promocode ---
+@router.message(Command("promocode"))
+async def cmd_promocode(message: Message, state: FSMContext):
+  await state.clear()
+  await message.answer("🎟 Введите промокод:")
+  await state.set_state(PromocodeState.code)
 
 
 # --- ПРОВЕРКА ЧИСЛА 67 ДЛЯ РЕФЕРАЛОВ ---
@@ -451,6 +464,59 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
     pass
 
 
+# --- ВЫДАЧА ТОКЕНОВ АДМИНОМ ---
+@router.message(GiveTokensState.user_id)
+async def process_give_tokens_id(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
+    return
+  target_id = int(message.text)
+  await state.update_data(target_id=target_id)
+  await message.answer(
+      f"🪙 Сколько **токенов** начислить пользователю `{target_id}`?\n*(Введи"
+      " целое число, например: 50)*",
+      parse_mode="Markdown",
+  )
+  await state.set_state(GiveTokensState.amount)
+
+
+@router.message(GiveTokensState.amount)
+async def process_give_tokens_amount(message: Message, state: FSMContext, bot: Bot):
+  if not message.text.isdigit():
+    await message.answer("❌ Ошибка! Введите количество токенов цифрами.")
+    return
+  amount = int(message.text)
+  data = await state.get_data()
+  target_id = data["target_id"]
+  await state.clear()
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        """
+            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated) 
+            VALUES (?, ?, 0, 0, 0, 1)
+            ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+        """,
+        (target_id, amount, amount),
+    )
+    await db.commit()
+
+  await message.answer(
+      f"✅ **Токены успешно выданы!**\n\n🆔 Пользователь: `{target_id}`\n🪙"
+      f" Начислено: **+{amount} токенов**",
+      parse_mode="Markdown",
+  )
+  try:
+    await bot.send_message(
+        target_id,
+        f"🎁 **Администратор начислил вам {amount} токенов!** Проверьте баланс"
+        " в профиле.",
+        parse_mode="Markdown",
+    )
+  except Exception:
+    pass
+
+
 @router.message(AddProduct.title)
 async def process_title(message: Message, state: FSMContext):
   await state.update_data(title=message.text)
@@ -628,9 +694,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     ref_text = (
         "👥 Реферальная система\n\nПриглашай друзей по своей персональной"
-        f" ссылке:\n`{ref_link}`\n\n🎁 Бонусы:\n• За каждого приглашенного друга,"
-        " который напишет в бота число **67**, вы получаете 7 токенов!\n•"
-        " Получайте 15% от суммы всех покупок токенами ваших рефералов!"
+        f" ссылке:\n`{ref_link}`\n\n🎁 Бонусы:\n• За каждого приглашенного друга"
+        " вы получаете 7 токенов!\n• Получайте 15% от суммы всех покупок"
+        " токенами ваших рефералов!"
     )
     await message.answer(ref_text, parse_mode="Markdown")
 
@@ -748,6 +814,12 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
             [
                 InlineKeyboardButton(
                     text="🎟 Создать промокод", callback_data="admin_create_promo"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🪙 Выдать токены пользователю",
+                    callback_data="admin_give_tokens",
                 )
             ],
             [
@@ -1024,6 +1096,19 @@ async def process_promo_type(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
+@router.callback_query(F.data == "admin_give_tokens")
+async def start_give_tokens(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await callback.message.answer(
+      "🪙 Введи **Telegram ID** пользователя, которому нужно начислить токены:",
+      parse_mode="Markdown",
+  )
+  await state.set_state(GiveTokensState.user_id)
+  await callback.answer()
+
+
 @router.callback_query(F.data == "admin_give_premium")
 async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -1109,7 +1194,6 @@ async def weekly_reset_loop(bot: Bot):
     await asyncio.sleep(604800)  # 604800 секунд = ровно 7 дней
     try:
       async with aiosqlite.connect(DB_NAME) as db:
-        # Ищем победителя (1 место по рефералам с подтвержденным входом)
         async with db.execute(
             """
                 SELECT u.user_id, COUNT(r.user_id) as ref_count
@@ -1132,7 +1216,6 @@ async def weekly_reset_loop(bot: Bot):
               datetime.datetime.now() + datetime.timedelta(days=14)
           ).strftime("%d.%m.%Y")
 
-          # Выдаем премиум на 14 дней победителю
           await db.execute(
               "UPDATE users SET is_premium = 1, premium_expires = ? WHERE"
               " user_id = ?",
@@ -1151,7 +1234,6 @@ async def weekly_reset_loop(bot: Bot):
           except Exception:
             pass
 
-        # Сбрасываем реферальные привязки у всех пользователей для нового сезона
         await db.execute(
             "UPDATE users SET referrer_id = 0, ref_activated = 0"
         )
@@ -1220,7 +1302,6 @@ async def main():
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
-  # Запускаем фоновые задачи: бэкапы каждые 5 минут и еженедельный сброс топа
   asyncio.create_task(auto_backup_loop(bot))
   asyncio.create_task(weekly_reset_loop(bot))
 
