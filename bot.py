@@ -18,7 +18,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-# ТОКЕН ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER
 TOKEN = os.getenv("TOKEN", "8549927929:AAGLHW1GnV3mZq06TBELwFXo6UkjQfHi5fE")
 PORT = int(os.getenv("PORT", 10000))
 DB_NAME = "bot.db"
@@ -75,7 +74,6 @@ async def init_db():
     await db.commit()
 
 
-# Состояния FSM
 class AddProduct(StatesGroup):
   title = State()
   price = State()
@@ -165,7 +163,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
             """
                     INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
                     VALUES (?, 7, 0, 0, 0, 1)
-                    ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + 7
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + 7
                 """,
             (referrer_id,),
         )
@@ -188,7 +186,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
             """
                     INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
                     VALUES (?, 7, 0, 0, 0, 1)
-                    ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + 7
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + 7
                 """,
             (referrer_id,),
         )
@@ -209,15 +207,11 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
   )
 
 
-# --- КОМАНДА /promocode ---
 @router.message(Command("promocode"))
 async def cmd_promocode(message: Message, state: FSMContext):
   await state.clear()
   await message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
-
-
-# --- FSM ХЕНДЛЕРЫ ---
 
 
 @router.message(PromocodeState.code)
@@ -236,7 +230,7 @@ async def promo_check(message: Message, state: FSMContext):
 
     if not promo:
       await message.answer(
-          "❌ Неверный или уже использованный промокод.",
+          "❌ Неверный или несуществующий промокод.",
           reply_markup=get_main_keyboard(user_id),
       )
       return
@@ -263,30 +257,31 @@ async def promo_check(message: Message, state: FSMContext):
       )
       return
 
-    # Гарантированное добавление пользователя в БД перед зачислением промокода
+    try:
+      val = int(reward_value)
+    except ValueError:
+      val = 0
+
     if reward_type == "tokens":
-      tokens_amount = int(reward_value)
       await db.execute(
           """
                 INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
                 VALUES (?, ?, 0, 0, 0, 1)
-                ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+                ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
             """,
-          (user_id, tokens_amount, tokens_amount),
+          (user_id, val, val),
       )
       await message.answer(
-          f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{tokens_amount}"
-          " токенов**",
+          f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{val} токенов**",
           parse_mode="Markdown",
           reply_markup=get_main_keyboard(user_id),
       )
     elif reward_type == "premium":
-      days = int(reward_value)
       expire_date = (
-          datetime.datetime.now() + datetime.timedelta(days=days)
+          datetime.datetime.now() + datetime.timedelta(days=val)
       ).strftime("%Y-%m-%d %H:%M:%S")
       formatted_date = (
-          datetime.datetime.now() + datetime.timedelta(days=days)
+          datetime.datetime.now() + datetime.timedelta(days=val)
       ).strftime("%d.%m.%Y")
       await db.execute(
           """
@@ -298,7 +293,7 @@ async def promo_check(message: Message, state: FSMContext):
       )
       await message.answer(
           f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
-          f" **{days} дней** (до {formatted_date})!",
+          f" **{val} дней** (до {formatted_date})!",
           parse_mode="Markdown",
           reply_markup=get_main_keyboard(user_id),
       )
@@ -365,7 +360,7 @@ async def process_promo_value(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите целое число.")
     return
-  await state.update_data(value=message.text)
+  await state.update_data(value=message.text.strip())
   await message.answer(
       "🔢 Введите **количество использований** (например: 10 или 100):\n*(Введите"
       " 0 для безлимита)*",
@@ -379,7 +374,7 @@ async def process_promo_uses(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите число использований.")
     return
-  max_uses = int(message.text)
+  max_uses = int(message.text.strip())
   data = await state.get_data()
   code, reward_type, reward_value = data["code"], data["type"], data["value"]
   await state.clear()
@@ -413,6 +408,7 @@ async def process_promo_uses(message: Message, state: FSMContext):
       f"✅ **Промокод успешно создан!**\n\n🎟 Код: `{code}`\n🎁 Награда:"
       f" {reward_desc}\n👥 Лимит: {uses_text}",
       parse_mode="Markdown",
+      reply_markup=get_main_keyboard(message.from_user.id),
   )
 
 
@@ -421,7 +417,7 @@ async def process_give_premium_id(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
     return
-  target_id = int(message.text)
+  target_id = int(message.text.strip())
   await state.update_data(target_id=target_id)
   await message.answer(
       f"⏳ На сколько **дней** выдать Премиум пользователю `{target_id}`?\n*(Введи"
@@ -436,7 +432,7 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите число дней цифрами.")
     return
-  days = int(message.text)
+  days = int(message.text.strip())
   data = await state.get_data()
   target_id = data["target_id"]
   await state.clear()
@@ -477,13 +473,12 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
     pass
 
 
-# --- ВЫДАЧА ТОКЕНОВ АДМИНОМ ---
 @router.message(GiveTokensState.user_id)
 async def process_give_tokens_id(message: Message, state: FSMContext):
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
     return
-  target_id = int(message.text)
+  target_id = int(message.text.strip())
   await state.update_data(target_id=target_id)
   await message.answer(
       f"🪙 Сколько **токенов** начислить пользователю `{target_id}`?\n*(Введи"
@@ -498,7 +493,7 @@ async def process_give_tokens_amount(message: Message, state: FSMContext, bot: B
   if not message.text.isdigit():
     await message.answer("❌ Ошибка! Введите количество токенов цифрами.")
     return
-  amount = int(message.text)
+  amount = int(message.text.strip())
   data = await state.get_data()
   target_id = data["target_id"]
   await state.clear()
@@ -508,7 +503,7 @@ async def process_give_tokens_amount(message: Message, state: FSMContext, bot: B
         """
             INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated) 
             VALUES (?, ?, 0, 0, 0, 1)
-            ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+            ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
         """,
         (target_id, amount, amount),
     )
@@ -593,9 +588,6 @@ async def send_broadcast(message: Message, state: FSMContext):
   )
 
 
-# --- ГЛАВНОЕ МЕНЮ КНОПОК ---
-
-
 @router.message(
     F.text.in_(
         {
@@ -667,9 +659,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         ]
     )
     profile_text = (
-        f"👤 Ваш Профиль\n\n🆔 Ваш ID: `{user_id}`\n💲 Баланс: {tokens}"
-        f" токенов\n👑 Премиум-подписка: {prem_status}\n📦 Куплено папок: {bought}"
-        " шт."
+        f"👤 Ваш Профиль\n\n🆔 Ваш ID: `{user_id}`\n💲 Баланс: {tokens if tokens"
+        f" is not None else 0} токенов\n👑 Премиум-подписка: {prem_status}\n📦"
+        f" Куплено папок: {bought} шт."
     )
     await message.answer(
         profile_text, reply_markup=keyboard, parse_mode="Markdown"
@@ -702,8 +694,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await message.answer(
-        "🛍 Доступные фулы:\n*(Нажми на нужную, чтобы забрать"
-        " ссылку)*",
+        "🛍 Доступные фулы:\n*(Нажми на нужную, чтобы забрать ссылку)*",
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
@@ -721,7 +712,6 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
   elif text == "🏆 Топ игроков":
     async with aiosqlite.connect(DB_NAME) as db:
-      # Проверяем премиумы и обновляем статус, если истек срок
       async with db.execute(
           "SELECT user_id, is_premium, premium_expires FROM users WHERE"
           " is_premium = 1"
@@ -741,7 +731,6 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
           except Exception:
             pass
 
-      # Топ игроков (максимум 10 игроков, у которых от 1 реферала)
       async with db.execute(
           """
                 SELECT u.user_id, u.is_premium, COUNT(r.user_id) as ref_count
@@ -770,9 +759,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       uid, is_prem, count = row
       prefix = medals[i - 1] if i <= 3 else f"{i}."
       crown = " 👑" if is_prem == 1 else ""
-      text_top += (
-          f"{prefix} Пользователь `{uid}`{crown} — **{count}** реф.\n"
-      )
+      text_top += f"{prefix} Пользователь `{uid}`{crown} — **{count}** реф.\n"
 
     text_top += (
         "\n*(каждую неделю сбрасывается топ и выдается премиум подписка на 14"
@@ -819,13 +806,13 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➕ Добавить фулл",
-                    callback_data="add_product",
+                    text="➕ Добавить фулл", callback_data="add_product"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✏️ Редактировать товар", callback_data="edit_product_list"
+                    text="✏️ Редактировать товар",
+                    callback_data="edit_product_list",
                 )
             ],
             [
@@ -864,9 +851,6 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         ]
     )
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
-
-
-# --- CALLBACK ИНЛАЙН КНОПКИ ---
 
 
 @router.callback_query(F.data == "enter_promocode")
@@ -921,12 +905,11 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     ) as cursor:
       u_data = await cursor.fetchone()
 
-    tokens = u_data[0] if u_data else 0
+    tokens = u_data[0] if (u_data and u_data[0] is not None) else 0
     is_prem = u_data[1] if u_data else 0
     referrer_id = u_data[3] if u_data else 0
     prem_expires = u_data[4] if u_data else None
 
-    # ПРОВЕРКА ПРЕМИУМА ПРИ ПОКУПКЕ
     if is_prem == 1 and prem_expires:
       try:
         exp_date = datetime.datetime.strptime(
@@ -943,15 +926,14 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       except Exception:
         pass
 
-    # ЕСЛИ ЕСТЬ ПРЕМИУМ — ВЫДАЕМ БЕСПЛАТНО
     if is_prem == 1:
       await db.execute(
           "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
           (p_id,),
       )
       await db.execute(
-          "UPDATE users SET bought_folders = bought_folders + 1 WHERE user_id"
-          " = ?",
+          "UPDATE users SET bought_folders = COALESCE(bought_folders, 0) + 1"
+          " WHERE user_id = ?",
           (user_id,),
       )
       await db.commit()
@@ -963,7 +945,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       await callback.answer()
       return
 
-    # ЕСЛИ ПРЕМИУМА НЕТ — ПОКУПКА ЗА ТОКЕНЫ
     final_price = (
         max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
     )
@@ -978,8 +959,8 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
 
     new_tokens = tokens - final_price
     await db.execute(
-        "UPDATE users SET tokens = ?, bought_folders = bought_folders + 1 WHERE"
-        " user_id = ?",
+        "UPDATE users SET tokens = ?, bought_folders ="
+        " COALESCE(bought_folders, 0) + 1 WHERE user_id = ?",
         (new_tokens, user_id),
     )
     await db.execute(
@@ -995,7 +976,7 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
             """
                     INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
                     VALUES (?, ?, 0, 0, 0, 1)
-                    ON CONFLICT(user_id) DO UPDATE SET tokens = tokens + ?
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
                 """,
             (referrer_id, ref_bonus, ref_bonus),
         )
@@ -1222,10 +1203,9 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
-# --- ЕЖЕНЕДЕЛЬНЫЙ АВТО-СБРОС ТОПА И ВЫДАЧА ПРЕМИУМА НА 14 ДНЕЙ ---
 async def weekly_reset_loop(bot: Bot):
   while True:
-    await asyncio.sleep(604800)  # 604800 секунд = ровно 7 дней
+    await asyncio.sleep(604800)
     try:
       async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
@@ -1286,11 +1266,10 @@ async def weekly_reset_loop(bot: Bot):
       print(f"Ошибка при еженедельном сбросе топа: {e}")
 
 
-# --- ФОНОВАЯ ЗАДАЧА ДЛЯ АВТО-БЭКАПА КАЖДЫЕ 5 МИНУТ С УДАЛЕНИЕМ СТАРЫХ СООБЩЕНИЙ ---
 async def auto_backup_loop(bot: Bot):
   backup_message_ids = []
   while True:
-    await asyncio.sleep(300)  # 300 секунд = ровно 5 минут
+    await asyncio.sleep(300)
     try:
       if os.path.exists(DB_NAME):
         document = FSInputFile(DB_NAME)
@@ -1314,7 +1293,6 @@ async def auto_backup_loop(bot: Bot):
       print(f"Ошибка при отправке авто-бэкапа: {e}")
 
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def handle_ping(request):
   return web.Response(text="Bot is running!")
 
