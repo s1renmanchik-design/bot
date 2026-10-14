@@ -131,6 +131,9 @@ def get_main_keyboard(user_id):
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
+# --- СТАРТ И КОМАНДЫ ---
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot, state: FSMContext):
   await state.clear()
@@ -214,155 +217,124 @@ async def cmd_promocode(message: Message, state: FSMContext):
   await state.set_state(PromocodeState.code)
 
 
+# --- ВВОД И АКТИВАЦИЯ ПРОМОКОДА ---
+
+
 @router.message(PromocodeState.code)
 async def promo_check(message: Message, state: FSMContext):
   user_id = message.from_user.id
   code_text = message.text.strip()
   await state.clear()
 
-  try:
-    async with aiosqlite.connect(DB_NAME) as db:
-      # Поиск промокода без учета регистра
-      async with db.execute(
-          "SELECT reward_type, reward_value, max_uses, used_count FROM"
-          " promocodes WHERE LOWER(code) = LOWER(?)",
-          (code_text,),
-      ) as cursor:
-        promo = await cursor.fetchone()
-
-      if not promo:
-        await message.answer(
-            "❌ Неверный или несуществующий промокод.",
-            reply_markup=get_main_keyboard(user_id),
-        )
-        return
-
-      reward_type, reward_value, max_uses, used_count = promo
-
-      # Проверка активации
-      async with db.execute(
-          "SELECT 1 FROM promo_activations WHERE user_id = ? AND LOWER(code) ="
-          " LOWER(?)",
-          (user_id, code_text),
-      ) as cursor:
-        used_check = await cursor.fetchone()
-
-      if used_check:
-        await message.answer(
-            "❌ Вы уже активировали этот промокод!",
-            reply_markup=get_main_keyboard(user_id),
-        )
-        return
-
-      if max_uses > 0 and used_count >= max_uses:
-        await message.answer(
-            "❌ У этого промокода закончилось количество активаций.",
-            reply_markup=get_main_keyboard(user_id),
-        )
-        return
-
-      val = int(reward_value)
-
-      if reward_type == "tokens":
-        await db.execute(
-            """
-                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
-                    VALUES (?, ?, 0, 0, 0, 1)
-                    ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
-                """,
-            (user_id, val, val),
-        )
-        await message.answer(
-            f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{val}"
-            " токенов**",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard(user_id),
-        )
-
-      elif reward_type == "premium":
-        # Проверяем, есть ли у юзера уже премиум
-        async with db.execute(
-            "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-          u_info = await cursor.fetchone()
-
-        now = datetime.datetime.now()
-        if u_info and u_info[0] == 1 and u_info[1]:
-          try:
-            curr_exp = datetime.datetime.strptime(
-                u_info[1], "%Y-%m-%d %H:%M:%S"
-            )
-            base_date = curr_exp if curr_exp > now else now
-          except Exception:
-            base_date = now
-        else:
-          base_date = now
-
-        new_expire = base_date + datetime.timedelta(days=val)
-        expire_str = new_expire.strftime("%Y-%m-%d %H:%M:%S")
-        formatted_date = new_expire.strftime("%d.%m.%Y")
-
-        await db.execute(
-            """
-                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-                    VALUES (?, 0, 1, 0, 0, 1, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
-                """,
-            (user_id, expire_str, expire_str),
-        )
-
-        await message.answer(
-            f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
-            f" **{val} дней** (до {formatted_date})!",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard(user_id),
-        )
-
-      # Фиксируем активацию
-      await db.execute(
-          "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
-          (user_id, code_text),
-      )
-      await db.execute(
-          "UPDATE promocodes SET used_count = used_count + 1 WHERE LOWER(code)"
-          " = LOWER(?)",
-          (code_text,),
-      )
-      await db.commit()
-
-  except Exception as e:
-    print(f"Ошибка в promo_check: {e}")
-    await message.answer(
-        "❌ Ошибка обработки промокода. Попробуйте еще раз.",
-        reply_markup=get_main_keyboard(user_id),
-    )
-
-
-@router.message(EditProduct.new_value)
-async def process_new_value(message: Message, state: FSMContext):
-  data = await state.get_data()
-  p_id = data["product_id"]
-  field = data["field"]
-  new_val = message.text.strip()
-  await state.clear()
-
   async with aiosqlite.connect(DB_NAME) as db:
-    if field == "title":
-      await db.execute(
-          "UPDATE products SET title = ? WHERE id = ?", (new_val, p_id)
+    async with db.execute(
+        "SELECT reward_type, reward_value, max_uses, used_count FROM promocodes"
+        " WHERE LOWER(code) = LOWER(?)",
+        (code_text,),
+    ) as cursor:
+      promo = await cursor.fetchone()
+
+    if not promo:
+      await message.answer(
+          "❌ Неверный или несуществующий промокод.",
+          reply_markup=get_main_keyboard(user_id),
       )
-    elif field == "price":
-      await db.execute(
-          "UPDATE products SET price = ? WHERE id = ?", (new_val, p_id)
+      return
+
+    reward_type, reward_value, max_uses, used_count = promo
+
+    async with db.execute(
+        "SELECT 1 FROM promo_activations WHERE user_id = ? AND LOWER(code) ="
+        " LOWER(?)",
+        (user_id, code_text),
+    ) as cursor:
+      used_check = await cursor.fetchone()
+
+    if used_check:
+      await message.answer(
+          "❌ Вы уже активировали этот промокод!",
+          reply_markup=get_main_keyboard(user_id),
       )
-    elif field == "link":
-      await db.execute(
-          "UPDATE products SET link = ? WHERE id = ?", (new_val, p_id)
+      return
+
+    if max_uses > 0 and used_count >= max_uses:
+      await message.answer(
+          "❌ У этого промокода закончилось количество активаций.",
+          reply_markup=get_main_keyboard(user_id),
       )
+      return
+
+    try:
+      val = int(reward_value)
+    except ValueError:
+      val = 0
+
+    if reward_type == "tokens":
+      await db.execute(
+          """
+                INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+                VALUES (?, ?, 0, 0, 0, 1)
+                ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
+            """,
+          (user_id, val, val),
+      )
+      await message.answer(
+          f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{val}"
+          " токенов**",
+          parse_mode="Markdown",
+          reply_markup=get_main_keyboard(user_id),
+      )
+
+    elif reward_type == "premium":
+      async with db.execute(
+          "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
+          (user_id,),
+      ) as cursor:
+        u_info = await cursor.fetchone()
+
+      now = datetime.datetime.now()
+      base_date = now
+      if u_info and u_info[0] == 1 and u_info[1]:
+        try:
+          curr_exp = datetime.datetime.strptime(u_info[1], "%Y-%m-%d %H:%M:%S")
+          if curr_exp > now:
+            base_date = curr_exp
+        except Exception:
+          pass
+
+      new_expire = base_date + datetime.timedelta(days=val)
+      expire_str = new_expire.strftime("%Y-%m-%d %H:%M:%S")
+      formatted_date = new_expire.strftime("%d.%m.%Y")
+
+      await db.execute(
+          """
+                INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
+                VALUES (?, 0, 1, 0, 0, 1, ?)
+                ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
+            """,
+          (user_id, expire_str, expire_str),
+      )
+
+      await message.answer(
+          f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
+          f" **{val} дней** (до {formatted_date})!",
+          parse_mode="Markdown",
+          reply_markup=get_main_keyboard(user_id),
+      )
+
+    await db.execute(
+        "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
+        (user_id, code_text),
+    )
+    await db.execute(
+        "UPDATE promocodes SET used_count = used_count + 1 WHERE LOWER(code) ="
+        " LOWER(?)",
+        (code_text,),
+    )
     await db.commit()
 
-  await message.answer("✅ Товар успешно обновлен!")
+
+# --- FSM ХЕНДЛЕРЫ АДМИНКИ И ТОВАРОВ ---
 
 
 @router.message(CreatePromoState.code)
@@ -475,14 +447,14 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
     ) as cursor:
       u_info = await cursor.fetchone()
 
+    base_date = now
     if u_info and u_info[0] == 1 and u_info[1]:
       try:
         curr_exp = datetime.datetime.strptime(u_info[1], "%Y-%m-%d %H:%M:%S")
-        base_date = curr_exp if curr_exp > now else now
+        if curr_exp > now:
+          base_date = curr_exp
       except Exception:
-        base_date = now
-    else:
-      base_date = now
+        pass
 
     new_expire = base_date + datetime.timedelta(days=days)
     expire_date = new_expire.strftime("%Y-%m-%d %H:%M:%S")
@@ -569,6 +541,32 @@ async def process_give_tokens_amount(message: Message, state: FSMContext, bot: B
     pass
 
 
+@router.message(EditProduct.new_value)
+async def process_new_value(message: Message, state: FSMContext):
+  data = await state.get_data()
+  p_id = data["product_id"]
+  field = data["field"]
+  new_val = message.text.strip()
+  await state.clear()
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    if field == "title":
+      await db.execute(
+          "UPDATE products SET title = ? WHERE id = ?", (new_val, p_id)
+      )
+    elif field == "price":
+      await db.execute(
+          "UPDATE products SET price = ? WHERE id = ?", (new_val, p_id)
+      )
+    elif field == "link":
+      await db.execute(
+          "UPDATE products SET link = ? WHERE id = ?", (new_val, p_id)
+      )
+    await db.commit()
+
+  await message.answer("✅ Товар успешно обновлен!")
+
+
 @router.message(AddProduct.title)
 async def process_title(message: Message, state: FSMContext):
   await state.update_data(title=message.text)
@@ -629,6 +627,9 @@ async def send_broadcast(message: Message, state: FSMContext):
       f"✅ Рассылка завершена!\n\n📤 Доставлено: {success}\n❌ Заблокировали"
       f" бота: {fail}"
   )
+
+
+# --- ГЛАВНОЕ МЕНЮ КНОПОК ---
 
 
 @router.message(
@@ -896,6 +897,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
 
 
+# --- CALLBACKS И ПОКУПКА ---
+
+
 @router.callback_query(F.data == "enter_promocode")
 async def promo_prompt(callback: CallbackQuery, state: FSMContext):
   await state.clear()
@@ -1076,303 +1080,4 @@ async def edit_product_list(callback: CallbackQuery):
   await callback.answer()
 
 
-@router.callback_query(F.data.startswith("edit_prod_"))
-async def select_edit_field(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  p_id = int(callback.data.split("_")[2])
-  await state.update_data(product_id=p_id)
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT title, price, link FROM products WHERE id = ?", (p_id,)
-    ) as cursor:
-      product = await cursor.fetchone()
-
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="📝 Название", callback_data="field_title"
-              ),
-              InlineKeyboardButton(
-                  text="💰 Цену", callback_data="field_price"
-              ),
-          ],
-          [InlineKeyboardButton(text="🔗 Ссылку", callback_data="field_link")],
-      ]
-  )
-  await callback.message.answer(
-      f"✏️ **Редактирование товара:** {product[0]}\n💰 Текущая цена:"
-      f" {product[1]} токенов\n🔗 Ссылка: {product[2]}\n\nЧто именно хочешь"
-      " изменить?",
-      reply_markup=keyboard,
-      parse_mode="Markdown",
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("field_"))
-async def prompt_new_value(callback: CallbackQuery, state: FSMContext):
-  field = callback.data.split("_")[1]
-  await state.update_data(field=field)
-  field_names = {
-      "title": "новое название",
-      "price": "новую цену в токенах",
-      "link": "новую ссылку",
-  }
-  await callback.message.answer(f"Введи {field_names[field]} для этого товара:")
-  await state.set_state(EditProduct.new_value)
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_create_promo")
-async def start_create_promo(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer(
-      "🎟 Введите текст промокода (например: `START100`):", parse_mode="Markdown"
-  )
-  await state.set_state(CreatePromoState.code)
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("promo_type_"))
-async def process_promo_type(callback: CallbackQuery, state: FSMContext):
-  p_type = callback.data.split("_")[2]
-  await state.update_data(type=p_type)
-  if p_type == "tokens":
-    await callback.message.answer(
-        "💰 Введите количество токенов (число, например: 50):"
-    )
-  else:
-    await callback.message.answer(
-        "⏳ Введите количество дней Премиума (число, например: 30):"
-    )
-  await state.set_state(CreatePromoState.value)
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_give_tokens")
-async def start_give_tokens(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer(
-      "🪙 Введи **Telegram ID** пользователя, которому нужно начислить токены:",
-      parse_mode="Markdown",
-  )
-  await state.set_state(GiveTokensState.user_id)
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_give_premium")
-async def start_give_premium(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer(
-      "👑 Введи **Telegram ID** пользователя, которому нужно выдать Премиум:",
-      parse_mode="Markdown",
-  )
-  await state.set_state(GivePremiumState.user_id)
-  await callback.answer()
-
-
-@router.callback_query(F.data == "add_product")
-async def start_add_product(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer(
-      "📝 Введи название фула (например: Казань, Пантера):"
-  )
-  await state.set_state(AddProduct.title)
-  await callback.answer()
-
-
-@router.callback_query(F.data == "delete_product_list")
-async def delete_product_list(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT id, title FROM products") as cursor:
-      products = await cursor.fetchall()
-
-  if not products:
-    await callback.message.answer("📭 Нет товаров для удаления.")
-    await callback.answer()
-    return
-
-  keyboard_buttons = [
-      [
-          InlineKeyboardButton(
-              text=f"❌ Удалить: {p[1]}", callback_data=f"del_prod_{p[0]}"
-          )
-      ]
-      for p in products
-  ]
-  await callback.message.answer(
-      "Выбери товар для удаления:",
-      reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("del_prod_"))
-async def delete_product_execute(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  p_id = int(callback.data.split("_")[2])
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute("DELETE FROM products WHERE id = ?", (p_id,))
-    await db.commit()
-
-  await callback.answer("Товар удален!", show_alert=True)
-
-
-@router.callback_query(F.data == "start_broadcast")
-async def start_broadcast(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer(
-      "📢 Отправь текст, картинку или видео для рассылки всем пользователям бота:"
-  )
-  await state.set_state(BroadcastState.message)
-  await callback.answer()
-
-
-async def weekly_reset_loop(bot: Bot):
-  while True:
-    await asyncio.sleep(604800)
-    try:
-      async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            """
-                SELECT u.user_id, COUNT(r.user_id) as ref_count
-                FROM users u
-                JOIN users r ON r.referrer_id = u.user_id
-                GROUP BY u.user_id
-                HAVING ref_count > 0
-                ORDER BY ref_count DESC
-                LIMIT 1
-            """
-        ) as cursor:
-          winner = await cursor.fetchone()
-
-        if winner:
-          winner_id = winner[0]
-          expire_date = (
-              datetime.datetime.now() + datetime.timedelta(days=14)
-          ).strftime("%Y-%m-%d %H:%M:%S")
-          formatted_date = (
-              datetime.datetime.now() + datetime.timedelta(days=14)
-          ).strftime("%d.%m.%Y")
-
-          await db.execute(
-              "UPDATE users SET is_premium = 1, premium_expires = ? WHERE"
-              " user_id = ?",
-              (expire_date, winner_id),
-          )
-          await db.commit()
-
-          try:
-            await bot.send_message(
-                winner_id,
-                "🏆 **Поздравляем! Вы заняли 1 место в еженедельном топе"
-                " рефералов!**\n👑 Вам автоматически начислена Премиум-подписка"
-                f" на **14 дней** (до {formatted_date})!",
-                parse_mode="Markdown",
-            )
-          except Exception:
-            pass
-
-        await db.execute(
-            "UPDATE users SET referrer_id = 0, ref_activated = 1"
-        )
-        await db.commit()
-
-      try:
-        await bot.send_message(
-            ADMIN_ID,
-            "🔄 Еженедельный топ рефералов успешно сброшен, победителю выдан"
-            " Премиум на 14 дней!",
-        )
-      except Exception:
-        pass
-
-    except Exception as e:
-      print(f"Ошибка при еженедельном сбросе топа: {e}")
-
-
-async def auto_backup_loop(bot: Bot):
-  backup_message_ids = []
-  while True:
-    await asyncio.sleep(300)
-    try:
-      if os.path.exists(DB_NAME):
-        document = FSInputFile(DB_NAME)
-        sent_msg = await bot.send_document(
-            ADMIN_ID,
-            document,
-            caption=(
-                "⏱ база данных обновилась:\n"
-                f"📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
-            ),
-        )
-        backup_message_ids.append(sent_msg.message_id)
-
-        if len(backup_message_ids) > 5:
-          old_msg_id = backup_message_ids.pop(0)
-          try:
-            await bot.delete_message(chat_id=ADMIN_ID, message_id=old_msg_id)
-          except Exception:
-            pass
-    except Exception as e:
-      print(f"Ошибка при отправке авто-бэкапа: {e}")
-
-
-async def handle_ping(request):
-  return web.Response(text="Bot is running!")
-
-
-async def start_web_server():
-  app = web.Application()
-  app.router.add_get("/", handle_ping)
-  runner = web.AppRunner(app)
-  await runner.setup()
-  site = web.TCPSite(runner, "0.0.0.0", PORT)
-  await site.start()
-
-
-async def main():
-  await init_db()
-  await start_web_server()
-
-  bot = Bot(token=TOKEN)
-  dp = Dispatcher(storage=MemoryStorage())
-  dp.include_router(router)
-
-  asyncio.create_task(auto_backup_loop(bot))
-  asyncio.create_task(weekly_reset_loop(bot))
-
-  await bot.delete_webhook(drop_pending_updates=True)
-  print(
-      f"Бот успешно запущен, авто-бэкап (5 минут) и еженедельный сброс активны,"
-      f" веб-сервер слушает порт {PORT}!"
-  )
-  await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-  asyncio.run(main())
+@router.callback_
