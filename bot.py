@@ -220,93 +220,100 @@ async def promo_check(message: Message, state: FSMContext):
   code_text = message.text.strip()
   await state.clear()
 
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT reward_type, reward_value, max_uses, used_count FROM promocodes"
-        " WHERE code = ?",
-        (code_text,),
-    ) as cursor:
-      promo = await cursor.fetchone()
+  try:
+    async with aiosqlite.connect(DB_NAME) as db:
+      async with db.execute(
+          "SELECT reward_type, reward_value, max_uses, used_count FROM"
+          " promocodes WHERE LOWER(code) = LOWER(?)",
+          (code_text,),
+      ) as cursor:
+        promo = await cursor.fetchone()
 
-    if not promo:
-      await message.answer(
-          "❌ Неверный или несуществующий промокод.",
-          reply_markup=get_main_keyboard(user_id),
-      )
-      return
+      if not promo:
+        await message.answer(
+            "❌ Неверный или несуществующий промокод.",
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return
 
-    reward_type, reward_value, max_uses, used_count = promo
+      reward_type, reward_value, max_uses, used_count = promo
 
-    async with db.execute(
-        "SELECT 1 FROM promo_activations WHERE user_id = ? AND code = ?",
-        (user_id, code_text),
-    ) as cursor:
-      used_check = await cursor.fetchone()
+      async with db.execute(
+          "SELECT 1 FROM promo_activations WHERE user_id = ? AND LOWER(code) ="
+          " LOWER(?)",
+          (user_id, code_text),
+      ) as cursor:
+        used_check = await cursor.fetchone()
 
-    if used_check:
-      await message.answer(
-          "❌ Вы уже активировали этот промокод!",
-          reply_markup=get_main_keyboard(user_id),
-      )
-      return
+      if used_check:
+        await message.answer(
+            "❌ Вы уже активировали этот промокод!",
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return
 
-    if max_uses > 0 and used_count >= max_uses:
-      await message.answer(
-          "❌ У этого промокода закончилось количество активаций.",
-          reply_markup=get_main_keyboard(user_id),
-      )
-      return
+      if max_uses > 0 and used_count >= max_uses:
+        await message.answer(
+            "❌ У этого промокода закончилось количество активаций.",
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return
 
-    try:
       val = int(reward_value)
-    except ValueError:
-      val = 0
 
-    if reward_type == "tokens":
-      await db.execute(
-          """
-                INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
-                VALUES (?, ?, 0, 0, 0, 1)
-                ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
-            """,
-          (user_id, val, val),
-      )
-      await message.answer(
-          f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{val} токенов**",
-          parse_mode="Markdown",
-          reply_markup=get_main_keyboard(user_id),
-      )
-    elif reward_type == "premium":
-      expire_date = (
-          datetime.datetime.now() + datetime.timedelta(days=val)
-      ).strftime("%Y-%m-%d %H:%M:%S")
-      formatted_date = (
-          datetime.datetime.now() + datetime.timedelta(days=val)
-      ).strftime("%d.%m.%Y")
-      await db.execute(
-          """
-                INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-                VALUES (?, 0, 1, 0, 0, 1, ?)
-                ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
-            """,
-          (user_id, expire_date, expire_date),
-      )
-      await message.answer(
-          f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
-          f" **{val} дней** (до {formatted_date})!",
-          parse_mode="Markdown",
-          reply_markup=get_main_keyboard(user_id),
-      )
+      if reward_type == "tokens":
+        await db.execute(
+            """
+                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+                    VALUES (?, ?, 0, 0, 0, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
+                """,
+            (user_id, val, val),
+        )
+        await message.answer(
+            f"✅ Промокод успешно активирован!\n🎁 Вам зачислено: **{val}"
+            " токенов**",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(user_id),
+        )
+      elif reward_type == "premium":
+        expire_date = (
+            datetime.datetime.now() + datetime.timedelta(days=val)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        formatted_date = (
+            datetime.datetime.now() + datetime.timedelta(days=val)
+        ).strftime("%d.%m.%Y")
+        await db.execute(
+            """
+                    INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
+                    VALUES (?, 0, 1, 0, 0, 1, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
+                """,
+            (user_id, expire_date, expire_date),
+        )
+        await message.answer(
+            f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
+            f" **{val} дней** (до {formatted_date})!",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(user_id),
+        )
 
-    await db.execute(
-        "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
-        (user_id, code_text),
+      await db.execute(
+          "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
+          (user_id, code_text),
+      )
+      await db.execute(
+          "UPDATE promocodes SET used_count = used_count + 1 WHERE LOWER(code)"
+          " = LOWER(?)",
+          (code_text,),
+      )
+      await db.commit()
+  except Exception as e:
+    print(f"Ошибка активации промокода: {e}")
+    await message.answer(
+        "❌ Произошла ошибка при активации. Попробуйте еще раз.",
+        reply_markup=get_main_keyboard(user_id),
     )
-    await db.execute(
-        "UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?",
-        (code_text,),
-    )
-    await db.commit()
 
 
 @router.message(EditProduct.new_value)
@@ -358,7 +365,7 @@ async def process_promo_code(message: Message, state: FSMContext):
 @router.message(CreatePromoState.value)
 async def process_promo_value(message: Message, state: FSMContext):
   if not message.text.isdigit():
-    await message.answer("❌ Ошибка! Введите целое число.")
+    await message.answer("❌ Ошибка! Введите целое число (цифрами).")
     return
   await state.update_data(value=message.text.strip())
   await message.answer(
@@ -372,7 +379,7 @@ async def process_promo_value(message: Message, state: FSMContext):
 @router.message(CreatePromoState.uses)
 async def process_promo_uses(message: Message, state: FSMContext):
   if not message.text.isdigit():
-    await message.answer("❌ Ошибка! Введите число использований.")
+    await message.answer("❌ Ошибка! Введите число использований цифрами.")
     return
   max_uses = int(message.text.strip())
   data = await state.get_data()
@@ -855,6 +862,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
 @router.callback_query(F.data == "enter_promocode")
 async def promo_prompt(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
   await callback.message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
   await callback.answer()
@@ -1088,6 +1096,7 @@ async def start_create_promo(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
+  await state.clear()
   await callback.message.answer(
       "🎟 Введите текст промокода (например: `START100`):", parse_mode="Markdown"
   )
@@ -1116,6 +1125,7 @@ async def start_give_tokens(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
+  await state.clear()
   await callback.message.answer(
       "🪙 Введи **Telegram ID** пользователя, которому нужно начислить токены:",
       parse_mode="Markdown",
@@ -1129,6 +1139,7 @@ async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
+  await state.clear()
   await callback.message.answer(
       "👑 Введи **Telegram ID** пользователя, которому нужно выдать Премиум:",
       parse_mode="Markdown",
@@ -1142,6 +1153,7 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
+  await state.clear()
   await callback.message.answer(
       "📝 Введи название фула (например: Казань, Пантера):"
   )
@@ -1196,6 +1208,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
+  await state.clear()
   await callback.message.answer(
       "📢 Отправь текст, картинку или видео для рассылки всем пользователям бота:"
   )
