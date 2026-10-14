@@ -222,6 +222,7 @@ async def promo_check(message: Message, state: FSMContext):
 
   try:
     async with aiosqlite.connect(DB_NAME) as db:
+      # Поиск промокода без учета регистра
       async with db.execute(
           "SELECT reward_type, reward_value, max_uses, used_count FROM"
           " promocodes WHERE LOWER(code) = LOWER(?)",
@@ -238,6 +239,7 @@ async def promo_check(message: Message, state: FSMContext):
 
       reward_type, reward_value, max_uses, used_count = promo
 
+      # Проверка активации
       async with db.execute(
           "SELECT 1 FROM promo_activations WHERE user_id = ? AND LOWER(code) ="
           " LOWER(?)",
@@ -276,21 +278,40 @@ async def promo_check(message: Message, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(user_id),
         )
+
       elif reward_type == "premium":
-        expire_date = (
-            datetime.datetime.now() + datetime.timedelta(days=val)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        formatted_date = (
-            datetime.datetime.now() + datetime.timedelta(days=val)
-        ).strftime("%d.%m.%Y")
+        # Проверяем, есть ли у юзера уже премиум
+        async with db.execute(
+            "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+          u_info = await cursor.fetchone()
+
+        now = datetime.datetime.now()
+        if u_info and u_info[0] == 1 and u_info[1]:
+          try:
+            curr_exp = datetime.datetime.strptime(
+                u_info[1], "%Y-%m-%d %H:%M:%S"
+            )
+            base_date = curr_exp if curr_exp > now else now
+          except Exception:
+            base_date = now
+        else:
+          base_date = now
+
+        new_expire = base_date + datetime.timedelta(days=val)
+        expire_str = new_expire.strftime("%Y-%m-%d %H:%M:%S")
+        formatted_date = new_expire.strftime("%d.%m.%Y")
+
         await db.execute(
             """
                     INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
                     VALUES (?, 0, 1, 0, 0, 1, ?)
                     ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
                 """,
-            (user_id, expire_date, expire_date),
+            (user_id, expire_str, expire_str),
         )
+
         await message.answer(
             f"✅ Промокод успешно активирован!\n👑 Вам выдана Премиум-подписка на"
             f" **{val} дней** (до {formatted_date})!",
@@ -298,6 +319,7 @@ async def promo_check(message: Message, state: FSMContext):
             reply_markup=get_main_keyboard(user_id),
         )
 
+      # Фиксируем активацию
       await db.execute(
           "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
           (user_id, code_text),
@@ -308,10 +330,11 @@ async def promo_check(message: Message, state: FSMContext):
           (code_text,),
       )
       await db.commit()
+
   except Exception as e:
-    print(f"Ошибка активации промокода: {e}")
+    print(f"Ошибка в promo_check: {e}")
     await message.answer(
-        "❌ Произошла ошибка при активации. Попробуйте еще раз.",
+        "❌ Ошибка обработки промокода. Попробуйте еще раз.",
         reply_markup=get_main_keyboard(user_id),
     )
 
@@ -444,14 +467,27 @@ async def process_give_premium_days(message: Message, state: FSMContext, bot: Bo
   target_id = data["target_id"]
   await state.clear()
 
-  expire_date = (
-      datetime.datetime.now() + datetime.timedelta(days=days)
-  ).strftime("%Y-%m-%d %H:%M:%S")
-  formatted_date = (
-      datetime.datetime.now() + datetime.timedelta(days=days)
-  ).strftime("%d.%m.%Y")
-
+  now = datetime.datetime.now()
   async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
+        (target_id,),
+    ) as cursor:
+      u_info = await cursor.fetchone()
+
+    if u_info and u_info[0] == 1 and u_info[1]:
+      try:
+        curr_exp = datetime.datetime.strptime(u_info[1], "%Y-%m-%d %H:%M:%S")
+        base_date = curr_exp if curr_exp > now else now
+      except Exception:
+        base_date = now
+    else:
+      base_date = now
+
+    new_expire = base_date + datetime.timedelta(days=days)
+    expire_date = new_expire.strftime("%Y-%m-%d %H:%M:%S")
+    formatted_date = new_expire.strftime("%d.%m.%Y")
+
     await db.execute(
         """
             INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires) 
