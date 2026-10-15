@@ -94,6 +94,33 @@ async def init_db():
         );
     """
     )
+
+    # Миграция: добавляем недостающие колонки в таблицы старой базы
+    migrations = {
+        "users": {
+            "tokens": "INTEGER DEFAULT 0",
+            "is_premium": "INTEGER DEFAULT 0",
+            "bought_folders": "INTEGER DEFAULT 0",
+            "referrer_id": "INTEGER DEFAULT 0",
+            "ref_activated": "INTEGER DEFAULT 1",
+            "premium_expires": "TEXT DEFAULT NULL",
+        },
+        "products": {
+            "buyers_count": "INTEGER DEFAULT 0",
+        },
+        "promocodes": {
+            "max_uses": "INTEGER DEFAULT 0",
+            "used_count": "INTEGER DEFAULT 0",
+        },
+    }
+    for table, columns in migrations.items():
+      async with db.execute(f"PRAGMA table_info({table})") as cur:
+        existing = {row[1] for row in await cur.fetchall()}
+      for col, ddl in columns.items():
+        if col not in existing:
+          await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+          logging.info("Миграция: добавлена колонка %s.%s", table, col)
+
     await db.commit()
 
 
