@@ -319,7 +319,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
         f"💲 Баланс: {tokens if tokens is not None else 0} токенов\n"
         f"👑 Премиум-подписка: {prem_status}\n"
-        f"📦 Куплено папок: {bought} шт."
+        f"📦 Куплено фулов: {bought} шт."
     )
     await message.answer(profile_text, reply_markup=keyboard)
 
@@ -431,12 +431,12 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text == "🪙 Как получить токены?":
     tokens_text = (
         "📌 Как получить токены?\n\n1. Возьмите фото."
-        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте рекламу моей игры в"
+        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте в"
         " комментариях под постами/ответами другим людям. \n3. Отправляйте"
         " доказательства (скриншоты) в директ канала."
         " https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото в"
         " комментариях = 1 токен! ГЛАВНОЕ: тема должна касаться по типу"
-        " майнкрафта и тд."
+        " сестры и брата и тд."
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -453,7 +453,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     )
     prem_text = (
         "👑 Премиум-подписка на 1 МЕСЯЦ (30 дней)\n\nДает право покупать"
-        " АБСОЛЮТНО ЛЮБЫЕ стримы бесплатно (даже с 0 токенов на балансе)!\n\n💳"
+        " АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно (даже с 0 токенов на балансе)!\n\n💳"
         " Стоимость:\n• 50 Звезд (любым подарком в Telegram за 50 звезд на"
         " профиль @ucu52)."
     )
