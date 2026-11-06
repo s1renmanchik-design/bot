@@ -526,12 +526,13 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text == "🪙 Как получить токены?":
     tokens_text = (
         "📌 Как получить токены?\n\n1. Возьмите фото."
-        " https://t.me/JmcDeveloper/15. Оставляйте в"
+        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте в"
         " комментариях под постами/ответами другим людям. \n3. Отправляйте"
         " доказательства (скриншоты) в директ канала."
         " https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото в"
         " комментариях = 1 токен! ГЛАВНОЕ: тема должна касаться по типу"
-        " сестры и брата и тд. ДЕТАЛЬНО РАСПИСАЛ ТУТ: https://t.me/JmcDeveloper/18
+        " сестры и брата и тд.\n\n📖 ДЕТАЛЬНО РАСПИСАЛ ТУТ:"
+        " https://t.me/JmcDeveloper/18"
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
