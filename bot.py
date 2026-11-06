@@ -7,7 +7,8 @@ import sys
 
 from aiohttp import web
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -31,7 +32,7 @@ except ImportError:  # старые версии aiogram 3.x
 logging.basicConfig(level=logging.INFO)
 
 # ВАЖНО: токен только из переменной окружения TOKEN (на хостинге).
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("8549927929:AAHs3JQzB6O8ZPnzNYSGTqCtDWF9Lmx6xfs")
 if not TOKEN:
   sys.exit("Не задана переменная окружения TOKEN")
 
@@ -39,6 +40,11 @@ PORT = int(os.getenv("PORT", 10000))
 DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
+
+# Канал для обязательной подписки.
+# Для каналов Telegram ID = -100 + число (2925107145 -> -1002925107145).
+CHANNEL_ID = -1002925107145
+CHANNEL_URL = "https://t.me/iiris_cnn_bot"
 
 DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -164,6 +170,79 @@ class GiveTokensState(StatesGroup):
 router = Router()
 
 
+# --- ОБЯЗАТЕЛЬНАЯ ПОДПИСКА НА КАНАЛ ---
+
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+  try:
+    member = await bot.get_chat_member(CHANNEL_ID, user_id)
+  except Exception:
+    # Бот не админ в канале или неверный CHANNEL_ID: не блокируем всех,
+    # но пишем ошибку в лог.
+    logging.exception("Не удалось проверить подписку")
+    return True
+  if member.status in (
+      ChatMemberStatus.MEMBER,
+      ChatMemberStatus.ADMINISTRATOR,
+      ChatMemberStatus.CREATOR,
+  ):
+    return True
+  if member.status == ChatMemberStatus.RESTRICTED:
+    return bool(getattr(member, "is_member", False))
+  return False
+
+
+def sub_keyboard() -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
+          [
+              InlineKeyboardButton(
+                  text="✅ Я подписался", callback_data="check_sub"
+              )
+          ],
+      ]
+  )
+
+
+SUB_TEXT = (
+    "🔒 Чтобы пользоваться ботом, подпишись на наш канал и нажми «Я"
+    " подписался»."
+)
+
+
+class SubscribeMiddleware(BaseMiddleware):
+
+  async def __call__(self, handler, event, data):
+    user = data.get("event_from_user")
+    bot: Bot = data["bot"]
+
+    if user is None or user.id == ADMIN_ID:
+      return await handler(event, data)
+
+    # /start пропускаем, чтобы реферальная ссылка успела сработать
+    if isinstance(event, Message) and (event.text or "").startswith("/start"):
+      return await handler(event, data)
+
+    # кнопку проверки подписки пропускаем
+    if isinstance(event, CallbackQuery) and event.data == "check_sub":
+      return await handler(event, data)
+
+    if await is_subscribed(bot, user.id):
+      return await handler(event, data)
+
+    if isinstance(event, CallbackQuery):
+      await event.message.answer(SUB_TEXT, reply_markup=sub_keyboard())
+      await event.answer()
+    else:
+      await event.answer(SUB_TEXT, reply_markup=sub_keyboard())
+    return None
+
+
+router.message.outer_middleware(SubscribeMiddleware())
+router.callback_query.outer_middleware(SubscribeMiddleware())
+
+
 def get_main_keyboard(user_id):
   kb = [
       [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛒 Магазин")],
@@ -224,14 +303,14 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
         try:
           await bot.send_message(
               referrer_id,
-              "🎉 По вашей реферальной ссылке зарегистрировался новый"
-              " пользователь!\n🎁 Вам начислено 7 токенов!",
+              "🎉 По вашей рефке зарегистрировался новый"
+              " фембойчик!\n❤️ Вам начислено 7 токенов!",
           )
         except Exception:
           pass
 
   await message.answer(
-      "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре"
+      "👋 Привет! Добро пожаловать в бота (Уголок бомжа). Выбирай нужный раздел на клавиатуре"
       " ниже:",
       reply_markup=get_main_keyboard(user_id),
   )
@@ -242,6 +321,22 @@ async def cmd_promocode(message: Message, state: FSMContext):
   await state.clear()
   await message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
+
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub(callback: CallbackQuery, bot: Bot):
+  if await is_subscribed(bot, callback.from_user.id):
+    try:
+      await callback.message.delete()
+    except Exception:
+      pass
+    await callback.message.answer(
+        "✅ Спасибо за подписку! Выбирай раздел в меню.",
+        reply_markup=get_main_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
+  else:
+    await callback.answer("❌ Ты ещё не подписан на канал!", show_alert=True)
 
 
 # --- МЕНЮ И КНОПКИ (стоят выше состояний, чтобы кнопки всегда работали) ---
@@ -319,7 +414,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
         f"💲 Баланс: {tokens if tokens is not None else 0} токенов\n"
         f"👑 Премиум-подписка: {prem_status}\n"
-        f"📦 Куплено фулов: {bought} шт."
+        f"📦 Собрано фулов: {bought} шт."
     )
     await message.answer(profile_text, reply_markup=keyboard)
 
@@ -413,7 +508,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       )
       return
 
-    text_top = "🏆 <b>Топ-10 игроков по рефералам:</b>\n\n"
+    text_top = "🏆 <b>Топ-10 крутых по рефералам:</b>\n\n"
     medals = ["🥇", "🥈", "🥉"]
 
     for i, row in enumerate(top_list, start=1):
@@ -431,12 +526,12 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text == "🪙 Как получить токены?":
     tokens_text = (
         "📌 Как получить токены?\n\n1. Возьмите фото."
-        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте в"
+        " https://t.me/JmcDeveloper/15. Оставляйте в"
         " комментариях под постами/ответами другим людям. \n3. Отправляйте"
         " доказательства (скриншоты) в директ канала."
         " https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото в"
         " комментариях = 1 токен! ГЛАВНОЕ: тема должна касаться по типу"
-        " сестры и брата и тд."
+        " сестры и брата и тд. ДЕТАЛЬНО РАСПИСАЛ ТУТ: https://t.me/JmcDeveloper/18
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -500,7 +595,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
             ],
             [
                 InlineKeyboardButton(
-                    text="📢 Сделать рассылку всем",
+                    text="📢 Сделать рассылку",
                     callback_data="start_broadcast",
                 )
             ],
@@ -870,8 +965,8 @@ async def process_promo_uses(message: Message, state: FSMContext):
       else f"Премиум на {reward_value} дней"
   )
   await message.answer(
-      f"✅ <b>Промокод успешно создан!</b>\n\n🎟 Код: <code>{esc(code)}</code>\n"
-      f"🎁 Награда: {reward_desc}\n👥 Лимит: {uses_text}",
+      f"✅ <b>Промокод успешно создан!</b>\n\n🎟 Промокод: <code>{esc(code)}</code>\n"
+      f"🎁 Награда: {reward_desc}\n👥 Использований: {uses_text}",
       reply_markup=get_main_keyboard(message.from_user.id),
   )
 
@@ -1089,7 +1184,7 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       await db.commit()
       text = (
           f"👑 Премиум-доступ применен!\n\n✅ Вы успешно получили фулл"
-          f" {esc(title)} бесплатно по подписке!\n\n🔗 Ссылка на скачивание:"
+          f" {esc(title)} бесплатно по подписке!\n\n🔗 Ссылка:"
           f" {esc(link)}"
       )
       await callback.message.answer(text)
