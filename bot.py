@@ -32,7 +32,7 @@ except ImportError:  # старые версии aiogram 3.x
 logging.basicConfig(level=logging.INFO)
 
 # ВАЖНО: токен только из переменной окружения TOKEN (на хостинге).
-TOKEN = os.getenv("8549927929:AAHs3JQzB6O8ZPnzNYSGTqCtDWF9Lmx6xfs")
+TOKEN = os.getenv("TOKEN")
 if not TOKEN:
   sys.exit("Не задана переменная окружения TOKEN")
 
