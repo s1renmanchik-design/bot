@@ -3,6 +3,7 @@ import datetime
 import html
 import logging
 import os
+import random
 import sys
 
 from aiohttp import web
@@ -29,6 +30,13 @@ try:
 except ImportError:  # старые версии aiogram 3.x
   DefaultBotProperties = None
 
+try:
+  from zoneinfo import ZoneInfo
+
+  LOCAL_TZ = ZoneInfo("Europe/Kyiv")
+except Exception:  # нет базы часовых поясов -> фиксированный UTC+2
+  LOCAL_TZ = datetime.timezone(datetime.timedelta(hours=2))
+
 logging.basicConfig(level=logging.INFO)
 
 # ВАЖНО: токен только из переменной окружения TOKEN (на хостинге).
@@ -48,10 +56,22 @@ CHANNEL_URL = "https://t.me/iiris_cnn_bot"
 
 DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# Модерация
+MAX_WARNS = 3
+PERM_BAN = "2999-12-31 00:00:00"
+
+# Лотерея
+LOTTERY_HOURS = 3
+
 
 def esc(value) -> str:
   """Экранирует текст для HTML-разметки Telegram."""
   return html.escape(str(value), quote=False)
+
+
+def now_local() -> datetime.datetime:
+  """Текущее время по Киеву (naive) - нужно только для ночного режима."""
+  return datetime.datetime.now(LOCAL_TZ).replace(tzinfo=None)
 
 
 async def init_db():
@@ -65,7 +85,9 @@ async def init_db():
             bought_folders INTEGER DEFAULT 0,
             referrer_id INTEGER DEFAULT 0,
             ref_activated INTEGER DEFAULT 1,
-            premium_expires TEXT DEFAULT NULL
+            premium_expires TEXT DEFAULT NULL,
+            warns INTEGER DEFAULT 0,
+            banned_until TEXT DEFAULT NULL
         );
     """
     )
@@ -100,6 +122,26 @@ async def init_db():
         );
     """
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lottery_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_cost INTEGER,
+            prize INTEGER,
+            ends_at TEXT,
+            finished INTEGER DEFAULT 0
+        );
+    """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lottery_participants (
+            round_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (round_id, user_id)
+        );
+    """
+    )
 
     # Миграция: добавляем недостающие колонки в таблицы старой базы
     migrations = {
@@ -110,6 +152,8 @@ async def init_db():
             "referrer_id": "INTEGER DEFAULT 0",
             "ref_activated": "INTEGER DEFAULT 1",
             "premium_expires": "TEXT DEFAULT NULL",
+            "warns": "INTEGER DEFAULT 0",
+            "banned_until": "TEXT DEFAULT NULL",
         },
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
@@ -170,6 +214,141 @@ class GiveTokensState(StatesGroup):
 router = Router()
 
 
+# --- БАНЫ И ПРЕДУПРЕЖДЕНИЯ ---
+
+
+async def get_active_ban(user_id: int):
+  """Возвращает datetime окончания бана или None, если бана нет."""
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT banned_until FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    if not row or not row[0]:
+      return None
+    try:
+      until = datetime.datetime.strptime(row[0], DT_FORMAT)
+    except Exception:
+      return None
+    if until <= datetime.datetime.now():
+      await db.execute(
+          "UPDATE users SET banned_until = NULL WHERE user_id = ?", (user_id,)
+      )
+      await db.commit()
+      return None
+    return until
+
+
+def ban_text(until: datetime.datetime) -> str:
+  if until.year >= 2900:
+    return "🚫 Ваш профиль заблокирован навсегда."
+  return f"🚫 Ваш профиль заблокирован до {until.strftime('%d.%m.%Y %H:%M')}."
+
+
+async def ensure_user(db, user_id: int) -> None:
+  await db.execute(
+      "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
+      " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 1)"
+      " ON CONFLICT(user_id) DO NOTHING",
+      (user_id,),
+  )
+
+
+async def ban_user(target_id: int, days: int) -> str:
+  """Банит на days дней (0 = навсегда). Возвращает текст срока."""
+  if days > 0:
+    until = datetime.datetime.now() + datetime.timedelta(days=days)
+    until_str = until.strftime(DT_FORMAT)
+    text = f"до {until.strftime('%d.%m.%Y %H:%M')}"
+  else:
+    until_str = PERM_BAN
+    text = "навсегда"
+  async with aiosqlite.connect(DB_NAME) as db:
+    await ensure_user(db, target_id)
+    await db.execute(
+        "UPDATE users SET banned_until = ? WHERE user_id = ?",
+        (until_str, target_id),
+    )
+    await db.commit()
+  return text
+
+
+async def unban_user(target_id: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        "UPDATE users SET banned_until = NULL WHERE user_id = ?", (target_id,)
+    )
+    await db.commit()
+
+
+async def add_warn(target_id: int):
+  """Добавляет предупреждение. Возвращает (кол-во варнов, забанен ли)."""
+  async with aiosqlite.connect(DB_NAME) as db:
+    await ensure_user(db, target_id)
+    await db.execute(
+        "UPDATE users SET warns = COALESCE(warns, 0) + 1 WHERE user_id = ?",
+        (target_id,),
+    )
+    async with db.execute(
+        "SELECT warns FROM users WHERE user_id = ?", (target_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    warns = row[0] if row and row[0] is not None else 0
+    banned = False
+    if warns >= MAX_WARNS:
+      await db.execute(
+          "UPDATE users SET banned_until = ?, is_premium = 0,"
+          " premium_expires = NULL, tokens = 0 WHERE user_id = ?",
+          (PERM_BAN, target_id),
+      )
+      banned = True
+    await db.commit()
+  return warns, banned
+
+
+async def remove_warn(target_id: int) -> int:
+  async with aiosqlite.connect(DB_NAME) as db:
+    await ensure_user(db, target_id)
+    await db.execute(
+        "UPDATE users SET warns = MAX(0, COALESCE(warns, 0) - 1)"
+        " WHERE user_id = ?",
+        (target_id,),
+    )
+    async with db.execute(
+        "SELECT warns FROM users WHERE user_id = ?", (target_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    await db.commit()
+  return row[0] if row and row[0] is not None else 0
+
+
+async def remove_premium(target_id: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        "UPDATE users SET is_premium = 0, premium_expires = NULL"
+        " WHERE user_id = ?",
+        (target_id,),
+    )
+    await db.commit()
+
+
+async def remove_tokens(target_id: int, amount: int) -> int:
+  """Забирает токены (не уходит ниже 0). Возвращает новый баланс."""
+  async with aiosqlite.connect(DB_NAME) as db:
+    await ensure_user(db, target_id)
+    await db.execute(
+        "UPDATE users SET tokens = MAX(0, COALESCE(tokens, 0) - ?)"
+        " WHERE user_id = ?",
+        (amount, target_id),
+    )
+    async with db.execute(
+        "SELECT tokens FROM users WHERE user_id = ?", (target_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    await db.commit()
+  return row[0] if row and row[0] is not None else 0
+
+
 # --- ОБЯЗАТЕЛЬНАЯ ПОДПИСКА НА КАНАЛ ---
 
 
@@ -220,6 +399,16 @@ class SubscribeMiddleware(BaseMiddleware):
     if user is None or user.id == ADMIN_ID:
       return await handler(event, data)
 
+    # Забаненные пользователи не могут пользоваться ботом
+    until = await get_active_ban(user.id)
+    if until is not None:
+      if isinstance(event, CallbackQuery):
+        await event.message.answer(ban_text(until))
+        await event.answer()
+      else:
+        await event.answer(ban_text(until))
+      return None
+
     # /start пропускаем, чтобы реферальная ссылка успела сработать
     if isinstance(event, Message) and (event.text or "").startswith("/start"):
       return await handler(event, data)
@@ -254,6 +443,7 @@ def get_main_keyboard(user_id):
           KeyboardButton(text="🪙 Как получить токены?"),
           KeyboardButton(text="👑 Премиум-подписка"),
       ],
+      [KeyboardButton(text="🎰 Лотерея")],
   ]
   if user_id == ADMIN_ID:
     kb.append([KeyboardButton(text="⚙️ Админ-панель")])
@@ -405,6 +595,230 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
     return f"❌ Ошибка обработки: {esc(e)}"
 
 
+# --- ЛОТЕРЕЯ ---
+
+
+def roll_lottery_params():
+  """Возвращает (цена участия, приз). Ночью 1:00-8:00 (Киев): 1 -> 4."""
+  hour = now_local().hour
+  if 1 <= hour < 8:
+    return 1, 4
+  prize = random.randint(7, 20)
+  # чем больше приз, тем дороже участие: 7 -> 1 токен ... 20 -> 4 токена
+  cost = 1 + (prize - 7) * 3 // 13
+  return cost, prize
+
+
+async def create_lottery_round() -> None:
+  cost, prize = roll_lottery_params()
+  ends_at = datetime.datetime.now() + datetime.timedelta(hours=LOTTERY_HOURS)
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        "INSERT INTO lottery_rounds (entry_cost, prize, ends_at, finished)"
+        " VALUES (?, ?, ?, 0)",
+        (cost, prize, ends_at.strftime(DT_FORMAT)),
+    )
+    await db.commit()
+
+
+async def get_current_round():
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT id, entry_cost, prize, ends_at FROM lottery_rounds"
+        " WHERE finished = 0 ORDER BY id DESC LIMIT 1"
+    ) as cur:
+      return await cur.fetchone()
+
+
+def lottery_again_keyboard() -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="🎰 Попытать удачу ещё раз", callback_data="lottery_open"
+              )
+          ]
+      ]
+  )
+
+
+async def build_lottery_view(user_id: int):
+  """Возвращает (текст, клавиатура) для экрана лотереи."""
+  rnd = await get_current_round()
+  if not rnd:
+    return "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", None
+
+  round_id, cost, prize, ends_at_str = rnd
+  ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+  left_min = max(0, int((ends_at - datetime.datetime.now()).total_seconds() // 60))
+  hours, minutes = divmod(left_min, 60)
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT COUNT(*) FROM lottery_participants WHERE round_id = ?",
+        (round_id,),
+    ) as cur:
+      players = (await cur.fetchone())[0]
+    async with db.execute(
+        "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
+        (round_id, user_id),
+    ) as cur:
+      joined = await cur.fetchone() is not None
+
+  text = (
+      "🎰 <b>Лотерея</b>\n\n"
+      f"🏆 Приз: <b>{prize} токенов</b>\n"
+      f"🎟 Участие: <b>{cost} токен(ов)</b>\n"
+      f"👥 Участников: <b>{players}</b>\n"
+      f"⏱ До конца розыгрыша: <b>{hours} ч {minutes} мин</b>\n\n"
+      "Победитель выбирается случайно среди всех участников."
+      " Токены за участие списываются сразу."
+  )
+  if joined:
+    return text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!", None
+
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=f"🎟 Участвовать ({cost} токен.)",
+                  callback_data=f"lottery_join_{round_id}",
+              )
+          ]
+      ]
+  )
+  return text, keyboard
+
+
+async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    # Сначала помечаем раунд завершённым, чтобы не выдать приз дважды
+    await db.execute(
+        "UPDATE lottery_rounds SET finished = 1 WHERE id = ?", (round_id,)
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT user_id FROM lottery_participants WHERE round_id = ?",
+        (round_id,),
+    ) as cur:
+      players = [row[0] for row in await cur.fetchall()]
+
+    winner = random.choice(players) if players else None
+    if winner is not None:
+      await db.execute(
+          """
+          INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
+          VALUES (?, ?, 0, 0, 0, 1)
+          ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
+          """,
+          (winner, prize, prize),
+      )
+      await db.commit()
+
+  for uid in players:
+    try:
+      if uid == winner:
+        await bot.send_message(
+            uid,
+            f"🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено:"
+            f" <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?",
+            reply_markup=lottery_again_keyboard(),
+        )
+      else:
+        await bot.send_message(
+            uid,
+            "😔 В этот раз удача была не на твоей стороне. Победитель уже"
+            " получил приз.\n\nХотите ещё попытать удачу?",
+            reply_markup=lottery_again_keyboard(),
+        )
+    except Exception:
+      pass
+    await asyncio.sleep(0.05)
+
+
+async def lottery_loop(bot: Bot):
+  while True:
+    try:
+      rnd = await get_current_round()
+      if rnd is None:
+        await create_lottery_round()
+        rnd = await get_current_round()
+
+      round_id, cost, prize, ends_at_str = rnd
+      ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+      delay = (ends_at - datetime.datetime.now()).total_seconds()
+      if delay > 0:
+        await asyncio.sleep(delay)
+      await finish_lottery_round(bot, round_id, prize)
+    except Exception:
+      logging.exception("Ошибка в цикле лотереи")
+      await asyncio.sleep(30)
+
+
+@router.callback_query(F.data == "lottery_open")
+async def lottery_open(callback: CallbackQuery):
+  text, keyboard = await build_lottery_view(callback.from_user.id)
+  await callback.message.answer(text, reply_markup=keyboard)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("lottery_join_"))
+async def lottery_join(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  round_id = int(callback.data.split("_")[2])
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT entry_cost, ends_at, finished FROM lottery_rounds WHERE id = ?",
+        (round_id,),
+    ) as cur:
+      rnd = await cur.fetchone()
+
+    if not rnd or rnd[2] == 1:
+      await callback.answer("⏳ Этот розыгрыш уже завершён.", show_alert=True)
+      return
+    cost = rnd[0]
+    try:
+      ends_at = datetime.datetime.strptime(rnd[1], DT_FORMAT)
+    except Exception:
+      ends_at = datetime.datetime.now()
+    if ends_at <= datetime.datetime.now():
+      await callback.answer("⏳ Розыгрыш уже заканчивается.", show_alert=True)
+      return
+
+    async with db.execute(
+        "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
+        (round_id, user_id),
+    ) as cur:
+      if await cur.fetchone():
+        await callback.answer("✅ Ты уже участвуешь!", show_alert=True)
+        return
+
+    # Списание токенов одним запросом: сработает, только если хватает токенов
+    cur = await db.execute(
+        "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+        " COALESCE(tokens, 0) >= ?",
+        (cost, user_id, cost),
+    )
+    if cur.rowcount == 0:
+      await db.rollback()
+      await callback.answer(
+          f"❌ Недостаточно токенов! Участие стоит {cost}.", show_alert=True
+      )
+      return
+    await db.execute(
+        "INSERT INTO lottery_participants (round_id, user_id) VALUES (?, ?)",
+        (round_id, user_id),
+    )
+    await db.commit()
+
+  await callback.answer("🎟 Ты в игре! Удачи!", show_alert=True)
+  await callback.message.answer(
+      f"🎟 Ты участвуешь в лотерее! Списано: <b>{cost} токен(ов)</b>.\n"
+      "Результат придёт сюда, когда закончится розыгрыш."
+  )
+
+
 # --- СТАРТ И ПРОМОКОД ---
 
 
@@ -480,7 +894,15 @@ async def cmd_promocode(
   await state.set_state(PromocodeState.code)
 
 
-# --- АДМИН-КОМАНДЫ: /premium add [дни] [ID] и /token add [сколько] [ID] ---
+# --- АДМИН-КОМАНДЫ ---
+
+
+def parse_args(command: CommandObject, count: int):
+  """Разбирает аргументы команды: нужно ровно count целых чисел."""
+  parts = (command.args or "").split()
+  if len(parts) != count or not all(p.isdigit() for p in parts):
+    return None
+  return [int(p) for p in parts]
 
 
 @router.message(Command("premium"))
@@ -576,6 +998,171 @@ async def cmd_token(message: Message, command: CommandObject, bot: Bot):
     pass
 
 
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  args = parse_args(command, 2)
+  if not args:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/ban [ID] [дни]</code>\n"
+        "Пример: <code>/ban 5681420389 7</code>\n"
+        "<i>(0 дней = бан навсегда)</i>"
+    )
+    return
+  target_id, days = args
+  if target_id == ADMIN_ID:
+    await message.answer("❌ Нельзя забанить админа.")
+    return
+  term = await ban_user(target_id, days)
+  await message.answer(
+      f"🚫 Пользователь <code>{target_id}</code> заблокирован {term}."
+  )
+  try:
+    await bot.send_message(
+        target_id, f"🚫 Ваш профиль заблокирован {term}."
+    )
+  except Exception:
+    pass
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/unban [ID]</code>\n"
+        "Пример: <code>/unban 5681420389</code>"
+    )
+    return
+  target_id = args[0]
+  await unban_user(target_id)
+  await message.answer(
+      f"✅ Пользователь <code>{target_id}</code> разблокирован."
+  )
+  try:
+    await bot.send_message(target_id, "✅ Ваш профиль разблокирован.")
+  except Exception:
+    pass
+
+
+@router.message(Command("warn"))
+async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/warn [ID]</code>\n"
+        "Пример: <code>/warn 5681420389</code>"
+    )
+    return
+  target_id = args[0]
+  if target_id == ADMIN_ID:
+    await message.answer("❌ Нельзя выдать предупреждение админу.")
+    return
+  warns, banned = await add_warn(target_id)
+  if banned:
+    await message.answer(
+        f"⚠️ Пользователь <code>{target_id}</code> получил"
+        f" {warns}/{MAX_WARNS} предупреждений и заблокирован навсегда"
+        " (премиум снят, токены обнулены)."
+    )
+    try:
+      await bot.send_message(
+          target_id,
+          f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений. Ваш профиль"
+          " заблокирован навсегда, премиум-подписка снята, токены обнулены.",
+      )
+    except Exception:
+      pass
+  else:
+    await message.answer(
+        f"⚠️ Пользователю <code>{target_id}</code> выдано предупреждение"
+        f" ({warns}/{MAX_WARNS})."
+    )
+    try:
+      await bot.send_message(
+          target_id,
+          f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}). При"
+          f" {MAX_WARNS} предупреждениях профиль будет заблокирован,"
+          " премиум снят, токены обнулены.",
+      )
+    except Exception:
+      pass
+
+
+@router.message(Command("unwarn"))
+async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/unwarn [ID]</code>\n"
+        "Пример: <code>/unwarn 5681420389</code>"
+    )
+    return
+  target_id = args[0]
+  warns = await remove_warn(target_id)
+  await message.answer(
+      f"✅ У пользователя <code>{target_id}</code> снято предупреждение"
+      f" (осталось {warns}/{MAX_WARNS})."
+  )
+  try:
+    await bot.send_message(
+        target_id,
+        f"✅ С вас снято предупреждение (осталось {warns}/{MAX_WARNS}).",
+    )
+  except Exception:
+    pass
+
+
+@router.message(Command("unpremium"))
+async def cmd_unpremium(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/unpremium [ID]</code>\n"
+        "Пример: <code>/unpremium 5681420389</code>"
+    )
+    return
+  target_id = args[0]
+  await remove_premium(target_id)
+  await message.answer(
+      f"✅ Премиум у пользователя <code>{target_id}</code> снят."
+  )
+
+
+@router.message(Command("untoken"))
+async def cmd_untoken(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  args = parse_args(command, 2)
+  if not args or args[1] <= 0:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/untoken [ID] [число токенов]</code>\n"
+        "Пример: <code>/untoken 5681420389 20</code>"
+    )
+    return
+  target_id, amount = args
+  new_balance = await remove_tokens(target_id, amount)
+  await message.answer(
+      f"✅ У пользователя <code>{target_id}</code> забрано до"
+      f" <b>{amount}</b> токенов. Баланс сейчас: <b>{new_balance}</b>."
+  )
+
+
 @router.callback_query(F.data == "check_sub")
 async def check_sub(callback: CallbackQuery, bot: Bot):
   if await is_subscribed(bot, callback.from_user.id):
@@ -605,6 +1192,7 @@ async def check_sub(callback: CallbackQuery, bot: Bot):
             "🏆 Топ игроков",
             "🪙 Как получить токены?",
             "👑 Премиум-подписка",
+            "🎰 Лотерея",
             "⚙️ Админ-панель",
         }
     )
@@ -617,8 +1205,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   if text == "👤 Мой Профиль":
     async with aiosqlite.connect(DB_NAME) as db:
       async with db.execute(
-          "SELECT tokens, is_premium, bought_folders, premium_expires FROM"
-          " users WHERE user_id = ?",
+          "SELECT tokens, is_premium, bought_folders, premium_expires, warns"
+          " FROM users WHERE user_id = ?",
           (user_id,),
       ) as cursor:
         user_data = await cursor.fetchone()
@@ -630,9 +1218,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
             (user_id,),
         )
         await db.commit()
-        tokens, is_prem, bought, prem_expires = 0, 0, 0, None
+        tokens, is_prem, bought, prem_expires, warns = 0, 0, 0, None, 0
       else:
-        tokens, is_prem, bought, prem_expires = user_data
+        tokens, is_prem, bought, prem_expires, warns = user_data
 
     prem_status = "❌ Не активна"
     if is_prem == 1 and prem_expires:
@@ -667,7 +1255,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
         f"💲 Баланс: {tokens if tokens is not None else 0} токенов\n"
         f"👑 Премиум-подписка: {prem_status}\n"
-        f"📦 Собрано фулов: {bought} шт."
+        f"📦 Собрано фулов: {bought} шт.\n"
+        f"⚠️ Предупреждения: {warns or 0}/{MAX_WARNS}"
     )
     await message.answer(profile_text, reply_markup=keyboard)
 
@@ -807,6 +1396,10 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         " профиль @ucu52)."
     )
     await message.answer(prem_text, reply_markup=keyboard)
+
+  elif text == "🎰 Лотерея":
+    lottery_text, lottery_kb = await build_lottery_view(user_id)
+    await message.answer(lottery_text, reply_markup=lottery_kb)
 
   elif text == "⚙️ Админ-панель":
     if user_id != ADMIN_ID:
@@ -1641,15 +2234,22 @@ async def main():
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
-  asyncio.create_task(auto_backup_loop(bot))
-  asyncio.create_task(weekly_reset_loop(bot))
+  background_tasks = [
+      asyncio.create_task(auto_backup_loop(bot)),
+      asyncio.create_task(weekly_reset_loop(bot)),
+      asyncio.create_task(lottery_loop(bot)),
+  ]
 
   await bot.delete_webhook(drop_pending_updates=True)
   print(
-      "Бот успешно запущен, авто-бэкап (5 минут) и еженедельный сброс активны,"
-      f" веб-сервер слушает порт {PORT}!"
+      "Бот успешно запущен, авто-бэкап (5 минут), еженедельный сброс и"
+      f" лотерея активны, веб-сервер слушает порт {PORT}!"
   )
-  await dp.start_polling(bot)
+  try:
+    await dp.start_polling(bot)
+  finally:
+    for task in background_tasks:
+      task.cancel()
 
 
 if __name__ == "__main__":
