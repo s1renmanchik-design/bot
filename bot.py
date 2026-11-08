@@ -4,12 +4,14 @@ import html
 import logging
 import os
 import random
+import re
 import sys
 
 from aiohttp import web
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -62,11 +64,32 @@ PERM_BAN = "2999-12-31 00:00:00"
 
 # Лотерея
 LOTTERY_HOURS = 3
+LOTTERY_RARE_CHANCE = 0.10  # шанс редкого крупного приза (9-20 токенов)
+LOTTERY_NOTIFY_PRIZE = 14  # от этого приза и выше всем приходит уведомление о старте
+LOTTERY_MIN_PLAYERS = 2  # минимум участников, чтобы разыграть приз
+LOTTERY_BIG_PRIZE = 15  # приз от этого значения и выше...
+LOTTERY_BIG_MIN_PLAYERS = 4  # ...требует вот столько участников
+
+
+def lottery_min_players(prize: int) -> int:
+  return LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
 
 
 def esc(value) -> str:
   """Экранирует текст для HTML-разметки Telegram."""
   return html.escape(str(value), quote=False)
+
+
+def ru_plural(n: int, one: str, few: str, many: str) -> str:
+  """'1 токен', '2 токена', '5 токенов'."""
+  n_abs = abs(n)
+  if n_abs % 10 == 1 and n_abs % 100 != 11:
+    word = one
+  elif 2 <= n_abs % 10 <= 4 and not 12 <= n_abs % 100 <= 14:
+    word = few
+  else:
+    word = many
+  return f"{n} {word}"
 
 
 def now_local() -> datetime.datetime:
@@ -143,6 +166,27 @@ async def init_db():
     """
     )
 
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ex_offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER, give TEXT, want TEXT, owner_link TEXT,
+            search TEXT, status TEXT DEFAULT 'open',
+            taker_id INTEGER, taker_link TEXT, created INTEGER, taken INTEGER
+        );
+    """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ex_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            offer_id INTEGER, complainer_id INTEGER, accused_id INTEGER,
+            status TEXT DEFAULT 'new', created INTEGER,
+            UNIQUE (offer_id, complainer_id)
+        );
+    """
+    )
+
     # Миграция: добавляем недостающие колонки в таблицы старой базы
     migrations = {
         "users": {
@@ -154,6 +198,8 @@ async def init_db():
             "premium_expires": "TEXT DEFAULT NULL",
             "warns": "INTEGER DEFAULT 0",
             "banned_until": "TEXT DEFAULT NULL",
+            "exchanges": "INTEGER DEFAULT 0",
+            "restricted_until": "TEXT DEFAULT NULL",
         },
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
@@ -443,7 +489,7 @@ def get_main_keyboard(user_id):
           KeyboardButton(text="🪙 Как получить токены?"),
           KeyboardButton(text="👑 Премиум-подписка"),
       ],
-      [KeyboardButton(text="🎰 Лотерея")],
+      [KeyboardButton(text="🔄 Обмены"), KeyboardButton(text="🎰 Лотерея")],
   ]
   if user_id == ADMIN_ID:
     kb.append([KeyboardButton(text="⚙️ Админ-панель")])
@@ -603,13 +649,55 @@ def roll_lottery_params():
   hour = now_local().hour
   if 1 <= hour < 8:
     return 1, 4
-  prize = random.randint(7, 20)
-  # чем больше приз, тем дороже участие: 7 -> 1 токен ... 20 -> 4 токена
-  cost = 1 + (prize - 7) * 3 // 13
+  # Обычно приз 5-8 токенов, а крупный 9-20 выпадает редко
+  if random.random() < LOTTERY_RARE_CHANCE:
+    prize = random.randint(9, 20)
+  else:
+    prize = random.randint(5, 8)
+  # чем больше приз, тем дороже участие: 5 -> 1 токен ... 20 -> 4 токена
+  cost = 1 + (prize - 5) * 3 // 15
   return cost, prize
 
 
-async def create_lottery_round() -> None:
+_bg_tasks = set()
+
+
+async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
+  """Рассылает всем пользователям уведомление о крупной лотерее."""
+  text = (
+      "🔥 <b>Началась крупная лотерея!</b>\n\n"
+      f"🏆 Приз: <b>от {prize} токенов</b> (+ взносы участников)\n"
+      f"🎟 Участие: <b>{cost} токен(ов)</b>\n"
+      f"👥 Минимум участников: <b>{lottery_min_players(prize)}</b>\n"
+      f"⏱ Длится {LOTTERY_HOURS} ч."
+  )
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute("SELECT user_id, banned_until FROM users") as cur:
+      rows = await cur.fetchall()
+  now = datetime.datetime.now()
+  for uid, banned_until in rows:
+    if banned_until:
+      try:
+        if datetime.datetime.strptime(banned_until, DT_FORMAT) > now:
+          continue
+      except Exception:
+        pass
+    try:
+      await bot.send_message(uid, text, reply_markup=lottery_join_keyboard())
+    except Exception:
+      pass
+    await asyncio.sleep(0.05)
+
+
+def lottery_join_keyboard() -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="🎰 Участвовать", callback_data="lottery_open")]
+      ]
+  )
+
+
+async def create_lottery_round(bot: Bot = None) -> None:
   cost, prize = roll_lottery_params()
   ends_at = datetime.datetime.now() + datetime.timedelta(hours=LOTTERY_HOURS)
   async with aiosqlite.connect(DB_NAME) as db:
@@ -619,6 +707,10 @@ async def create_lottery_round() -> None:
         (cost, prize, ends_at.strftime(DT_FORMAT)),
     )
     await db.commit()
+  if bot is not None and prize >= LOTTERY_NOTIFY_PRIZE:
+    task = asyncio.create_task(notify_big_lottery(bot, cost, prize))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 async def get_current_round():
@@ -667,9 +759,11 @@ async def build_lottery_view(user_id: int):
 
   text = (
       "🎰 <b>Лотерея</b>\n\n"
-      f"🏆 Приз: <b>{prize} токенов</b>\n"
+      f"🏆 Приз: <b>{prize + cost * players} токенов</b>"
+      f" ({prize} + {cost * players} от взносов участников)\n"
       f"🎟 Участие: <b>{cost} токен(ов)</b>\n"
-      f"👥 Участников: <b>{players}</b>\n"
+      f"👥 Участников: <b>{players}</b> (минимум для розыгрыша:"
+      f" {lottery_min_players(prize)})\n"
       f"⏱ До конца розыгрыша: <b>{hours} ч {minutes} мин</b>\n\n"
       "Победитель выбирается случайно среди всех участников."
       " Токены за участие списываются сразу."
@@ -703,6 +797,38 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
     ) as cur:
       players = [row[0] for row in await cur.fetchall()]
 
+    async with db.execute(
+        "SELECT entry_cost FROM lottery_rounds WHERE id = ?", (round_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    cost = row[0] if row and row[0] else 0
+
+    min_players = lottery_min_players(prize)
+    if players and len(players) < min_players:
+      # Мало участников: приз не разыгрывается, токены за участие возвращаем
+      for uid in players:
+        await db.execute(
+            "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
+            (cost, uid),
+        )
+      await db.commit()
+      for uid in players:
+        try:
+          await bot.send_message(
+              uid,
+              "😔 В розыгрыше не набралось нужное число участников"
+              f" ({len(players)} из {min_players}). Приз не разыгран, тебе"
+              f" вернули <b>{cost} токен(ов)</b>.\n\nХотите ещё попытать"
+              " удачу?",
+              reply_markup=lottery_again_keyboard(),
+          )
+        except Exception:
+          pass
+        await asyncio.sleep(0.05)
+      return
+
+    # Каждый взнос участника добавляется к призу
+    prize = prize + cost * len(players)
     winner = random.choice(players) if players else None
     if winner is not None:
       await db.execute(
@@ -741,7 +867,7 @@ async def lottery_loop(bot: Bot):
     try:
       rnd = await get_current_round()
       if rnd is None:
-        await create_lottery_round()
+        await create_lottery_round(bot)
         rnd = await get_current_round()
 
       round_id, cost, prize, ends_at_str = rnd
@@ -1163,6 +1289,61 @@ async def cmd_untoken(message: Message, command: CommandObject):
   )
 
 
+@router.message(Command("all"))
+async def cmd_all(message: Message, command: CommandObject, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  parts = (command.args or "").split()
+  if (
+      len(parts) != 2
+      or parts[0].lower() not in ("token", "tokens")
+      or not parts[1].isdigit()
+      or int(parts[1]) <= 0
+  ):
+    await message.answer(
+        "ℹ️ Использование:\n<code>/all token [сколько]</code>\n"
+        "Пример: <code>/all token 5</code> — выдать всем по 5 токенов."
+    )
+    return
+  amount = int(parts[1])
+  now_str = datetime.datetime.now().strftime(DT_FORMAT)
+  async with aiosqlite.connect(DB_NAME) as db:
+    # Забаненным токены не выдаём
+    cur = await db.execute(
+        "UPDATE users SET tokens = COALESCE(tokens, 0) + ?"
+        " WHERE banned_until IS NULL OR banned_until <= ?",
+        (amount, now_str),
+    )
+    await db.commit()
+    count = cur.rowcount
+    async with db.execute(
+        "SELECT user_id FROM users WHERE banned_until IS NULL"
+        " OR banned_until <= ?",
+        (now_str,),
+    ) as cur2:
+      user_ids = [row[0] for row in await cur2.fetchall()]
+
+  await message.answer(
+      f"✅ Выдано по <b>{amount}</b> токенов всем пользователям:"
+      f" <b>{count}</b> чел. Рассылаю уведомления…"
+  )
+
+  async def _notify_all():
+    for uid in user_ids:
+      try:
+        await bot.send_message(
+            uid, f"🎁 Администратор выдал всем по <b>{amount}</b> токенов!"
+        )
+      except Exception:
+        pass
+      await asyncio.sleep(0.05)
+
+  task = asyncio.create_task(_notify_all())
+  _bg_tasks.add(task)
+  task.add_done_callback(_bg_tasks.discard)
+
+
 @router.callback_query(F.data == "check_sub")
 async def check_sub(callback: CallbackQuery, bot: Bot):
   if await is_subscribed(bot, callback.from_user.id):
@@ -1193,6 +1374,7 @@ async def check_sub(callback: CallbackQuery, bot: Bot):
             "🪙 Как получить токены?",
             "👑 Премиум-подписка",
             "🎰 Лотерея",
+            "🔄 Обмены",
             "⚙️ Админ-панель",
         }
     )
@@ -1205,8 +1387,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   if text == "👤 Мой Профиль":
     async with aiosqlite.connect(DB_NAME) as db:
       async with db.execute(
-          "SELECT tokens, is_premium, bought_folders, premium_expires, warns"
-          " FROM users WHERE user_id = ?",
+          "SELECT tokens, is_premium, bought_folders, premium_expires, warns,"
+          " COALESCE(exchanges, 0) FROM users WHERE user_id = ?",
           (user_id,),
       ) as cursor:
         user_data = await cursor.fetchone()
@@ -1218,9 +1400,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
             (user_id,),
         )
         await db.commit()
-        tokens, is_prem, bought, prem_expires, warns = 0, 0, 0, None, 0
+        tokens, is_prem, bought, prem_expires, warns, exchanges = 0, 0, 0, None, 0, 0
       else:
-        tokens, is_prem, bought, prem_expires, warns = user_data
+        tokens, is_prem, bought, prem_expires, warns, exchanges = user_data
 
     prem_status = "❌ Не активна"
     if is_prem == 1 and prem_expires:
@@ -1256,7 +1438,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"💲 Баланс: {tokens if tokens is not None else 0} токенов\n"
         f"👑 Премиум-подписка: {prem_status}\n"
         f"📦 Собрано фулов: {bought} шт.\n"
-        f"⚠️ Предупреждения: {warns or 0}/{MAX_WARNS}"
+        f"⚠️ Предупреждения: {warns or 0}/{MAX_WARNS}\n"
+        f"🔄 Обменов проведено: {exchanges}"
     )
     await message.answer(profile_text, reply_markup=keyboard)
 
@@ -1400,6 +1583,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text == "🎰 Лотерея":
     lottery_text, lottery_kb = await build_lottery_view(user_id)
     await message.answer(lottery_text, reply_markup=lottery_kb)
+
+  elif text == "🔄 Обмены":
+    await message.answer(await ex_menu_text(), reply_markup=exchange_menu_kb())
 
   elif text == "⚙️ Админ-панель":
     if user_id != ADMIN_ID:
@@ -1635,7 +1821,7 @@ async def process_promo_value(message: Message, state: FSMContext):
 
 
 @router.message(StateFilter(CreatePromoState.uses))
-async def process_promo_uses(message: Message, state: FSMContext):
+async def process_promo_uses(message: Message, state: FSMContext, bot: Bot):
   text = (message.text or "").strip()
   if not text.isdigit():
     await message.answer("❌ Ошибка! Введите число использований цифрами.")
@@ -1678,6 +1864,30 @@ async def process_promo_uses(message: Message, state: FSMContext):
       f"✅ <b>Промокод успешно создан!</b>\n\n🎟 Промокод: <code>{esc(code)}</code>\n"
       f"🎁 Награда: {reward_desc}\n👥 Использований: {uses_text}",
       reply_markup=get_main_keyboard(message.from_user.id),
+  )
+
+  # Готовый пост для канала
+  try:
+    username = (await bot.get_me()).username
+  except Exception:
+    username = "ygolokbomja_bot"
+  if reward_type == "tokens":
+    reward_line = ru_plural(int(reward_value), "токен", "токена", "токенов")
+  else:
+    reward_line = "Премиум на " + ru_plural(
+        int(reward_value), "день", "дня", "дней"
+    )
+  if max_uses > 0:
+    uses_line = ru_plural(
+        max_uses, "Использование", "Использования", "Использований"
+    )
+  else:
+    uses_line = "Безлимит использований"
+  await message.answer(
+      "📋 <b>Готовый пост для канала:</b>\n\n"
+      f"<code>/promocode {esc(code)}</code>\n"
+      f"{reward_line}\n{uses_line}\n"
+      f"<i>Вписывать промокод в бота @{esc(username)}</i>"
   )
 
 
@@ -1835,6 +2045,9 @@ async def backup_database_manual(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
+  if await get_restriction(user_id):
+    await callback.answer(RESTRICTED_TEXT, show_alert=True)
+    return
   p_id = int(callback.data.split("_")[1])
 
   async with aiosqlite.connect(DB_NAME) as db:
@@ -2112,6 +2325,629 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   )
   await state.set_state(BroadcastState.message)
   await callback.answer()
+
+
+# --- ОБМЕНЫ ССЫЛКАМИ ---
+
+EXCHANGE_COST = 1  # сколько токенов платит тот, кто берёт обмен
+RESTRICT_HOURS = 72  # на сколько часов ограничивается обвиняемый
+MAX_OPEN_OFFERS = 5  # сколько открытых обменов может держать один человек
+EX_PAGE_SIZE = 5
+EX_SEARCH = {}  # user_id -> строка поиска
+# Ссылка обязана быть на mega.nz
+LINK_RE = re.compile(r"^https://mega\.nz/file/\S+$", re.I)
+LINK_RULE = (
+    "⚠️ <b>Ссылка обязана быть в mega.nz</b> и начинаться с"
+    " <code>https://mega.nz/file/</code>"
+)
+LINK_ERROR = (
+    "❌ Ссылка не подходит. Она обязана начинаться с https://mega.nz/file/"
+    " Отправь ещё раз."
+)
+
+
+class NewOfferState(StatesGroup):
+  give = State()
+  want = State()
+  link = State()
+
+
+class ExSearchState(StatesGroup):
+  query = State()
+
+
+class ExTakeState(StatesGroup):
+  link = State()
+
+
+class ExAdminMsgState(StatesGroup):
+  text = State()
+
+
+async def ex_exec(sql, args=()):
+  async with aiosqlite.connect(DB_NAME) as db:
+    cur = await db.execute(sql, args)
+    await db.commit()
+    return cur.rowcount, cur.lastrowid
+
+
+async def ex_one(sql, args=()):
+  async with aiosqlite.connect(DB_NAME) as db:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(sql, args) as cur:
+      return await cur.fetchone()
+
+
+async def ex_all(sql, args=()):
+  async with aiosqlite.connect(DB_NAME) as db:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(sql, args) as cur:
+      return await cur.fetchall()
+
+
+async def get_restriction(user_id: int):
+  """datetime окончания ограничения обменов/покупок или None."""
+  row = await ex_one(
+      "SELECT restricted_until FROM users WHERE user_id = ?", (user_id,)
+  )
+  if not row or not row["restricted_until"]:
+    return None
+  try:
+    until = datetime.datetime.strptime(row["restricted_until"], DT_FORMAT)
+  except Exception:
+    return None
+  if until <= datetime.datetime.now():
+    await ex_exec(
+        "UPDATE users SET restricted_until = NULL WHERE user_id = ?",
+        (user_id,),
+    )
+    return None
+  return until
+
+
+RESTRICTED_TEXT = (
+    "🔒 На вас подана жалоба. Обмены и покупки в магазине временно"
+    " ограничены до решения администратора."
+)
+
+
+def ex_kb(rows) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
+          for row in rows
+      ]
+  )
+
+
+async def ex_show(event, text, kb=None):
+  """Callback -> редактирует сообщение, Message -> отправляет новое."""
+  if isinstance(event, CallbackQuery):
+    try:
+      await event.message.edit_text(
+          text, reply_markup=kb, disable_web_page_preview=True
+      )
+      return
+    except TelegramBadRequest as e:
+      if "not modified" in str(e).lower():
+        return
+    await event.message.answer(
+        text, reply_markup=kb, disable_web_page_preview=True
+    )
+  else:
+    await event.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+def exchange_menu_kb() -> InlineKeyboardMarkup:
+  return ex_kb([
+      [("➕ Выставить обмен", "ex:new"), ("📋 Все обмены", "ex:all")],
+      [("🔍 Поиск", "ex:search"), ("📦 Мои обмены", "ex:my")],
+  ])
+
+
+async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool):
+  if banned:
+    text = (
+        f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений. Ваш профиль"
+        " заблокирован навсегда, премиум-подписка снята, токены обнулены."
+    )
+  else:
+    text = (
+        f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}). При"
+        f" {MAX_WARNS} предупреждениях профиль будет заблокирован,"
+        " премиум снят, токены обнулены."
+    )
+  try:
+    await bot.send_message(target_id, text)
+  except Exception:
+    pass
+
+
+async def ex_menu_text() -> str:
+  return (
+      "🔄 <b>Обмены ссылками</b>\nВыставляй свой обмен или бери чужой."
+      f" Чтобы провести обмен, нужно заплатить {EXCHANGE_COST} токен."
+  )
+
+
+@router.callback_query(F.data == "ex:menu")
+async def ex_menu_cb(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  await ex_show(callback, await ex_menu_text(), exchange_menu_kb())
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:cancel")
+async def ex_cancel(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  await ex_show(callback, "Отменено.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:noop")
+async def ex_noop(callback: CallbackQuery):
+  await callback.answer()
+
+
+# --- создание обмена ---
+
+
+@router.callback_query(F.data == "ex:new")
+async def ex_new(callback: CallbackQuery, state: FSMContext):
+  uid = callback.from_user.id
+  if await get_restriction(uid):
+    await callback.answer(RESTRICTED_TEXT, show_alert=True)
+    return
+  cnt = await ex_one(
+      "SELECT COUNT(*) n FROM ex_offers WHERE owner_id = ? AND status = 'open'",
+      (uid,),
+  )
+  if cnt["n"] >= MAX_OPEN_OFFERS:
+    await callback.answer(
+        f"У тебя уже {MAX_OPEN_OFFERS} открытых обменов. Удали лишний.",
+        show_alert=True,
+    )
+    return
+  await state.set_state(NewOfferState.give)
+  await ex_show(
+      callback,
+      "Что ты <b>отдаёшь</b>? (например: Пантера)",
+      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(NewOfferState.give))
+async def ex_new_give(message: Message, state: FSMContext):
+  text = (message.text or "").strip()[:60]
+  if not text:
+    await message.answer("Напиши текстом, что ты отдаёшь.")
+    return
+  await state.update_data(give=text)
+  await state.set_state(NewOfferState.want)
+  await message.answer(
+      "Что хочешь <b>получить</b>? (например: Сердцеед)",
+      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+
+
+@router.message(StateFilter(NewOfferState.want))
+async def ex_new_want(message: Message, state: FSMContext):
+  text = (message.text or "").strip()[:60]
+  if not text:
+    await message.answer("Напиши текстом, что хочешь получить.")
+    return
+  await state.update_data(want=text)
+  await state.set_state(NewOfferState.link)
+  await message.answer(
+      f"Отправь <b>свою ссылку</b> для обмена.\n{LINK_RULE}",
+      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+
+
+@router.message(StateFilter(NewOfferState.link))
+async def ex_new_link(message: Message, state: FSMContext):
+  link = (message.text or "").strip()
+  if not LINK_RE.match(link):
+    await message.answer(LINK_ERROR)
+    return
+  data = await state.get_data()
+  await state.clear()
+  _, offer_id = await ex_exec(
+      "INSERT INTO ex_offers (owner_id, give, want, owner_link, search,"
+      " created) VALUES (?, ?, ?, ?, ?, ?)",
+      (
+          message.from_user.id,
+          data["give"],
+          data["want"],
+          link,
+          (data["give"] + " " + data["want"]).lower(),
+          int(datetime.datetime.now().timestamp()),
+      ),
+  )
+  await message.answer(
+      f"✅ Обмен #{offer_id} выставлен: <b>{esc(data['give'])}</b> →"
+      f" <b>{esc(data['want'])}</b>.\nТебе придёт уведомление, когда кто-то"
+      " возьмётся за него.",
+      reply_markup=ex_kb([[("🔄 Обмены", "ex:menu")]]),
+  )
+
+
+# --- список и поиск ---
+
+
+async def ex_render_list(event, user_id: int, page: int):
+  q = EX_SEARCH.get(user_id)
+  where, args = "status = 'open'", []
+  if q:
+    if q.isdigit():
+      where += " AND (owner_id = ? OR id = ?)"
+      args += [int(q), int(q)]
+    else:
+      for w in q.lower().split()[:3]:
+        where += " AND search LIKE ?"
+        args.append(f"%{w}%")
+  total = (await ex_one(f"SELECT COUNT(*) n FROM ex_offers WHERE {where}", args))["n"]
+  pages = max(1, -(-total // EX_PAGE_SIZE))
+  page = max(0, min(page, pages - 1))
+  rows = await ex_all(
+      f"SELECT * FROM ex_offers WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+      args + [EX_PAGE_SIZE, page * EX_PAGE_SIZE],
+  )
+  head = "📋 <b>Открытые обмены</b>"
+  if q:
+    head += f"\n🔍 Поиск: <i>{esc(q)}</i>"
+  head += f"\nНайдено: {total} · стр. {page + 1}/{pages}"
+  if not rows:
+    head += "\n\nПока пусто."
+  buttons = [
+      [(f"#{r['id']} {r['give']} → {r['want']}"[:60], f"ex:view:{r['id']}")]
+      for r in rows
+  ]
+  nav = []
+  if page > 0:
+    nav.append(("⬅️", f"ex:list:{page - 1}"))
+  nav.append((f"{page + 1}/{pages}", "ex:noop"))
+  if page < pages - 1:
+    nav.append(("➡️", f"ex:list:{page + 1}"))
+  buttons.append(nav)
+  buttons.append([("🔍 Поиск", "ex:search"), ("🧹 Сбросить", "ex:all")])
+  buttons.append([("⬅️ В обмены", "ex:menu")])
+  await ex_show(event, head, ex_kb(buttons))
+
+
+@router.callback_query(F.data == "ex:all")
+async def ex_all_cb(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  EX_SEARCH.pop(callback.from_user.id, None)
+  await ex_render_list(callback, callback.from_user.id, 0)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ex:list:"))
+async def ex_list_cb(callback: CallbackQuery):
+  await ex_render_list(
+      callback, callback.from_user.id, int(callback.data.split(":")[2])
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:search")
+async def ex_search(callback: CallbackQuery, state: FSMContext):
+  await state.set_state(ExSearchState.query)
+  await ex_show(
+      callback,
+      "Напиши слово (или два): <b>Пантера</b>, <b>Сердцеед</b>\n"
+      "Или ID человека / номер обмена — только цифры.",
+      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(ExSearchState.query))
+async def ex_search_do(message: Message, state: FSMContext):
+  await state.clear()
+  EX_SEARCH[message.from_user.id] = (message.text or "").strip()[:60]
+  await ex_render_list(message, message.from_user.id, 0)
+
+
+# --- просмотр, удаление, мои обмены ---
+
+
+@router.callback_query(F.data.startswith("ex:view:"))
+async def ex_view(callback: CallbackQuery):
+  offer_id = int(callback.data.split(":")[2])
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if not o or o["status"] != "open":
+    await callback.answer("Этот обмен уже недоступен.", show_alert=True)
+    return
+  text = (
+      f"🔄 <b>Обмен #{o['id']}</b>\nОтдаёт: <b>{esc(o['give'])}</b>\nХочет:"
+      f" <b>{esc(o['want'])}</b>\nОбменщик ID: <code>{o['owner_id']}</code>\n"
+      f"Стоимость обмена: {EXCHANGE_COST} токен"
+  )
+  if o["owner_id"] == callback.from_user.id:
+    kb = ex_kb([[("🗑 Удалить", f"ex:del:{offer_id}")], [("⬅️ Назад", "ex:list:0")]])
+  else:
+    kb = ex_kb([
+        [("🤝 Провести обмен", f"ex:take:{offer_id}")],
+        [("⬅️ Назад", "ex:list:0")],
+    ])
+  await ex_show(callback, text, kb)
+  await callback.answer()
+
+
+async def ex_render_my(callback: CallbackQuery):
+  rows = await ex_all(
+      "SELECT * FROM ex_offers WHERE owner_id = ? AND status IN"
+      " ('open', 'taken') ORDER BY id DESC LIMIT 15",
+      (callback.from_user.id,),
+  )
+  icon = {"open": "🟢", "taken": "✅"}
+  buttons = [
+      [(f"🟢 #{r['id']} {r['give']} → {r['want']}"[:60], f"ex:view:{r['id']}")]
+      for r in rows
+      if r["status"] == "open"
+  ]
+  body = "\n".join(
+      f"{icon[r['status']]} #{r['id']} {esc(r['give'])} → {esc(r['want'])}"
+      for r in rows
+  )
+  buttons.append([("⬅️ В обмены", "ex:menu")])
+  await ex_show(
+      callback, "📦 <b>Мои обмены</b>\n" + (body or "Пока пусто."), ex_kb(buttons)
+  )
+
+
+@router.callback_query(F.data == "ex:my")
+async def ex_my(callback: CallbackQuery):
+  await ex_render_my(callback)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ex:del:"))
+async def ex_del(callback: CallbackQuery):
+  offer_id = int(callback.data.split(":")[2])
+  rc, _ = await ex_exec(
+      "UPDATE ex_offers SET status = 'deleted' WHERE id = ? AND owner_id = ?"
+      " AND status = 'open'",
+      (offer_id, callback.from_user.id),
+  )
+  await callback.answer("Удалено." if rc else "Не получилось.", show_alert=not rc)
+  await ex_render_my(callback)
+
+
+# --- взять обмен ---
+
+
+@router.callback_query(F.data.startswith("ex:take:"))
+async def ex_take(callback: CallbackQuery, state: FSMContext):
+  offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if not o or o["status"] != "open":
+    await callback.answer("Этот обмен уже забрали или удалили.", show_alert=True)
+    return
+  if o["owner_id"] == uid:
+    await callback.answer("Это твой обмен.", show_alert=True)
+    return
+  if await get_restriction(uid):
+    await callback.answer(RESTRICTED_TEXT, show_alert=True)
+    return
+  bal = await ex_one("SELECT COALESCE(tokens, 0) t FROM users WHERE user_id = ?", (uid,))
+  if not bal or bal["t"] < EXCHANGE_COST:
+    await callback.answer(
+        f"Нужно {EXCHANGE_COST} токен для обмена.", show_alert=True
+    )
+    return
+  await state.set_state(ExTakeState.link)
+  await state.update_data(offer_id=offer_id)
+  await ex_show(
+      callback,
+      f"Обмен #{offer_id}: <b>{esc(o['give'])}</b> → <b>{esc(o['want'])}</b>\n\n"
+      "Отправь <b>свою ссылку</b>. После этого спишется"
+      f" {EXCHANGE_COST} токен и ты получишь ссылку обменщика.\n{LINK_RULE}",
+      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(ExTakeState.link))
+async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
+  link = (message.text or "").strip()
+  if not LINK_RE.match(link):
+    await message.answer(LINK_ERROR)
+    return
+  uid = message.from_user.id
+  offer_id = (await state.get_data())["offer_id"]
+  await state.clear()
+  if await get_restriction(uid):
+    await message.answer(RESTRICTED_TEXT)
+    return
+
+  now_ts = int(datetime.datetime.now().timestamp())
+  rc, _ = await ex_exec(
+      "UPDATE ex_offers SET status = 'taken', taker_id = ?, taker_link = ?,"
+      " taken = ? WHERE id = ? AND status = 'open' AND owner_id != ?",
+      (uid, link, now_ts, offer_id, uid),
+  )
+  if not rc:
+    await message.answer("Не успел — этот обмен уже забрали.")
+    return
+  rc, _ = await ex_exec(
+      "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+      " COALESCE(tokens, 0) >= ?",
+      (EXCHANGE_COST, uid, EXCHANGE_COST),
+  )
+  if not rc:
+    await ex_exec(
+        "UPDATE ex_offers SET status = 'open', taker_id = NULL,"
+        " taker_link = NULL, taken = NULL WHERE id = ?",
+        (offer_id,),
+    )
+    await message.answer(f"Не хватает токенов (нужно {EXCHANGE_COST}).")
+    return
+
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  await ex_exec(
+      "UPDATE users SET exchanges = COALESCE(exchanges, 0) + 1"
+      " WHERE user_id IN (?, ?)",
+      (o["owner_id"], uid),
+  )
+  await message.answer(
+      f"🤝 <b>Обмен #{offer_id}</b>: {esc(o['give'])} → {esc(o['want'])}\n"
+      f"Ссылка обменщика (ID <code>{o['owner_id']}</code>):\n"
+      f"{esc(o['owner_link'])}\n\nСписано {EXCHANGE_COST} токен.",
+      disable_web_page_preview=True,
+  )
+  try:
+    await bot.send_message(
+        o["owner_id"],
+        f"🔔 ID <code>{uid}</code> взялся за твой обмен #{offer_id}:"
+        f" {esc(o['give'])} → {esc(o['want'])}\nЕго ссылка:\n{esc(link)}",
+        reply_markup=ex_kb([[("🚨 Пожаловаться", f"ex:rep:{offer_id}")]]),
+        disable_web_page_preview=True,
+    )
+  except Exception:
+    pass
+
+
+# --- жалоба ---
+
+
+@router.callback_query(F.data.startswith("ex:rep:"))
+async def ex_report(callback: CallbackQuery, bot: Bot):
+  offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if not o or o["status"] != "taken" or o["owner_id"] != uid:
+    await callback.answer("Жалоба недоступна.", show_alert=True)
+    return
+  accused = o["taker_id"]
+  try:
+    _, report_id = await ex_exec(
+        "INSERT INTO ex_reports (offer_id, complainer_id, accused_id, created)"
+        " VALUES (?, ?, ?, ?)",
+        (offer_id, uid, accused, int(datetime.datetime.now().timestamp())),
+    )
+  except aiosqlite.IntegrityError:
+    await callback.answer("Ты уже отправил жалобу по этому обмену.", show_alert=True)
+    return
+
+  until = datetime.datetime.now() + datetime.timedelta(hours=RESTRICT_HOURS)
+  await ex_exec(
+      "UPDATE users SET restricted_until = ? WHERE user_id = ?",
+      (until.strftime(DT_FORMAT), accused),
+  )
+  await callback.answer("🚨 Жалоба отправлена админу.", show_alert=True)
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+  try:
+    await bot.send_message(
+        accused,
+        f"🚨 На вас подана жалоба по обмену #{offer_id}. Обмены и покупки в"
+        " магазине временно ограничены до решения администратора.",
+    )
+  except Exception:
+    pass
+  try:
+    await bot.send_message(
+        ADMIN_ID,
+        f"🚨 <b>Жалоба #{report_id}</b>\nID <code>{uid}</code> (обменщик)"
+        f" пожаловался на ID <code>{accused}</code> (взялся за обмен)\n"
+        f"Обмен #{offer_id}: {esc(o['give'])} → {esc(o['want'])}\n"
+        f"Ссылка обменщика: {esc(o['owner_link'])}\n"
+        f"Ссылка взявшегося: {esc(o['taker_link'])}\n"
+        f"Ограничения на ID {accused}: {RESTRICT_HOURS} ч или до твоего"
+        " решения.",
+        reply_markup=ex_kb([
+            [("✅ Убрать ограничения", f"ex:ok:{report_id}")],
+            [("✉️ Написать обменщику", f"ex:msg:{report_id}")],
+        ]),
+        disable_web_page_preview=True,
+    )
+  except Exception:
+    logging.exception("Не удалось отправить жалобу админу")
+
+
+@router.callback_query(F.data.startswith("ex:ok:"))
+async def ex_admin_ok(callback: CallbackQuery, bot: Bot):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  report_id = int(callback.data.split(":")[2])
+  r = await ex_one("SELECT * FROM ex_reports WHERE id = ?", (report_id,))
+  if not r or r["status"] != "new":
+    await callback.answer("Уже обработано.", show_alert=True)
+    return
+  await ex_exec("UPDATE ex_reports SET status = 'released' WHERE id = ?", (report_id,))
+  await ex_exec(
+      "UPDATE users SET restricted_until = NULL WHERE user_id = ?",
+      (r["accused_id"],),
+  )
+  try:
+    await bot.send_message(
+        r["accused_id"], "✅ Ограничения сняты администратором."
+    )
+  except Exception:
+    pass
+  warns, banned = await add_warn(r["complainer_id"])
+  await send_warn_notice(bot, r["complainer_id"], warns, banned)
+  await callback.answer("Готово.")
+  try:
+    await callback.message.edit_reply_markup(
+        reply_markup=ex_kb([[("✉️ Написать обменщику", f"ex:msg:{report_id}")]])
+    )
+  except Exception:
+    pass
+  await callback.message.answer(
+      f"✅ Жалоба #{report_id}: ограничения с ID <code>{r['accused_id']}</code>"
+      f" сняты, обменщику ID <code>{r['complainer_id']}</code> выдано"
+      f" предупреждение ({warns}/{MAX_WARNS})."
+  )
+
+
+@router.callback_query(F.data.startswith("ex:msg:"))
+async def ex_admin_msg(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  report_id = int(callback.data.split(":")[2])
+  await state.set_state(ExAdminMsgState.text)
+  await state.update_data(report_id=report_id)
+  await callback.message.answer(
+      f"Напиши сообщение для обменщика по жалобе #{report_id}"
+      " (/cancel — отмена):"
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(ExAdminMsgState.text), Command("cancel"))
+async def ex_admin_msg_cancel(message: Message, state: FSMContext):
+  await state.clear()
+  await message.answer("Отменено.")
+
+
+@router.message(StateFilter(ExAdminMsgState.text))
+async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    return
+  report_id = (await state.get_data())["report_id"]
+  await state.clear()
+  r = await ex_one("SELECT * FROM ex_reports WHERE id = ?", (report_id,))
+  if not r:
+    await message.answer("Жалоба не найдена.")
+    return
+  try:
+    await bot.send_message(
+        r["complainer_id"],
+        f"✉️ <b>Сообщение от администрации:</b>\n{esc(message.text or '')}",
+    )
+    await message.answer("Отправлено.")
+  except Exception:
+    await message.answer("Не доставлено (человек заблокировал бота).")
 
 
 # --- ГЛОБАЛЬНЫЙ ЛОВЕЦ ОШИБОК ---
