@@ -64,15 +64,37 @@ PERM_BAN = "2999-12-31 00:00:00"
 
 # Лотерея
 LOTTERY_HOURS = 3
-LOTTERY_RARE_CHANCE = 0.10  # шанс редкого крупного приза (9-20 токенов)
-LOTTERY_NOTIFY_PRIZE = 14  # от этого приза и выше всем приходит уведомление о старте
+LOTTERY_NORMAL_CHANCE = 0.80  # обычный приз 4-10 токенов
+LOTTERY_BIG_LOW_CHANCE = 0.15  # крупный приз 11-14 токенов
+# остаток (5%) — самый крупный приз 15-20 токенов
+LOTTERY_NOTIFY_PRIZE = 11  # от этого приза и выше всем приходит уведомление о старте
 LOTTERY_MIN_PLAYERS = 2  # минимум участников, чтобы разыграть приз
 LOTTERY_BIG_PRIZE = 15  # приз от этого значения и выше...
 LOTTERY_BIG_MIN_PLAYERS = 4  # ...требует вот столько участников
 
 
+def lottery_cost_for_total(total: int) -> int:
+  """Цена участия: каждые 5 токенов приза = +1 токен (приз 5 -> 1, 10 -> 2,
+  15 -> 3, 20 -> 4, 25 -> 5 и так далее без потолка). Меньше 5 тоже 1."""
+  return max(1, total // 5)
+
+
+def fee_to_prize(paid: int) -> int:
+  """В приз уходит 50% потраченных на участие токенов (округление вверх)."""
+  return (paid + 1) // 2
+
+
+def cost_text(cost: int) -> str:
+  return "бесплатно" if cost == 0 else f"{cost} токен(ов)"
+
+
 def lottery_min_players(prize: int) -> int:
   return LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
+
+
+def hidden_link(link) -> str:
+  """Ссылка под спойлером: скрыта, пока человек не нажмёт на неё."""
+  return f"<tg-spoiler>{esc(link)}</tg-spoiler>"
 
 
 def esc(value) -> str:
@@ -168,6 +190,16 @@ async def init_db():
 
     await db.execute(
         """
+        CREATE TABLE IF NOT EXISTS roulette_state (
+            user_id INTEGER PRIMARY KEY,
+            win_streak INTEGER DEFAULT 0,
+            loss_streak INTEGER DEFAULT 0,
+            guaranteed INTEGER DEFAULT 0
+        );
+    """
+    )
+    await db.execute(
+        """
         CREATE TABLE IF NOT EXISTS ex_offers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER, give TEXT, want TEXT, owner_link TEXT,
@@ -203,6 +235,12 @@ async def init_db():
         },
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
+        },
+        "lottery_participants": {
+            "paid": "INTEGER DEFAULT NULL",
+        },
+        "lottery_rounds": {
+            "cost_fixed": "INTEGER DEFAULT 0",
         },
         "promocodes": {
             "max_uses": "INTEGER DEFAULT 0",
@@ -490,6 +528,7 @@ def get_main_keyboard(user_id):
           KeyboardButton(text="👑 Премиум-подписка"),
       ],
       [KeyboardButton(text="🔄 Обмены"), KeyboardButton(text="🎰 Лотерея")],
+      [KeyboardButton(text="🎲 Рулетка")],
   ]
   if user_id == ADMIN_ID:
     kb.append([KeyboardButton(text="⚙️ Админ-панель")])
@@ -645,18 +684,16 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
 
 
 def roll_lottery_params():
-  """Возвращает (цена участия, приз). Ночью 1:00-8:00 (Киев): 1 -> 4."""
+  """Возвращает (приз, цена_фиксирована). Ночью 1:00-8:00 (Киев): приз 4, участие 1."""
   hour = now_local().hour
   if 1 <= hour < 8:
-    return 1, 4
-  # Обычно приз 5-8 токенов, а крупный 9-20 выпадает редко
-  if random.random() < LOTTERY_RARE_CHANCE:
-    prize = random.randint(9, 20)
-  else:
-    prize = random.randint(5, 8)
-  # чем больше приз, тем дороже участие: 5 -> 1 токен ... 20 -> 4 токена
-  cost = 1 + (prize - 5) * 3 // 15
-  return cost, prize
+    return 4, 1
+  r = random.random()
+  if r < LOTTERY_NORMAL_CHANCE:
+    return random.randint(4, 10), 0
+  if r < LOTTERY_NORMAL_CHANCE + LOTTERY_BIG_LOW_CHANCE:
+    return random.randint(11, 14), 0
+  return random.randint(15, 20), 0
 
 
 _bg_tasks = set()
@@ -667,7 +704,7 @@ async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
   text = (
       "🔥 <b>Началась крупная лотерея!</b>\n\n"
       f"🏆 Приз: <b>от {prize} токенов</b> (+ взносы участников)\n"
-      f"🎟 Участие: <b>{cost} токен(ов)</b>\n"
+      f"🎟 Участие: <b>{cost_text(cost)}</b>\n"
       f"👥 Минимум участников: <b>{lottery_min_players(prize)}</b>\n"
       f"⏱ Длится {LOTTERY_HOURS} ч."
   )
@@ -698,13 +735,14 @@ def lottery_join_keyboard() -> InlineKeyboardMarkup:
 
 
 async def create_lottery_round(bot: Bot = None) -> None:
-  cost, prize = roll_lottery_params()
+  prize, fixed = roll_lottery_params()
+  cost = 1 if fixed else lottery_cost_for_total(prize)
   ends_at = datetime.datetime.now() + datetime.timedelta(hours=LOTTERY_HOURS)
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
-        "INSERT INTO lottery_rounds (entry_cost, prize, ends_at, finished)"
-        " VALUES (?, ?, ?, 0)",
-        (cost, prize, ends_at.strftime(DT_FORMAT)),
+        "INSERT INTO lottery_rounds (entry_cost, prize, ends_at, finished,"
+        " cost_fixed) VALUES (?, ?, ?, 0, ?)",
+        (cost, prize, ends_at.strftime(DT_FORMAT), fixed),
     )
     await db.commit()
   if bot is not None and prize >= LOTTERY_NOTIFY_PRIZE:
@@ -714,12 +752,27 @@ async def create_lottery_round(bot: Bot = None) -> None:
 
 
 async def get_current_round():
+  """(id, entry_cost, prize, ends_at, cost_fixed) или None."""
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT id, entry_cost, prize, ends_at FROM lottery_rounds"
-        " WHERE finished = 0 ORDER BY id DESC LIMIT 1"
+        "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0)"
+        " FROM lottery_rounds WHERE finished = 0 ORDER BY id DESC LIMIT 1"
     ) as cur:
       return await cur.fetchone()
+
+
+async def lottery_stats(db, rnd) -> dict:
+  """Участники, фонд от взносов, итоговый приз и актуальная цена участия."""
+  round_id, entry_cost, prize, _, fixed = rnd
+  async with db.execute(
+      "SELECT COUNT(*), COALESCE(SUM((COALESCE(paid, ?) + 1) / 2), 0)"
+      " FROM lottery_participants WHERE round_id = ?",
+      (entry_cost, round_id),
+  ) as cur:
+    players, pool = await cur.fetchone()
+  total = prize + pool
+  cost = entry_cost if fixed else lottery_cost_for_total(total)
+  return {"players": players, "pool": pool, "total": total, "cost": cost}
 
 
 def lottery_again_keyboard() -> InlineKeyboardMarkup:
@@ -740,33 +793,36 @@ async def build_lottery_view(user_id: int):
   if not rnd:
     return "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", None
 
-  round_id, cost, prize, ends_at_str = rnd
+  round_id, _, prize, ends_at_str, fixed = rnd
   ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
   left_min = max(0, int((ends_at - datetime.datetime.now()).total_seconds() // 60))
   hours, minutes = divmod(left_min, 60)
 
   async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT COUNT(*) FROM lottery_participants WHERE round_id = ?",
-        (round_id,),
-    ) as cur:
-      players = (await cur.fetchone())[0]
+    st = await lottery_stats(db, rnd)
     async with db.execute(
         "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
         (round_id, user_id),
     ) as cur:
       joined = await cur.fetchone() is not None
+  cost = st["cost"]
 
   text = (
       "🎰 <b>Лотерея</b>\n\n"
-      f"🏆 Приз: <b>{prize + cost * players} токенов</b>"
-      f" ({prize} + {cost * players} от взносов участников)\n"
-      f"🎟 Участие: <b>{cost} токен(ов)</b>\n"
-      f"👥 Участников: <b>{players}</b> (минимум для розыгрыша:"
+      f"🏆 Приз: <b>{st['total']} токенов</b>"
+      f" ({prize} + {st['pool']} от взносов участников)\n"
+      f"🎟 Участие: <b>{cost_text(cost)}</b>"
+      + ("" if fixed else " (растёт вместе с призом)")
+      + "\n"
+      f"👥 Участников: <b>{st['players']}</b> (минимум для розыгрыша:"
       f" {lottery_min_players(prize)})\n"
       f"⏱ До конца розыгрыша: <b>{hours} ч {minutes} мин</b>\n\n"
-      "Победитель выбирается случайно среди всех участников."
-      " Токены за участие списываются сразу."
+      "Победитель выбирается случайно среди всех участников. "
+      + (
+          "Половина токенов за участие добавляется к призу."
+          if cost
+          else "Участие бесплатное."
+      )
   )
   if joined:
     return text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!", None
@@ -775,8 +831,12 @@ async def build_lottery_view(user_id: int):
       inline_keyboard=[
           [
               InlineKeyboardButton(
-                  text=f"🎟 Участвовать ({cost} токен.)",
-                  callback_data=f"lottery_join_{round_id}",
+                  text=(
+                      "🎟 Участвовать (бесплатно)"
+                      if cost == 0
+                      else f"🎟 Участвовать ({cost} токен.)"
+                  ),
+                  callback_data=f"lottery_join_{round_id}_{cost}",
               )
           ]
       ]
@@ -792,16 +852,19 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
     )
     await db.commit()
     async with db.execute(
-        "SELECT user_id FROM lottery_participants WHERE round_id = ?",
-        (round_id,),
-    ) as cur:
-      players = [row[0] for row in await cur.fetchall()]
-
-    async with db.execute(
         "SELECT entry_cost FROM lottery_rounds WHERE id = ?", (round_id,)
     ) as cur:
       row = await cur.fetchone()
     cost = row[0] if row and row[0] else 0
+
+    async with db.execute(
+        "SELECT user_id, paid FROM lottery_participants WHERE round_id = ?",
+        (round_id,),
+    ) as cur:
+      part_rows = await cur.fetchall()
+    players = [r[0] for r in part_rows]
+    # сколько каждый реально заплатил (цену могли поменять в середине тиража)
+    paid_map = {r[0]: (r[1] if r[1] is not None else cost) for r in part_rows}
 
     min_players = lottery_min_players(prize)
     if players and len(players) < min_players:
@@ -809,7 +872,7 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
       for uid in players:
         await db.execute(
             "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
-            (cost, uid),
+            (paid_map[uid], uid),
         )
       await db.commit()
       for uid in players:
@@ -817,9 +880,13 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
           await bot.send_message(
               uid,
               "😔 В розыгрыше не набралось нужное число участников"
-              f" ({len(players)} из {min_players}). Приз не разыгран, тебе"
-              f" вернули <b>{cost} токен(ов)</b>.\n\nХотите ещё попытать"
-              " удачу?",
+              f" ({len(players)} из {min_players}). Приз не разыгран."
+              + (
+                  f" Тебе вернули <b>{paid_map[uid]} токен(ов)</b>."
+                  if paid_map[uid]
+                  else ""
+              )
+              + "\n\nХотите ещё попытать удачу?",
               reply_markup=lottery_again_keyboard(),
           )
         except Exception:
@@ -827,8 +894,8 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
         await asyncio.sleep(0.05)
       return
 
-    # Каждый взнос участника добавляется к призу
-    prize = prize + cost * len(players)
+    # Половина каждого взноса участника добавляется к призу
+    prize = prize + sum(fee_to_prize(v) for v in paid_map.values())
     winner = random.choice(players) if players else None
     if winner is not None:
       await db.execute(
@@ -870,11 +937,13 @@ async def lottery_loop(bot: Bot):
         await create_lottery_round(bot)
         rnd = await get_current_round()
 
-      round_id, cost, prize, ends_at_str = rnd
+      round_id, cost, prize, ends_at_str, _fixed = rnd
       ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
       delay = (ends_at - datetime.datetime.now()).total_seconds()
       if delay > 0:
-        await asyncio.sleep(delay)
+        # спим короткими кусками: админ может изменить время тиража
+        await asyncio.sleep(min(delay, 15))
+        continue
       await finish_lottery_round(bot, round_id, prize)
     except Exception:
       logging.exception("Ошибка в цикле лотереи")
@@ -891,21 +960,25 @@ async def lottery_open(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("lottery_join_"))
 async def lottery_join(callback: CallbackQuery):
   user_id = callback.from_user.id
-  round_id = int(callback.data.split("_")[2])
+  parts = callback.data.split("_")
+  round_id = int(parts[2])
+  shown_cost = int(parts[3]) if len(parts) > 3 else None
+  price_changed = False
 
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT entry_cost, ends_at, finished FROM lottery_rounds WHERE id = ?",
+        "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0),"
+        " finished FROM lottery_rounds WHERE id = ?",
         (round_id,),
     ) as cur:
-      rnd = await cur.fetchone()
+      row = await cur.fetchone()
 
-    if not rnd or rnd[2] == 1:
+    if not row or row[5] == 1:
       await callback.answer("⏳ Этот розыгрыш уже завершён.", show_alert=True)
       return
-    cost = rnd[0]
+    rnd = row[:5]
     try:
-      ends_at = datetime.datetime.strptime(rnd[1], DT_FORMAT)
+      ends_at = datetime.datetime.strptime(rnd[3], DT_FORMAT)
     except Exception:
       ends_at = datetime.datetime.now()
     if ends_at <= datetime.datetime.now():
@@ -920,27 +993,53 @@ async def lottery_join(callback: CallbackQuery):
         await callback.answer("✅ Ты уже участвуешь!", show_alert=True)
         return
 
-    # Списание токенов одним запросом: сработает, только если хватает токенов
-    cur = await db.execute(
-        "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
-        " COALESCE(tokens, 0) >= ?",
-        (cost, user_id, cost),
-    )
-    if cur.rowcount == 0:
-      await db.rollback()
-      await callback.answer(
-          f"❌ Недостаточно токенов! Участие стоит {cost}.", show_alert=True
+    st = await lottery_stats(db, rnd)
+    cost = st["cost"]
+    if shown_cost is not None and shown_cost != cost:
+      price_changed = True
+    else:
+      # Списание токенов одним запросом: сработает, только если хватает токенов
+      if cost > 0:
+        cur = await db.execute(
+            "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+            " COALESCE(tokens, 0) >= ?",
+            (cost, user_id, cost),
+        )
+        charged = cur.rowcount
+      else:
+        await ensure_user(db, user_id)
+        charged = 1
+      if charged == 0:
+        await db.rollback()
+        await callback.answer(
+            f"❌ Недостаточно токенов! Участие стоит {cost}.", show_alert=True
+        )
+        return
+      await db.execute(
+          "INSERT INTO lottery_participants (round_id, user_id, paid)"
+          " VALUES (?, ?, ?)",
+          (round_id, user_id, cost),
       )
-      return
-    await db.execute(
-        "INSERT INTO lottery_participants (round_id, user_id) VALUES (?, ?)",
-        (round_id, user_id),
+      await db.commit()
+
+  if price_changed:
+    await callback.answer(
+        f"💱 Цена участия изменилась: теперь {cost_text(cost)}. Проверь и"
+        " нажми «Участвовать» ещё раз.",
+        show_alert=True,
     )
-    await db.commit()
+    try:
+      text, kb = await build_lottery_view(user_id)
+      await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+      pass
+    return
 
   await callback.answer("🎟 Ты в игре! Удачи!", show_alert=True)
   await callback.message.answer(
-      f"🎟 Ты участвуешь в лотерее! Списано: <b>{cost} токен(ов)</b>.\n"
+      "🎟 Ты участвуешь в лотерее!"
+      + (f" Списано: <b>{cost} токен(ов)</b>." if cost else " Участие бесплатное.")
+      + "\n"
       "Результат придёт сюда, когда закончится розыгрыш."
   )
 
@@ -1344,6 +1443,101 @@ async def cmd_all(message: Message, command: CommandObject, bot: Bot):
   task.add_done_callback(_bg_tasks.discard)
 
 
+@router.message(Command("lottery"))
+async def cmd_lottery(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+
+  usage = (
+      "ℹ️ Управление текущей лотереей:\n"
+      "<code>/lottery prize [токены]</code> — главный приз (можно 0)\n"
+      "<code>/lottery cost [токены]</code> — цена участия, фиксированная"
+      " (можно 0 — бесплатно)\n"
+      "<code>/lottery cost auto</code> — вернуть автоцену (растёт вместе с"
+      " призом)\n"
+      "<code>/lottery time [часы]</code> — сколько часов до конца, считая с"
+      " сейчас (можно <code>30m</code> — минуты)\n"
+      "<code>/lottery</code> — показать текущие настройки\n\n"
+      "<i>Участники не сбрасываются: все, кто уже вошёл, остаются в"
+      " розыгрыше. Изменения действуют на текущий тираж, следующие выпадают по"
+      " обычным правилам.</i>"
+  )
+
+  rnd = await get_current_round()
+  if not rnd:
+    await message.answer("⏳ Сейчас нет активного тиража. Подожди секунду.")
+    return
+  round_id = rnd[0]
+
+  parts = (command.args or "").split()
+  if parts:
+    if len(parts) != 2:
+      await message.answer(usage)
+      return
+    field, raw = parts[0].lower(), parts[1].lower()
+    async with aiosqlite.connect(DB_NAME) as db:
+      if field == "prize":
+        if not raw.isdigit():
+          await message.answer(usage)
+          return
+        await db.execute(
+            "UPDATE lottery_rounds SET prize = ? WHERE id = ? AND finished = 0",
+            (int(raw), round_id),
+        )
+      elif field == "cost":
+        if raw == "auto":
+          await db.execute(
+              "UPDATE lottery_rounds SET cost_fixed = 0 WHERE id = ?"
+              " AND finished = 0",
+              (round_id,),
+          )
+        elif raw.isdigit():
+          await db.execute(
+              "UPDATE lottery_rounds SET entry_cost = ?, cost_fixed = 1"
+              " WHERE id = ? AND finished = 0",
+              (int(raw), round_id),
+          )
+        else:
+          await message.answer(usage)
+          return
+      elif field == "time":
+        unit_minutes = raw.endswith("m")
+        num = raw[:-1] if (unit_minutes or raw.endswith("h")) else raw
+        if not num.isdigit() or int(num) <= 0:
+          await message.answer(usage)
+          return
+        minutes = int(num) if unit_minutes else int(num) * 60
+        minutes = min(minutes, 24 * 60 * 14)
+        new_end = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
+        await db.execute(
+            "UPDATE lottery_rounds SET ends_at = ? WHERE id = ? AND finished = 0",
+            (new_end.strftime(DT_FORMAT), round_id),
+        )
+      else:
+        await message.answer(usage)
+        return
+      await db.commit()
+    rnd = await get_current_round()
+
+  round_id, _, prize, ends_at_str, fixed = rnd
+  ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+  left_min = max(0, int((ends_at - datetime.datetime.now()).total_seconds() // 60))
+  async with aiosqlite.connect(DB_NAME) as db:
+    st = await lottery_stats(db, rnd)
+  await message.answer(
+      ("✅ Готово.\n\n" if parts else "")
+      + "🎰 <b>Текущая лотерея</b>\n"
+      f"🏆 Главный приз: <b>{prize}</b> токенов (+ {st['pool']} от взносов ="
+      f" {st['total']})\n"
+      f"🎟 Участие: <b>{cost_text(st['cost'])}</b>"
+      f" ({'фиксированная' if fixed else 'авто'})\n"
+      f"👥 Участников: <b>{st['players']}</b> (минимум: {lottery_min_players(prize)})\n"
+      f"⏱ До конца: <b>{left_min // 60} ч {left_min % 60} мин</b>"
+      + ("" if parts else "\n\n" + usage)
+  )
+
+
 @router.callback_query(F.data == "check_sub")
 async def check_sub(callback: CallbackQuery, bot: Bot):
   if await is_subscribed(bot, callback.from_user.id):
@@ -1375,6 +1569,7 @@ async def check_sub(callback: CallbackQuery, bot: Bot):
             "👑 Премиум-подписка",
             "🎰 Лотерея",
             "🔄 Обмены",
+            "🎲 Рулетка",
             "⚙️ Админ-панель",
         }
     )
@@ -1522,8 +1717,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         top_list = await cursor.fetchall()
 
     footer = (
-        "<i>(каждую неделю сбрасывается топ и выдается премиум подписка на 14"
-        " дней)</i>"
+        "<i>(каждую неделю топ сбрасывается, а игроку, занявшему 🥇 1 место,"
+        " выдается премиум-подписка на 14 дней)</i>"
     )
 
     if not top_list:
@@ -1550,14 +1745,18 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
   elif text == "🪙 Как получить токены?":
     tokens_text = (
-        "📌 Как получить токены?\n\n1. Возьмите фото."
-        " https://t.me/JmcDeveloper/11\n\n2. Оставляйте в"
-        " комментариях под постами/ответами другим людям. \n3. Отправляйте"
-        " доказательства (скриншоты) в директ канала."
-        " https://t.me/JmcDeveloper?direct\n\n💰 1 отправка фото в"
-        " комментариях = 1 токен! ГЛАВНОЕ: тема должна касаться по типу"
-        " сестры и брата и тд.\n\n📖 ДЕТАЛЬНО РАСПИСАЛ ТУТ:"
-        " https://t.me/JmcDeveloper/18"
+        "Как получить токены?\n\n"
+        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n"
+        "2. Оставляйте в комментариях под постами/ответами другим людям."
+        " <u>(под тему сестра и брата)</u>\n"
+        "3. Отправляйте доказательства (скриншоты) в директ канала."
+        " https://t.me/JmcDeveloper?direct\n\n"
+        "ГЛАВНОЕ: тема видосов должна касаться по типу сестры и брата и"
+        " тд.\n\n"
+        "💰 1 отправка фото в комментариях = 1 токен!\n\n\n\n"
+        "📖 ДЕТАЛЬНО РАСПИСАЛ ТУТ: https://t.me/JmcDeveloper/18\n"
+        "📖 ДЕТАЛЬНО РАСПИСАЛ ТУТ: https://t.me/JmcDeveloper/18\n"
+        "📖 ДЕТАЛЬНО РАСПИСАЛ ТУТ: https://t.me/JmcDeveloper/18"
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -1586,6 +1785,10 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
   elif text == "🔄 Обмены":
     await message.answer(await ex_menu_text(), reply_markup=exchange_menu_kb())
+
+  elif text == "🎲 Рулетка":
+    await state.set_state(RouletteState.bet)
+    await message.answer(await roulette_intro_text(user_id))
 
   elif text == "⚙️ Админ-панель":
     if user_id != ADMIN_ID:
@@ -2107,10 +2310,10 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       await db.commit()
       text = (
           f"👑 Премиум-доступ применен!\n\n✅ Вы успешно получили фулл"
-          f" {esc(title)} бесплатно по подписке!\n\n🔗 Ссылка:"
-          f" {esc(link)}"
+          f" {esc(title)} бесплатно по подписке!\n\n🔗 Ссылка"
+          f" (нажми, чтобы показать):\n{hidden_link(link)}"
       )
-      await callback.message.answer(text)
+      await callback.message.answer(text, disable_web_page_preview=True)
       await callback.answer()
       return
 
@@ -2163,17 +2366,17 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
     text = (
         f"🎉 Поздравляем! Ты первый покупатель фулла {esc(title)}!\n🔥"
         f" Применилась скидка 80%!\nСписано: {final_price} токенов.\n💲 Ваш"
-        f" остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание:"
-        f" {esc(link)}"
+        f" остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание"
+        f" (нажми, чтобы показать):\n{hidden_link(link)}"
     )
   else:
     text = (
         f"✅ Спасибо за покупку фула {esc(title)}!\n💰 Списано:"
         f" {final_price} токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя"
-        f" ссылка на скачивание: {esc(link)}"
+        f" ссылка на скачивание (нажми, чтобы показать):\n{hidden_link(link)}"
     )
 
-  await callback.message.answer(text)
+  await callback.message.answer(text, disable_web_page_preview=True)
   await callback.answer()
 
 
@@ -2948,6 +3151,186 @@ async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Отправлено.")
   except Exception:
     await message.answer("Не доставлено (человек заблокировал бота).")
+
+
+# --- РУЛЕТКА 50/50 ---
+
+ROULETTE_MIN = 2
+ROULETTE_MAX = 10
+ROULETTE_WIN_STREAK_LIMIT = 3  # после стольких побед подряд следующая игра проигрыш
+ROULETTE_LOSS_STREAK_LIMIT = 3  # после стольких поражений подряд...
+ROULETTE_PITY_MAX_BETS = (3, 9)  # ...две победы подряд: 1-я при ставке до 3, 2-я до 9
+_roulette_locks = {}
+
+
+class RouletteState(StatesGroup):
+  bet = State()
+
+
+def roulette_decide(win_streak, loss_streak, guaranteed, bet, roll_win):
+  """Решает исход игры. Возвращает (победа, win_streak, loss_streak, guaranteed)."""
+  if win_streak >= ROULETTE_WIN_STREAK_LIMIT:
+    win = False  # серия побед обрывается
+  elif guaranteed > 0 and bet <= ROULETTE_PITY_MAX_BETS[2 - guaranteed]:
+    win = True  # гарантированная победа после серии поражений
+    guaranteed -= 1
+  else:
+    win = roll_win
+
+  if win:
+    win_streak += 1
+    loss_streak = 0
+  else:
+    win_streak = 0
+    loss_streak += 1
+    if loss_streak >= ROULETTE_LOSS_STREAK_LIMIT:
+      loss_streak = 0
+      guaranteed = len(ROULETTE_PITY_MAX_BETS)
+  return win, win_streak, loss_streak, guaranteed
+
+
+async def roulette_play(user_id: int, bet: int) -> dict:
+  """Один раунд. {'error': 'balance', 'balance': N} или {'win': bool, 'balance': N}."""
+  lock = _roulette_locks.setdefault(user_id, asyncio.Lock())
+  async with lock:
+    async with aiosqlite.connect(DB_NAME) as db:
+      cur = await db.execute(
+          "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+          " COALESCE(tokens, 0) >= ?",
+          (bet, user_id, bet),
+      )
+      if cur.rowcount == 0:
+        async with db.execute(
+            "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?",
+            (user_id,),
+        ) as c:
+          row = await c.fetchone()
+        return {"error": "balance", "balance": row[0] if row else 0}
+
+      await db.execute(
+          "INSERT OR IGNORE INTO roulette_state (user_id) VALUES (?)",
+          (user_id,),
+      )
+      async with db.execute(
+          "SELECT win_streak, loss_streak, guaranteed FROM roulette_state"
+          " WHERE user_id = ?",
+          (user_id,),
+      ) as c:
+        ws, ls, g = await c.fetchone()
+      win, ws, ls, g = roulette_decide(ws, ls, g, bet, random.random() < 0.5)
+      await db.execute(
+          "UPDATE roulette_state SET win_streak = ?, loss_streak = ?,"
+          " guaranteed = ? WHERE user_id = ?",
+          (ws, ls, g, user_id),
+      )
+      if win:
+        await db.execute(
+            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+            (bet * 2, user_id),
+        )
+      async with db.execute(
+          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+      ) as c:
+        balance = (await c.fetchone())[0]
+      await db.commit()
+  return {"win": win, "balance": balance}
+
+
+def roulette_result_kb(bet: int) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=f"🔁 Сыграть снова ({bet} токен.)",
+                  callback_data=f"rl_again_{bet}",
+              )
+          ],
+          [InlineKeyboardButton(text="💰 Другая ставка", callback_data="rl_new")],
+      ]
+  )
+
+
+async def roulette_intro_text(user_id: int) -> str:
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      row = await cur.fetchone()
+  balance = row[0] if row else 0
+  return (
+      "🎲 <b>Рулетка 50/50</b>\n\n"
+      "Ставишь токены — и либо удваиваешь их, либо теряешь. Шанс выиграть"
+      " 50/50!\n"
+      f"Выиграл: получаешь ставку ×2 (ставка 4 → на баланс вернётся 8).\n"
+      "Проиграл: ставка сгорает.\n\n"
+      f"💰 Ставка: от <b>{ROULETTE_MIN}</b> до <b>{ROULETTE_MAX}</b> токенов.\n"
+      f"Твой баланс: <b>{balance}</b> токенов.\n\n"
+      "✍️ Напиши в чат, сколько токенов ставишь:"
+  )
+
+
+def roulette_result_text(bet: int, res: dict) -> str:
+  if res["win"]:
+    return (
+        f"🎉 <b>Победа!</b> Ставка {bet} → <b>+{bet}</b> токенов.\n"
+        f"Баланс: <b>{res['balance']}</b>"
+    )
+  return (
+      f"💥 <b>Проигрыш.</b> Ставка {bet} токенов сгорела.\n"
+      f"Баланс: <b>{res['balance']}</b>"
+  )
+
+
+@router.message(StateFilter(RouletteState.bet))
+async def roulette_bet(message: Message, state: FSMContext):
+  raw = (message.text or "").strip()
+  if not raw.isdigit() or not ROULETTE_MIN <= int(raw) <= ROULETTE_MAX:
+    await message.answer(
+        f"Напиши число от {ROULETTE_MIN} до {ROULETTE_MAX} — сколько токенов"
+        " ставишь."
+    )
+    return
+  bet = int(raw)
+  res = await roulette_play(message.from_user.id, bet)
+  if "error" in res:
+    await message.answer(
+        f"❌ Не хватает токенов. Баланс: <b>{res['balance']}</b>. Напиши"
+        " ставку поменьше или нажми другую кнопку меню."
+    )
+    return
+  await state.clear()
+  await message.answer(
+      roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
+  )
+
+
+@router.callback_query(F.data.startswith("rl_again_"))
+async def roulette_again(callback: CallbackQuery):
+  bet = int(callback.data.split("_")[2])
+  if not ROULETTE_MIN <= bet <= ROULETTE_MAX:
+    await callback.answer()
+    return
+  res = await roulette_play(callback.from_user.id, bet)
+  if "error" in res:
+    await callback.answer(
+        f"❌ Не хватает токенов. Баланс: {res['balance']}", show_alert=True
+    )
+    return
+  await callback.answer()
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+  await callback.message.answer(
+      roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
+  )
+
+
+@router.callback_query(F.data == "rl_new")
+async def roulette_new(callback: CallbackQuery, state: FSMContext):
+  await state.set_state(RouletteState.bet)
+  await callback.answer()
+  await callback.message.answer(await roulette_intro_text(callback.from_user.id))
 
 
 # --- ГЛОБАЛЬНЫЙ ЛОВЕЦ ОШИБОК ---
