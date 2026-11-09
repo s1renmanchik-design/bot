@@ -323,10 +323,18 @@ async def get_active_ban(user_id: int):
     return until
 
 
+APPEAL_TEXT = (
+    "Если вы ограничены от бота или заблокированы, напишите @ucu52, если вы"
+    " получили наказание незаслуженно."
+)
+
+
 def ban_text(until: datetime.datetime) -> str:
   if until.year >= 2900:
-    return "🚫 Ваш профиль заблокирован навсегда."
-  return f"🚫 Ваш профиль заблокирован до {until.strftime('%d.%m.%Y %H:%M')}."
+    base = "🚫 Ваш профиль заблокирован навсегда."
+  else:
+    base = f"🚫 Ваш профиль заблокирован до {until.strftime('%d.%m.%Y %H:%M')}."
+  return f"{base}\n\n{APPEAL_TEXT}"
 
 
 async def ensure_user(db, user_id: int) -> None:
@@ -2249,7 +2257,7 @@ async def backup_database_manual(callback: CallbackQuery):
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
   if await get_restriction(user_id):
-    await callback.answer(RESTRICTED_TEXT, show_alert=True)
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
     return
   p_id = int(callback.data.split("_")[1])
 
@@ -2610,7 +2618,12 @@ async def get_restriction(user_id: int):
 
 RESTRICTED_TEXT = (
     "🔒 На вас подана жалоба. Обмены и покупки в магазине временно"
-    " ограничены до решения администратора."
+    " ограничены до решения администратора.\n\n" + APPEAL_TEXT
+)
+# для всплывающих окон (лимит Telegram — 200 символов)
+RESTRICTED_ALERT = (
+    "🔒 Вы ограничены от обменов и покупок. Если это незаслуженно — напишите"
+    " @ucu52"
 )
 
 
@@ -2699,7 +2712,7 @@ async def ex_noop(callback: CallbackQuery):
 async def ex_new(callback: CallbackQuery, state: FSMContext):
   uid = callback.from_user.id
   if await get_restriction(uid):
-    await callback.answer(RESTRICTED_TEXT, show_alert=True)
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
     return
   cnt = await ex_one(
       "SELECT COUNT(*) n FROM ex_offers WHERE owner_id = ? AND status = 'open'",
@@ -2935,7 +2948,7 @@ async def ex_take(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Это твой обмен.", show_alert=True)
     return
   if await get_restriction(uid):
-    await callback.answer(RESTRICTED_TEXT, show_alert=True)
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
     return
   bal = await ex_one("SELECT COALESCE(tokens, 0) t FROM users WHERE user_id = ?", (uid,))
   if not bal or bal["t"] < EXCHANGE_COST:
