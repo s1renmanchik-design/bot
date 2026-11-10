@@ -29,19 +29,17 @@ from aiogram.types import (
 
 try:
   from aiogram.client.default import DefaultBotProperties
-except ImportError:  # старые версии aiogram 3.x
+except ImportError:
   DefaultBotProperties = None
 
 try:
   from zoneinfo import ZoneInfo
-
   LOCAL_TZ = ZoneInfo("Europe/Kyiv")
-except Exception:  # нет базы часовых поясов -> фиксированный UTC+2
+except Exception:
   LOCAL_TZ = datetime.timezone(datetime.timedelta(hours=2))
 
 logging.basicConfig(level=logging.INFO)
 
-# ВАЖНО: токен только из переменной окружения TOKEN (на хостинге).
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
   sys.exit("Не задана переменная окружения TOKEN")
@@ -51,36 +49,29 @@ DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
 
-# Канал для обязательной подписки.
-# Для каналов Telegram ID = -100 + число (2925107145 -> -1002925107145).
 CHANNEL_ID = -1002925107145
 CHANNEL_URL = "https://t.me/iiris_cnn_bot"
 
 DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# Модерация
 MAX_WARNS = 3
 PERM_BAN = "2999-12-31 00:00:00"
+REF_BONUS = 7  # токенов пригласившему за подписавшегося реферала
 
-# Лотерея
 LOTTERY_HOURS = 3
-LOTTERY_NORMAL_CHANCE = 0.80  # обычный приз 4-10 токенов
-LOTTERY_BIG_LOW_CHANCE = 0.15  # крупный приз 11-14 токенов
-# остаток (5%) — самый крупный приз 15-20 токенов
-LOTTERY_NOTIFY_PRIZE = 11  # от этого приза и выше всем приходит уведомление о старте
-LOTTERY_MIN_PLAYERS = 2  # минимум участников, чтобы разыграть приз
-LOTTERY_BIG_PRIZE = 15  # приз от этого значения и выше...
-LOTTERY_BIG_MIN_PLAYERS = 4  # ...требует вот столько участников
+LOTTERY_NORMAL_CHANCE = 0.80
+LOTTERY_BIG_LOW_CHANCE = 0.15
+LOTTERY_NOTIFY_PRIZE = 11
+LOTTERY_MIN_PLAYERS = 2
+LOTTERY_BIG_PRIZE = 15
+LOTTERY_BIG_MIN_PLAYERS = 4
 
 
 def lottery_cost_for_total(total: int) -> int:
-  """Цена участия: каждые 5 токенов приза = +1 токен (приз 5 -> 1, 10 -> 2,
-  15 -> 3, 20 -> 4, 25 -> 5 и так далее без потолка). Меньше 5 тоже 1."""
   return max(1, total // 5)
 
 
 def fee_to_prize(paid: int) -> int:
-  """В приз уходит 50% потраченных на участие токенов (округление вверх)."""
   return (paid + 1) // 2
 
 
@@ -93,17 +84,14 @@ def lottery_min_players(prize: int) -> int:
 
 
 def hidden_link(link) -> str:
-  """Ссылка под спойлером: скрыта, пока человек не нажмёт на неё."""
   return f"<tg-spoiler>{esc(link)}</tg-spoiler>"
 
 
 def esc(value) -> str:
-  """Экранирует текст для HTML-разметки Telegram."""
   return html.escape(str(value), quote=False)
 
 
 def ru_plural(n: int, one: str, few: str, many: str) -> str:
-  """'1 токен', '2 токена', '5 токенов'."""
   n_abs = abs(n)
   if n_abs % 10 == 1 and n_abs % 100 != 11:
     word = one
@@ -115,7 +103,6 @@ def ru_plural(n: int, one: str, few: str, many: str) -> str:
 
 
 def now_local() -> datetime.datetime:
-  """Текущее время по Киеву (naive) - нужно только для ночного режима."""
   return datetime.datetime.now(LOCAL_TZ).replace(tzinfo=None)
 
 
@@ -129,10 +116,13 @@ async def init_db():
             is_premium INTEGER DEFAULT 0,
             bought_folders INTEGER DEFAULT 0,
             referrer_id INTEGER DEFAULT 0,
-            ref_activated INTEGER DEFAULT 1,
+            ref_activated INTEGER DEFAULT 0,
+            ref_income INTEGER DEFAULT 0,
+            ref_extra INTEGER DEFAULT 0,
             premium_expires TEXT DEFAULT NULL,
             warns INTEGER DEFAULT 0,
-            banned_until TEXT DEFAULT NULL
+            banned_until TEXT DEFAULT NULL,
+            ban_reason TEXT DEFAULT NULL
         );
     """
     )
@@ -187,14 +177,12 @@ async def init_db():
         );
     """
     )
-
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS roulette_state (
             user_id INTEGER PRIMARY KEY,
-            win_streak INTEGER DEFAULT 0,
-            loss_streak INTEGER DEFAULT 0,
-            guaranteed INTEGER DEFAULT 0
+            games INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0
         );
     """
     )
@@ -219,17 +207,19 @@ async def init_db():
     """
     )
 
-    # Миграция: добавляем недостающие колонки в таблицы старой базы
     migrations = {
         "users": {
             "tokens": "INTEGER DEFAULT 0",
             "is_premium": "INTEGER DEFAULT 0",
             "bought_folders": "INTEGER DEFAULT 0",
             "referrer_id": "INTEGER DEFAULT 0",
-            "ref_activated": "INTEGER DEFAULT 1",
+            "ref_activated": "INTEGER DEFAULT 0",
+            "ref_income": "INTEGER DEFAULT 0",
+            "ref_extra": "INTEGER DEFAULT 0",
             "premium_expires": "TEXT DEFAULT NULL",
             "warns": "INTEGER DEFAULT 0",
             "banned_until": "TEXT DEFAULT NULL",
+            "ban_reason": "TEXT DEFAULT NULL",
             "exchanges": "INTEGER DEFAULT 0",
             "restricted_until": "TEXT DEFAULT NULL",
         },
@@ -246,6 +236,10 @@ async def init_db():
             "max_uses": "INTEGER DEFAULT 0",
             "used_count": "INTEGER DEFAULT 0",
         },
+        "roulette_state": {
+            "games": "INTEGER DEFAULT 0",
+            "wins": "INTEGER DEFAULT 0",
+        },
     }
     for table, columns in migrations.items():
       async with db.execute(f"PRAGMA table_info({table})") as cur:
@@ -255,6 +249,11 @@ async def init_db():
           await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
           logging.info("Миграция: добавлена колонка %s.%s", table, col)
 
+    await db.execute(
+        "UPDATE users SET ref_income = ? WHERE referrer_id != 0"
+        " AND ref_activated = 1 AND COALESCE(ref_income, 0) = 0",
+        (REF_BONUS,),
+    )
     await db.commit()
 
 
@@ -298,29 +297,29 @@ class GiveTokensState(StatesGroup):
 router = Router()
 
 
-# --- БАНЫ И ПРЕДУПРЕЖДЕНИЯ ---
+# --- БАНЫ, ПРЕДУПРЕЖДЕНИЯ И ПРИЧИНЫ ---
 
 
-async def get_active_ban(user_id: int):
-  """Возвращает datetime окончания бана или None, если бана нет."""
+async def get_active_ban_info(user_id: int):
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT banned_until FROM users WHERE user_id = ?", (user_id,)
+        "SELECT banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,)
     ) as cur:
       row = await cur.fetchone()
     if not row or not row[0]:
-      return None
+      return None, None
     try:
       until = datetime.datetime.strptime(row[0], DT_FORMAT)
     except Exception:
-      return None
+      return None, None
     if until <= datetime.datetime.now():
       await db.execute(
-          "UPDATE users SET banned_until = NULL WHERE user_id = ?", (user_id,)
+          "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id = ?",
+          (user_id,),
       )
       await db.commit()
-      return None
-    return until
+      return None, None
+    return until, row[1]
 
 
 APPEAL_TEXT = (
@@ -329,25 +328,26 @@ APPEAL_TEXT = (
 )
 
 
-def ban_text(until: datetime.datetime) -> str:
+def ban_text(until: datetime.datetime, reason: str = None) -> str:
   if until.year >= 2900:
     base = "🚫 Ваш профиль заблокирован навсегда."
   else:
     base = f"🚫 Ваш профиль заблокирован до {until.strftime('%d.%m.%Y %H:%M')}."
-  return f"{base}\n\n{APPEAL_TEXT}"
+  
+  reason_str = f"\n📝 Причина: <b>{esc(reason)}</b>" if reason else ""
+  return f"{base}{reason_str}\n\n{APPEAL_TEXT}"
 
 
 async def ensure_user(db, user_id: int) -> None:
   await db.execute(
       "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-      " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 1)"
+      " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 0)"
       " ON CONFLICT(user_id) DO NOTHING",
       (user_id,),
   )
 
 
-async def ban_user(target_id: int, days: int) -> str:
-  """Банит на days дней (0 = навсегда). Возвращает текст срока."""
+async def ban_user(target_id: int, days: int, reason: str = None) -> str:
   if days > 0:
     until = datetime.datetime.now() + datetime.timedelta(days=days)
     until_str = until.strftime(DT_FORMAT)
@@ -358,8 +358,8 @@ async def ban_user(target_id: int, days: int) -> str:
   async with aiosqlite.connect(DB_NAME) as db:
     await ensure_user(db, target_id)
     await db.execute(
-        "UPDATE users SET banned_until = ? WHERE user_id = ?",
-        (until_str, target_id),
+        "UPDATE users SET banned_until = ?, ban_reason = ? WHERE user_id = ?",
+        (until_str, reason, target_id),
     )
     await db.commit()
   return text
@@ -368,13 +368,13 @@ async def ban_user(target_id: int, days: int) -> str:
 async def unban_user(target_id: int) -> None:
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
-        "UPDATE users SET banned_until = NULL WHERE user_id = ?", (target_id,)
+        "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id = ?",
+        (target_id,),
     )
     await db.commit()
 
 
-async def add_warn(target_id: int):
-  """Добавляет предупреждение. Возвращает (кол-во варнов, забанен ли)."""
+async def add_warn(target_id: int, reason: str = None):
   async with aiosqlite.connect(DB_NAME) as db:
     await ensure_user(db, target_id)
     await db.execute(
@@ -388,10 +388,11 @@ async def add_warn(target_id: int):
     warns = row[0] if row and row[0] is not None else 0
     banned = False
     if warns >= MAX_WARNS:
+      ban_msg = f"Превышен лимит предупреждений ({MAX_WARNS})" + (f": {reason}" if reason else "")
       await db.execute(
-          "UPDATE users SET banned_until = ?, is_premium = 0,"
+          "UPDATE users SET banned_until = ?, ban_reason = ?, is_premium = 0,"
           " premium_expires = NULL, tokens = 0 WHERE user_id = ?",
-          (PERM_BAN, target_id),
+          (PERM_BAN, ban_msg, target_id),
       )
       banned = True
     await db.commit()
@@ -425,7 +426,6 @@ async def remove_premium(target_id: int) -> None:
 
 
 async def remove_tokens(target_id: int, amount: int) -> int:
-  """Забирает токены (не уходит ниже 0). Возвращает новый баланс."""
   async with aiosqlite.connect(DB_NAME) as db:
     await ensure_user(db, target_id)
     await db.execute(
@@ -441,15 +441,13 @@ async def remove_tokens(target_id: int, amount: int) -> int:
   return row[0] if row and row[0] is not None else 0
 
 
-# --- ОБЯЗАТЕЛЬНАЯ ПОДПИСКА НА КАНАЛ ---
+# --- РЕФЕРАЛЬНАЯ СИСТЕМА И ПОДПИСКА ---
 
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
   try:
     member = await bot.get_chat_member(CHANNEL_ID, user_id)
   except Exception:
-    # Бот не админ в канале или неверный CHANNEL_ID: не блокируем всех,
-    # но пишем ошибку в лог.
     logging.exception("Не удалось проверить подписку")
     return True
   if member.status in (
@@ -461,6 +459,38 @@ async def is_subscribed(bot: Bot, user_id: int) -> bool:
   if member.status == ChatMemberStatus.RESTRICTED:
     return bool(getattr(member, "is_member", False))
   return False
+
+
+async def activate_referral(bot: Bot, user_id: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    cur = await db.execute(
+        "UPDATE users SET ref_activated = 1, ref_income = ? WHERE user_id = ?"
+        " AND ref_activated = 0 AND referrer_id != 0",
+        (REF_BONUS, user_id),
+    )
+    if cur.rowcount == 0:
+      return
+    async with db.execute(
+        "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
+    ) as c:
+      row = await c.fetchone()
+      if not row:
+        return
+      referrer_id = row[0]
+    await ensure_user(db, referrer_id)
+    await db.execute(
+        "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
+        (REF_BONUS, referrer_id),
+    )
+    await db.commit()
+  try:
+    await bot.send_message(
+        referrer_id,
+        "🎉 По вашей рефке зарегистрировался новый фембойчик!\n"
+        f"❤️ Вам начислено {REF_BONUS} токенов!",
+    )
+  except Exception:
+    pass
 
 
 def sub_keyboard() -> InlineKeyboardMarkup:
@@ -491,25 +521,24 @@ class SubscribeMiddleware(BaseMiddleware):
     if user is None or user.id == ADMIN_ID:
       return await handler(event, data)
 
-    # Забаненные пользователи не могут пользоваться ботом
-    until = await get_active_ban(user.id)
+    until, reason = await get_active_ban_info(user.id)
     if until is not None:
+      msg_text = ban_text(until, reason)
       if isinstance(event, CallbackQuery):
-        await event.message.answer(ban_text(until))
+        await event.message.answer(msg_text)
         await event.answer()
       else:
-        await event.answer(ban_text(until))
+        await event.answer(msg_text)
       return None
 
-    # /start пропускаем, чтобы реферальная ссылка успела сработать
     if isinstance(event, Message) and (event.text or "").startswith("/start"):
       return await handler(event, data)
 
-    # кнопку проверки подписки пропускаем
     if isinstance(event, CallbackQuery) and event.data == "check_sub":
       return await handler(event, data)
 
     if await is_subscribed(bot, user.id):
+      await activate_referral(bot, user.id)
       return await handler(event, data)
 
     if isinstance(event, CallbackQuery):
@@ -543,15 +572,12 @@ def get_main_keyboard(user_id):
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-# --- ОБЩИЕ ФУНКЦИИ: ВЫДАЧА ТОКЕНОВ, ПРЕМИУМА, АКТИВАЦИЯ ПРОМОКОДА ---
-
-
 async def grant_tokens(target_id: int, amount: int) -> None:
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
         """
         INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
-        VALUES (?, ?, 0, 0, 0, 1)
+        VALUES (?, ?, 0, 0, 0, 0)
         ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
         """,
         (target_id, amount, amount),
@@ -560,7 +586,6 @@ async def grant_tokens(target_id: int, amount: int) -> None:
 
 
 async def grant_premium(target_id: int, days: int) -> datetime.datetime:
-  """Выдает премиум на days дней (продлевает, если уже активен)."""
   now = datetime.datetime.now()
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
@@ -583,7 +608,7 @@ async def grant_premium(target_id: int, days: int) -> datetime.datetime:
     await db.execute(
         """
         INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-        VALUES (?, 0, 1, 0, 0, 1, ?)
+        VALUES (?, 0, 1, 0, 0, 0, ?)
         ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
         """,
         (target_id, expire_str, expire_str),
@@ -593,7 +618,6 @@ async def grant_premium(target_id: int, days: int) -> datetime.datetime:
 
 
 async def apply_promocode(user_id: int, code_text: str) -> str:
-  """Активирует промокод и возвращает текст ответа пользователю."""
   code_text = (code_text or "").strip()
   if not code_text:
     return "❌ Промокод не указан."
@@ -629,7 +653,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
         await db.execute(
             """
             INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
-            VALUES (?, ?, 0, 0, 0, 1)
+            VALUES (?, ?, 0, 0, 0, 0)
             ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
             """,
             (user_id, val, val),
@@ -658,7 +682,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
         await db.execute(
             """
             INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-            VALUES (?, 0, 1, 0, 0, 1, ?)
+            VALUES (?, 0, 1, 0, 0, 0, ?)
             ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
             """,
             (user_id, expire_str, expire_str),
@@ -670,7 +694,6 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
       else:
         return "❌ Неизвестный тип награды у промокода."
 
-      # Сначала запись в БД, потом ответ пользователю
       await db.execute(
           "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
           (user_id, real_code),
@@ -692,7 +715,6 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
 
 
 def roll_lottery_params():
-  """Возвращает (приз, цена_фиксирована). Ночью 1:00-8:00 (Киев): приз 4, участие 1."""
   hour = now_local().hour
   if 1 <= hour < 8:
     return 4, 1
@@ -708,7 +730,6 @@ _bg_tasks = set()
 
 
 async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
-  """Рассылает всем пользователям уведомление о крупной лотерее."""
   text = (
       "🔥 <b>Началась крупная лотерея!</b>\n\n"
       f"🏆 Приз: <b>от {prize} токенов</b> (+ взносы участников)\n"
@@ -760,7 +781,6 @@ async def create_lottery_round(bot: Bot = None) -> None:
 
 
 async def get_current_round():
-  """(id, entry_cost, prize, ends_at, cost_fixed) или None."""
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
         "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0)"
@@ -770,7 +790,6 @@ async def get_current_round():
 
 
 async def lottery_stats(db, rnd) -> dict:
-  """Участники, фонд от взносов, итоговый приз и актуальная цена участия."""
   round_id, entry_cost, prize, _, fixed = rnd
   async with db.execute(
       "SELECT COUNT(*), COALESCE(SUM((COALESCE(paid, ?) + 1) / 2), 0)"
@@ -796,7 +815,6 @@ def lottery_again_keyboard() -> InlineKeyboardMarkup:
 
 
 async def build_lottery_view(user_id: int):
-  """Возвращает (текст, клавиатура) для экрана лотереи."""
   rnd = await get_current_round()
   if not rnd:
     return "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", None
@@ -818,7 +836,7 @@ async def build_lottery_view(user_id: int):
   text = (
       "🎰 <b>Лотерея</b>\n\n"
       f"🏆 Приз: <b>{st['total']} токенов</b>"
-      f" ({prize} + {st['pool']} от взносов участников)\n"
+      f" ({prize} + {st['pool']} от взносов)\n"
       f"🎟 Участие: <b>{cost_text(cost)}</b>"
       + ("" if fixed else " (растёт вместе с призом)")
       + "\n"
@@ -854,7 +872,6 @@ async def build_lottery_view(user_id: int):
 
 async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
   async with aiosqlite.connect(DB_NAME) as db:
-    # Сначала помечаем раунд завершённым, чтобы не выдать приз дважды
     await db.execute(
         "UPDATE lottery_rounds SET finished = 1 WHERE id = ?", (round_id,)
     )
@@ -871,12 +888,10 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
     ) as cur:
       part_rows = await cur.fetchall()
     players = [r[0] for r in part_rows]
-    # сколько каждый реально заплатил (цену могли поменять в середине тиража)
     paid_map = {r[0]: (r[1] if r[1] is not None else cost) for r in part_rows}
 
     min_players = lottery_min_players(prize)
     if players and len(players) < min_players:
-      # Мало участников: приз не разыгрывается, токены за участие возвращаем
       for uid in players:
         await db.execute(
             "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
@@ -902,7 +917,6 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
         await asyncio.sleep(0.05)
       return
 
-    # Половина каждого взноса участника добавляется к призу
     prize = prize + sum(fee_to_prize(v) for v in paid_map.values())
     winner = random.choice(players) if players else None
     if winner is not None:
@@ -949,7 +963,6 @@ async def lottery_loop(bot: Bot):
       ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
       delay = (ends_at - datetime.datetime.now()).total_seconds()
       if delay > 0:
-        # спим короткими кусками: админ может изменить время тиража
         await asyncio.sleep(min(delay, 15))
         continue
       await finish_lottery_round(bot, round_id, prize)
@@ -1006,7 +1019,6 @@ async def lottery_join(callback: CallbackQuery):
     if shown_cost is not None and shown_cost != cost:
       price_changed = True
     else:
-      # Списание токенов одним запросом: сработает, только если хватает токенов
       if cost > 0:
         cur = await db.execute(
             "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
@@ -1077,29 +1089,13 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       ref_to_save = referrer_id if referrer_id else 0
       await db.execute(
           "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-          " referrer_id, ref_activated) VALUES (?, 0, 0, 0, ?, 1)",
+          " referrer_id, ref_activated) VALUES (?, 0, 0, 0, ?, 0)",
           (user_id, ref_to_save),
       )
       await db.commit()
 
-      if referrer_id:
-        await db.execute(
-            """
-            INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
-            VALUES (?, 7, 0, 0, 0, 1)
-            ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + 7
-            """,
-            (referrer_id,),
-        )
-        await db.commit()
-        try:
-          await bot.send_message(
-              referrer_id,
-              "🎉 По вашей рефке зарегистрировался новый"
-              " фембойчик!\n❤️ Вам начислено 7 токенов!",
-          )
-        except Exception:
-          pass
+  if referrer_id and await is_subscribed(bot, user_id):
+    await activate_referral(bot, user_id)
 
   await message.answer(
       "👋 Привет! Добро пожаловать в бота (Уголок бомжа). Выбирай нужный раздел на клавиатуре"
@@ -1116,26 +1112,286 @@ async def cmd_promocode(
   user_id = message.from_user.id
   code_text = (command.args or "").strip()
 
-  # /promocode КОД — активируется сразу
   if code_text:
     reply = await apply_promocode(user_id, code_text)
     await message.answer(reply, reply_markup=get_main_keyboard(user_id))
     return
 
-  # /promocode без кода — спрашиваем код отдельным сообщением
   await message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
 
 
-# --- АДМИН-КОМАНДЫ ---
+# --- АДМИН-КОМАНДЫ (включая /uref и /check) ---
 
 
 def parse_args(command: CommandObject, count: int):
-  """Разбирает аргументы команды: нужно ровно count целых чисел."""
   parts = (command.args or "").split()
-  if len(parts) != count or not all(p.isdigit() for p in parts):
+  if len(parts) < count:
     return None
-  return [int(p) for p in parts]
+  return parts
+
+
+REF_TOP_SQL = """
+    SELECT user_id, is_premium, ref_count FROM (
+        SELECT u.user_id, u.is_premium,
+               (SELECT COUNT(*) FROM users r
+                 WHERE r.referrer_id = u.user_id AND r.ref_activated = 1)
+               + COALESCE(u.ref_extra, 0) AS ref_count
+        FROM users u
+    )
+    WHERE ref_count > 0
+    ORDER BY ref_count DESC
+    LIMIT ?
+"""
+
+
+def parse_dt(value):
+  try:
+    return datetime.datetime.strptime(value, DT_FORMAT) if value else None
+  except Exception:
+    return None
+
+
+async def ref_summary(db, uid: int):
+  async with db.execute(
+      "SELECT COALESCE(SUM(ref_activated = 1), 0),"
+      " COALESCE(SUM(ref_activated = 0), 0), COALESCE(SUM(ref_income), 0)"
+      " FROM users WHERE referrer_id = ?",
+      (uid,),
+  ) as c:
+    active, pending, income = await c.fetchone()
+  async with db.execute(
+      "SELECT COALESCE(ref_extra, 0) FROM users WHERE user_id = ?", (uid,)
+  ) as c:
+    row = await c.fetchone()
+  extra = row[0] if row else 0
+  return active, pending, extra, income + extra * REF_BONUS
+
+
+async def uref_add(target_id: int, count: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    await ensure_user(db, target_id)
+    await db.execute(
+        "UPDATE users SET ref_extra = COALESCE(ref_extra, 0) + ?,"
+        " tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
+        (count, count * REF_BONUS, target_id),
+    )
+    await db.commit()
+
+
+async def uref_remove(target_id: int, count):
+  removed, taken = 0, 0
+  async with aiosqlite.connect(DB_NAME) as db:
+    await ensure_user(db, target_id)
+    async with db.execute(
+        "SELECT COALESCE(ref_extra, 0) FROM users WHERE user_id = ?",
+        (target_id,),
+    ) as c:
+      row = await c.fetchone()
+      extra = row[0] if row else 0
+
+    n_extra = extra if count is None else min(count, extra)
+    if n_extra:
+      await db.execute(
+          "UPDATE users SET ref_extra = ref_extra - ? WHERE user_id = ?",
+          (n_extra, target_id),
+      )
+      removed += n_extra
+      taken += n_extra * REF_BONUS
+
+    left = None if count is None else count - n_extra
+    if left is None or left > 0:
+      where = "referrer_id = ?" + ("" if left is None else " AND ref_activated = 1")
+      sql = (
+          "SELECT user_id, ref_activated, COALESCE(ref_income, 0) FROM users"
+          f" WHERE {where} ORDER BY user_id DESC"
+      )
+      args = [target_id]
+      if left is not None:
+        sql += " LIMIT ?"
+        args.append(left)
+      async with db.execute(sql, args) as c:
+        rows = await c.fetchall()
+      for rid, activated, income in rows:
+        if activated:
+          removed += 1
+          taken += income if income > 0 else REF_BONUS
+        await db.execute(
+            "UPDATE users SET referrer_id = 0, ref_income = 0 WHERE user_id = ?",
+            (rid,),
+        )
+    if taken:
+      await db.execute(
+          "UPDATE users SET tokens = MAX(0, COALESCE(tokens, 0) - ?)"
+          " WHERE user_id = ?",
+          (taken, target_id),
+      )
+    async with db.execute(
+        "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (target_id,)
+    ) as c:
+      balance = (await c.fetchone())[0]
+    await db.commit()
+  return removed, taken, balance
+
+
+@router.message(Command("uref"))
+async def cmd_uref(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  usage = (
+      "ℹ️ Рефералы:\n"
+      "<code>/uref [ID]</code> — список рефералов и доход\n"
+      "<code>/uref add [ID] [число]</code> — добавить рефералов"
+      f" (+{REF_BONUS} токенов за каждого)\n"
+      "<code>/uref del [ID] [число]</code> — убрать N рефералов и забрать"
+      " их доход\n"
+      "<code>/uref del [ID] all</code> — убрать всех"
+  )
+  parts = (command.args or "").split()
+  if len(parts) == 1 and parts[0].isdigit():
+    target_id = int(parts[0])
+    async with aiosqlite.connect(DB_NAME) as db:
+      active, pending, extra, income = await ref_summary(db, target_id)
+      async with db.execute(
+          "SELECT user_id, ref_activated, COALESCE(ref_income, 0) FROM users"
+          " WHERE referrer_id = ? ORDER BY ref_activated DESC, user_id DESC"
+          " LIMIT 20",
+          (target_id,),
+      ) as c:
+        rows = await c.fetchall()
+    lines = "\n".join(
+        f"• <code>{rid}</code> — "
+        + ("✅" if act else "⏳ не подписан")
+        + f", принёс {inc}"
+        for rid, act, inc in rows
+    ) or "— нет —"
+    await message.answer(
+        f"👥 <b>Рефералы ID</b> <code>{target_id}</code>\n"
+        f"✅ Засчитано: <b>{active + extra}</b>"
+        f" (из них добавлено админом: {extra})\n"
+        f"⏳ Не подписались: <b>{pending}</b>\n"
+        f"💰 Доход с рефералов: <b>{income}</b> токенов\n\n{lines}"
+    )
+    return
+
+  if len(parts) == 3 and parts[0].lower() in ("add", "del") and parts[1].isdigit():
+    action, target_id, raw = parts[0].lower(), int(parts[1]), parts[2].lower()
+    if action == "add":
+      if not raw.isdigit() or int(raw) <= 0:
+        await message.answer(usage)
+        return
+      count = int(raw)
+      await uref_add(target_id, count)
+      await message.answer(
+          f"✅ ID <code>{target_id}</code>: добавлено рефералов: <b>{count}</b>,"
+          f" начислено <b>{count * REF_BONUS}</b> токенов."
+      )
+      return
+    if raw == "all":
+      count = None
+    elif raw.isdigit() and int(raw) > 0:
+      count = int(raw)
+    else:
+      await message.answer(usage)
+      return
+    removed, taken, balance = await uref_remove(target_id, count)
+    await message.answer(
+        f"✅ ID <code>{target_id}</code>: убрано рефералов: <b>{removed}</b>,"
+        f" списано дохода: <b>{taken}</b> токенов.\n"
+        f"Баланс сейчас: <b>{balance}</b>."
+    )
+    return
+  await message.answer(usage)
+
+
+@router.message(Command("check"))
+async def cmd_check(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  parts = (command.args or "").split()
+  if len(parts) != 1 or not parts[0].isdigit():
+    await message.answer("ℹ️ Использование:\n<code>/check [ID]</code>")
+    return
+  target_id = int(parts[0])
+  now = datetime.datetime.now()
+  async with aiosqlite.connect(DB_NAME) as db:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+        "SELECT * FROM users WHERE user_id = ?", (target_id,)
+    ) as c:
+      u = await c.fetchone()
+    if not u:
+      await message.answer("❌ Пользователь не найден в базе.")
+      return
+
+    active, pending, extra, income = await ref_summary(db, target_id)
+    async with db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(COALESCE(paid, 0)), 0)"
+        " FROM lottery_participants WHERE user_id = ?",
+        (target_id,),
+    ) as c:
+      lot_n, lot_paid = await c.fetchone()
+    async with db.execute(
+        "SELECT COALESCE(games, 0), COALESCE(wins, 0) FROM roulette_state"
+        " WHERE user_id = ?",
+        (target_id,),
+    ) as c:
+      rl = await c.fetchone()
+    async with db.execute(
+        "SELECT COUNT(*) FROM ex_offers WHERE owner_id = ? AND status = 'open'",
+        (target_id,),
+    ) as c:
+      open_offers = (await c.fetchone())[0]
+
+  rl_games, rl_wins = rl if rl else (0, 0)
+  prem_exp = parse_dt(u["premium_expires"])
+  if u["is_premium"] == 1 and (prem_exp is None or prem_exp > now):
+    prem = f"✅ до {prem_exp.strftime('%d.%m.%Y %H:%M')}" if prem_exp else "✅ активна"
+  else:
+    prem = "❌ нет"
+
+  def until_text(value):
+    dt = parse_dt(value)
+    if not dt or dt <= now:
+      return "нет"
+    if dt.year >= 2900:
+      return "🚫 навсегда"
+    return f"🚫 до {dt.strftime('%d.%m.%Y %H:%M')}"
+
+  invited = (
+      f"<code>{u['referrer_id']}</code> "
+      + ("(подписался ✅)" if u["ref_activated"] else "(ещё не подписался ⏳)")
+      if u["referrer_id"]
+      else "никто / сброшено"
+  )
+  ban_info = until_text(u["banned_until"])
+  if u["banned_until"] and parse_dt(u["banned_until"]) and parse_dt(u["banned_until"]) > now:
+    if u["ban_reason"]:
+      ban_info += f" (Причина: {esc(u['ban_reason'])})"
+
+  await message.answer(
+      f"🔎 <b>Аккаунт</b> <code>{target_id}</code>\n\n"
+      f"🪙 Токены: <b>{u['tokens'] or 0}</b>\n"
+      f"👑 Премиум: {prem}\n"
+      f"📦 Куплено фулов: {u['bought_folders'] or 0}\n"
+      f"⚠️ Предупреждения: {u['warns'] or 0}/{MAX_WARNS}\n"
+      f"🚫 Бан: {ban_info}\n"
+      f"🔒 Ограничение обменов: {until_text(u['restricted_until'])}\n\n"
+      f"👥 <b>Рефералы</b>\n"
+      f"• Засчитано: <b>{active + extra}</b> (добавлено админом: {extra})\n"
+      f"• Не подписались: {pending}\n"
+      f"• Доход с рефералов: <b>{income}</b> токенов\n"
+      f"• Пригласил его: {invited}\n\n"
+      f"🔄 <b>Обмены</b>\n"
+      f"• Проведено: <b>{u['exchanges'] or 0}</b>\n"
+      f"• Открытых сейчас: {open_offers}\n\n"
+      f"🎰 <b>Лотерея</b>\n"
+      f"• Участий: <b>{lot_n}</b>, заплачено всего: {lot_paid} токенов\n\n"
+      f"🎲 <b>Рулетка</b>\n"
+      f"• Игр: <b>{rl_games}</b> (побед: {rl_wins}, поражений: {rl_games - rl_wins})"
+  )
 
 
 @router.message(Command("premium"))
@@ -1144,19 +1400,18 @@ async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
     await message.answer("⛔️ У тебя нет доступа!")
     return
 
-  usage = (
-      "ℹ️ Использование:\n<code>/premium add [дни] [ID]</code>\n"
-      "Пример: <code>/premium add 30 5681420389</code>"
-  )
   args = (command.args or "").split()
   if (
-      len(args) != 3
+      len(args) < 3
       or args[0].lower() != "add"
       or not args[1].isdigit()
       or not args[2].isdigit()
       or int(args[1]) <= 0
   ):
-    await message.answer(usage)
+    await message.answer(
+        "ℹ️ Использование:\n<code>/premium add [дни] [ID]</code>\n"
+        "Пример: <code>/premium add 30 5681420389</code>"
+    )
     return
 
   days = int(args[1])
@@ -1192,19 +1447,18 @@ async def cmd_token(message: Message, command: CommandObject, bot: Bot):
     await message.answer("⛔️ У тебя нет доступа!")
     return
 
-  usage = (
-      "ℹ️ Использование:\n<code>/token add [сколько] [ID]</code>\n"
-      "Пример: <code>/token add 50 5681420389</code>"
-  )
   args = (command.args or "").split()
   if (
-      len(args) != 3
+      len(args) < 3
       or args[0].lower() != "add"
       or not args[1].isdigit()
       or not args[2].isdigit()
       or int(args[1]) <= 0
   ):
-    await message.answer(usage)
+    await message.answer(
+        "ℹ️ Использование:\n<code>/token add [сколько] [ID]</code>\n"
+        "Пример: <code>/token add 50 5681420389</code>"
+    )
     return
 
   amount = int(args[1])
@@ -1236,26 +1490,32 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  args = parse_args(command, 2)
-  if not args:
+  parts = (command.args or "").split()
+  if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
     await message.answer(
-        "ℹ️ Использование:\n<code>/ban [ID] [дни]</code>\n"
-        "Пример: <code>/ban 5681420389 7</code>\n"
+        "ℹ️ Использование:\n<code>/ban [ID] [дни] [причина]</code>\n"
+        "Пример: <code>/ban 5681420389 7 Спам в боте</code>\n"
         "<i>(0 дней = бан навсегда)</i>"
     )
     return
-  target_id, days = args
+  target_id = int(parts[0])
+  days = int(parts[1])
+  reason = " ".join(parts[2:]) if len(parts) > 2 else None
+
   if target_id == ADMIN_ID:
     await message.answer("❌ Нельзя забанить админа.")
     return
-  term = await ban_user(target_id, days)
+  term = await ban_user(target_id, days, reason)
+  reason_admin = f"\n📝 Причина: {esc(reason)}" if reason else ""
   await message.answer(
-      f"🚫 Пользователь <code>{target_id}</code> заблокирован {term}."
+      f"🚫 Пользователь <code>{target_id}</code> заблокирован {term}.{reason_admin}"
   )
   try:
-    await bot.send_message(
-        target_id, f"🚫 Ваш профиль заблокирован {term}."
-    )
+    user_msg = f"🚫 Ваш профиль заблокирован {term}."
+    if reason:
+      user_msg += f"\n📝 Причина: <b>{esc(reason)}</b>"
+    user_msg += f"\n\n{APPEAL_TEXT}"
+    await bot.send_message(target_id, user_msg)
   except Exception:
     pass
 
@@ -1265,14 +1525,14 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  args = parse_args(command, 1)
-  if not args:
+  parts = (command.args or "").split()
+  if len(parts) != 1 or not parts[0].isdigit():
     await message.answer(
         "ℹ️ Использование:\n<code>/unban [ID]</code>\n"
         "Пример: <code>/unban 5681420389</code>"
     )
     return
-  target_id = args[0]
+  target_id = int(parts[0])
   await unban_user(target_id)
   await message.answer(
       f"✅ Пользователь <code>{target_id}</code> разблокирован."
@@ -1288,44 +1548,46 @@ async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  args = parse_args(command, 1)
-  if not args:
+  parts = (command.args or "").split()
+  if len(parts) < 1 or not parts[0].isdigit():
     await message.answer(
-        "ℹ️ Использование:\n<code>/warn [ID]</code>\n"
-        "Пример: <code>/warn 5681420389</code>"
+        "ℹ️ Использование:\n<code>/warn [ID] [причина]</code>\n"
+        "Пример: <code>/warn 5681420389 Неадекватное поведение</code>"
     )
     return
-  target_id = args[0]
+  target_id = int(parts[0])
+  reason = " ".join(parts[1:]) if len(parts) > 1 else None
+
   if target_id == ADMIN_ID:
     await message.answer("❌ Нельзя выдать предупреждение админу.")
     return
-  warns, banned = await add_warn(target_id)
+  warns, banned = await add_warn(target_id, reason)
+  reason_text = f"\n📝 Причина: {esc(reason)}" if reason else ""
+  
   if banned:
     await message.answer(
         f"⚠️ Пользователь <code>{target_id}</code> получил"
         f" {warns}/{MAX_WARNS} предупреждений и заблокирован навсегда"
-        " (премиум снят, токены обнулены)."
+        f" (премиум снят, токены обнулены).{reason_text}"
     )
     try:
-      await bot.send_message(
-          target_id,
-          f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений. Ваш профиль"
-          " заблокирован навсегда, премиум-подписка снята, токены обнулены.",
-      )
+      u_msg = f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений. Ваш профиль заблокирован навсегда, премиум-подписка снята, токены обнулены."
+      if reason:
+        u_msg += f"\n📝 Причина последней выдачи: <b>{esc(reason)}</b>"
+      u_msg += f"\n\n{APPEAL_TEXT}"
+      await bot.send_message(target_id, u_msg)
     except Exception:
       pass
   else:
     await message.answer(
         f"⚠️ Пользователю <code>{target_id}</code> выдано предупреждение"
-        f" ({warns}/{MAX_WARNS})."
+        f" ({warns}/{MAX_WARNS}).{reason_text}"
     )
     try:
-      await bot.send_message(
-          target_id,
-          f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}). При"
-          f" {MAX_WARNS} предупреждениях профиль будет заблокирован,"
-          " премиум снят, токены обнулены.",
-      )
+      u_msg = f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}). При {MAX_WARNS} предупреждениях профиль будет заблокирован, премиум снят, токены обнулены."
+      if reason:
+        u_msg += f"\n📝 Причина: <b>{esc(reason)}</b>"
+      await bot.send_message(target_id, u_msg)
     except Exception:
       pass
 
@@ -1335,14 +1597,14 @@ async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  args = parse_args(command, 1)
-  if not args:
+  parts = (command.args or "").split()
+  if len(parts) != 1 or not parts[0].isdigit():
     await message.answer(
         "ℹ️ Использование:\n<code>/unwarn [ID]</code>\n"
         "Пример: <code>/unwarn 5681420389</code>"
     )
     return
-  target_id = args[0]
+  target_id = int(parts[0])
   warns = await remove_warn(target_id)
   await message.answer(
       f"✅ У пользователя <code>{target_id}</code> снято предупреждение"
@@ -1362,14 +1624,14 @@ async def cmd_unpremium(message: Message, command: CommandObject):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  args = parse_args(command, 1)
-  if not args:
+  parts = (command.args or "").split()
+  if len(parts) != 1 or not parts[0].isdigit():
     await message.answer(
         "ℹ️ Использование:\n<code>/unpremium [ID]</code>\n"
         "Пример: <code>/unpremium 5681420389</code>"
     )
     return
-  target_id = args[0]
+  target_id = int(parts[0])
   await remove_premium(target_id)
   await message.answer(
       f"✅ Премиум у пользователя <code>{target_id}</code> снят."
@@ -1381,14 +1643,15 @@ async def cmd_untoken(message: Message, command: CommandObject):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  args = parse_args(command, 2)
-  if not args or args[1] <= 0:
+  parts = (command.args or "").split()
+  if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit() or int(parts[1]) <= 0:
     await message.answer(
         "ℹ️ Использование:\n<code>/untoken [ID] [число токенов]</code>\n"
         "Пример: <code>/untoken 5681420389 20</code>"
     )
     return
-  target_id, amount = args
+  target_id = int(parts[0])
+  amount = int(parts[1])
   new_balance = await remove_tokens(target_id, amount)
   await message.answer(
       f"✅ У пользователя <code>{target_id}</code> забрано до"
@@ -1416,7 +1679,6 @@ async def cmd_all(message: Message, command: CommandObject, bot: Bot):
   amount = int(parts[1])
   now_str = datetime.datetime.now().strftime(DT_FORMAT)
   async with aiosqlite.connect(DB_NAME) as db:
-    # Забаненным токены не выдаём
     cur = await db.execute(
         "UPDATE users SET tokens = COALESCE(tokens, 0) + ?"
         " WHERE banned_until IS NULL OR banned_until <= ?",
@@ -1549,6 +1811,7 @@ async def cmd_lottery(message: Message, command: CommandObject):
 @router.callback_query(F.data == "check_sub")
 async def check_sub(callback: CallbackQuery, bot: Bot):
   if await is_subscribed(bot, callback.from_user.id):
+    await activate_referral(bot, callback.from_user.id)
     try:
       await callback.message.delete()
     except Exception:
@@ -1560,9 +1823,6 @@ async def check_sub(callback: CallbackQuery, bot: Bot):
     await callback.answer()
   else:
     await callback.answer("❌ Ты ещё не подписан на канал!", show_alert=True)
-
-
-# --- МЕНЮ И КНОПКИ (стоят выше состояний, чтобы кнопки всегда работали) ---
 
 
 @router.message(
@@ -1599,7 +1859,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       if not user_data:
         await db.execute(
             "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-            " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 1)",
+            " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 0)",
             (user_id,),
         )
         await db.commit()
@@ -1662,7 +1922,6 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     keyboard_buttons = []
     for prod in products:
       p_id, title, price, buyers_count = prod
-      # Текст кнопок не парсится как разметка, экранировать не нужно.
       if buyers_count == 0:
         btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
       else:
@@ -1685,7 +1944,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     ref_text = (
         "👥 <b>Реферальная система</b>\n\nПриглашай друзей по своей"
         f" персональной ссылке:\n<code>{ref_link}</code>\n\n🎁 Бонусы:\n• За"
-        " каждого приглашенного друга вы получаете 7 токенов!\n• Получайте 15%"
+        f" каждого приглашенного друга (после подписки на канал) вы получаете {REF_BONUS} токенов!\n• Получайте 15%"
         " от суммы всех покупок токенами ваших рефералов!"
     )
     await message.answer(ref_text)
@@ -1711,17 +1970,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
           except Exception:
             pass
 
-      async with db.execute(
-          """
-          SELECT u.user_id, u.is_premium, COUNT(r.user_id) as ref_count
-          FROM users u
-          JOIN users r ON r.referrer_id = u.user_id
-          GROUP BY u.user_id
-          HAVING ref_count > 0
-          ORDER BY ref_count DESC
-          LIMIT 10
-          """
-      ) as cursor:
+      async with db.execute(REF_TOP_SQL, (10,)) as cursor:
         top_list = await cursor.fetchall()
 
     footer = (
@@ -1853,9 +2102,6 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
 
 
-# --- ВВОД ПРОМОКОДА (после кнопки или /promocode без кода) ---
-
-
 @router.message(StateFilter(PromocodeState.code))
 async def promo_check(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -1863,9 +2109,6 @@ async def promo_check(message: Message, state: FSMContext):
   await state.clear()
   reply = await apply_promocode(user_id, code_text)
   await message.answer(reply, reply_markup=get_main_keyboard(user_id))
-
-
-# --- АДМИНКА: ВЫДАЧА ТОКЕНОВ И ПРЕМИУМА ---
 
 
 @router.callback_query(F.data == "admin_give_tokens")
@@ -1994,9 +2237,6 @@ async def process_give_tokens_amount(
     await message.answer(f"❌ Ошибка выдачи токенов: {esc(e)}")
 
 
-# --- СОЗДАНИЕ ПРОМОКОДОВ И ТОВАРОВ ---
-
-
 @router.message(StateFilter(CreatePromoState.code))
 async def process_promo_code(message: Message, state: FSMContext):
   await state.update_data(code=(message.text or "").strip())
@@ -2077,7 +2317,6 @@ async def process_promo_uses(message: Message, state: FSMContext, bot: Bot):
       reply_markup=get_main_keyboard(message.from_user.id),
   )
 
-  # Готовый пост для канала
   try:
     username = (await bot.get_me()).username
   except Exception:
@@ -2193,9 +2432,6 @@ async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
       f"✅ Рассылка завершена!\n\n📤 Доставлено: {success}\n❌ Не доставлено"
       f" (заблокировали бота): {fail}"
   )
-
-
-# --- CALLBACK QUERY HANDLERS ---
 
 
 @router.callback_query(F.data == "enter_promocode")
@@ -2353,9 +2589,13 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       ref_bonus = round(final_price * 0.15)
       if ref_bonus > 0:
         await db.execute(
+            "UPDATE users SET ref_income = COALESCE(ref_income, 0) + ? WHERE user_id = ?",
+            (ref_bonus, referrer_id),
+        )
+        await db.execute(
             """
             INSERT INTO users (user_id, tokens, is_premium, bought_folders, referrer_id, ref_activated)
-            VALUES (?, ?, 0, 0, 0, 1)
+            VALUES (?, ?, 0, 0, 0, 0)
             ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
             """,
             (referrer_id, ref_bonus, ref_bonus),
@@ -2540,20 +2780,21 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
 
 # --- ОБМЕНЫ ССЫЛКАМИ ---
 
-EXCHANGE_COST = 1  # сколько токенов платит тот, кто берёт обмен
-RESTRICT_HOURS = 72  # на сколько часов ограничивается обвиняемый
-MAX_OPEN_OFFERS = 5  # сколько открытых обменов может держать один человек
+EXCHANGE_COST = 1
+RESTRICT_HOURS = 72
+MAX_OPEN_OFFERS = 5
 EX_PAGE_SIZE = 5
-EX_SEARCH = {}  # user_id -> строка поиска
-# Ссылка обязана быть на mega.nz
-LINK_RE = re.compile(r"^https://mega\.nz/file/\S+$", re.I)
+EX_SEARCH = {}
+LINK_RE = re.compile(r"^(https://mega\.nz/(file|folder)/\S+|https://cloud\.mail\.ru/\S+)$", re.I)
 LINK_RULE = (
-    "⚠️ <b>Ссылка обязана быть в mega.nz</b> и начинаться с"
-    " <code>https://mega.nz/file/</code>"
+    "⚠️ <b>Ссылка обязана быть рабочей!</b> Поддерживаются:\n"
+    "• <code>https://mega.nz/file/...</code>\n"
+    "• <code>https://mega.nz/folder/...</code>\n"
+    "• <code>https://cloud.mail.ru/...</code>"
 )
 LINK_ERROR = (
-    "❌ Ссылка не подходит. Она обязана начинаться с https://mega.nz/file/"
-    " Отправь ещё раз."
+    "❌ Ссылка не подходит. Она должна быть с <b>mega.nz</b> (файл/папка) "
+    "или <b>cloud.mail.ru</b>. Отправь ещё раз."
 )
 
 
@@ -2597,7 +2838,6 @@ async def ex_all(sql, args=()):
 
 
 async def get_restriction(user_id: int):
-  """datetime окончания ограничения обменов/покупок или None."""
   row = await ex_one(
       "SELECT restricted_until FROM users WHERE user_id = ?", (user_id,)
   )
@@ -2620,7 +2860,6 @@ RESTRICTED_TEXT = (
     "🔒 На вас подана жалоба. Обмены и покупки в магазине временно"
     " ограничены до решения администратора.\n\n" + APPEAL_TEXT
 )
-# для всплывающих окон (лимит Telegram — 200 символов)
 RESTRICTED_ALERT = (
     "🔒 Вы ограничены от обменов и покупок. Если это незаслуженно — напишите"
     " @ucu52"
@@ -2637,7 +2876,6 @@ def ex_kb(rows) -> InlineKeyboardMarkup:
 
 
 async def ex_show(event, text, kb=None):
-  """Callback -> редактирует сообщение, Message -> отправляет новое."""
   if isinstance(event, CallbackQuery):
     try:
       await event.message.edit_text(
@@ -2661,15 +2899,16 @@ def exchange_menu_kb() -> InlineKeyboardMarkup:
   ])
 
 
-async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool):
+async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool, reason: str = None):
+  reason_str = f"\n📝 Причина: <b>{esc(reason)}</b>" if reason else ""
   if banned:
     text = (
-        f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений. Ваш профиль"
+        f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений.{reason_str} Ваш профиль"
         " заблокирован навсегда, премиум-подписка снята, токены обнулены."
     )
   else:
     text = (
-        f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}). При"
+        f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}).{reason_str} При"
         f" {MAX_WARNS} предупреждениях профиль будет заблокирован,"
         " премиум снят, токены обнулены."
     )
@@ -2681,7 +2920,7 @@ async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool):
 
 async def ex_menu_text() -> str:
   return (
-      "🔄 <b>Обмены ссылками</b>\nВыставляй свой обмен или бери чужой."
+      "🔄 <b>Обмены фуллами</b>\nВыставляй свой обмен или бери чужой."
       f" Чтобы провести обмен, нужно заплатить {EXCHANGE_COST} токен."
   )
 
@@ -2696,16 +2935,13 @@ async def ex_menu_cb(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "ex:cancel")
 async def ex_cancel(callback: CallbackQuery, state: FSMContext):
   await state.clear()
-  await ex_show(callback, "Отменено.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
+  await ex_show(callback, "ГАЛЯ ОТМЕНАА.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
   await callback.answer()
 
 
 @router.callback_query(F.data == "ex:noop")
 async def ex_noop(callback: CallbackQuery):
   await callback.answer()
-
-
-# --- создание обмена ---
 
 
 @router.callback_query(F.data == "ex:new")
@@ -2756,7 +2992,7 @@ async def ex_new_want(message: Message, state: FSMContext):
   await state.update_data(want=text)
   await state.set_state(NewOfferState.link)
   await message.answer(
-      f"Отправь <b>свою ссылку</b> для обмена.\n{LINK_RULE}",
+      f"Отправь <b>свою ссылку на фулл</b> для обмена.\n{LINK_RULE}",
       reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
   )
 
@@ -2787,9 +3023,6 @@ async def ex_new_link(message: Message, state: FSMContext):
       " возьмётся за него.",
       reply_markup=ex_kb([[("🔄 Обмены", "ex:menu")]]),
   )
-
-
-# --- список и поиск ---
 
 
 async def ex_render_list(event, user_id: int, page: int):
@@ -2854,7 +3087,7 @@ async def ex_search(callback: CallbackQuery, state: FSMContext):
   await ex_show(
       callback,
       "Напиши слово (или два): <b>Пантера</b>, <b>Сердцеед</b>\n"
-      "Или ID человека / номер обмена — только цифры.",
+      "Или ID человека / названия обмена — только цифры.",
       ex_kb([[("❌ Отмена", "ex:cancel")]]),
   )
   await callback.answer()
@@ -2865,9 +3098,6 @@ async def ex_search_do(message: Message, state: FSMContext):
   await state.clear()
   EX_SEARCH[message.from_user.id] = (message.text or "").strip()[:60]
   await ex_render_list(message, message.from_user.id, 0)
-
-
-# --- просмотр, удаление, мои обмены ---
 
 
 @router.callback_query(F.data.startswith("ex:view:"))
@@ -2933,9 +3163,6 @@ async def ex_del(callback: CallbackQuery):
   await ex_render_my(callback)
 
 
-# --- взять обмен ---
-
-
 @router.callback_query(F.data.startswith("ex:take:"))
 async def ex_take(callback: CallbackQuery, state: FSMContext):
   offer_id = int(callback.data.split(":")[2])
@@ -2961,7 +3188,7 @@ async def ex_take(callback: CallbackQuery, state: FSMContext):
   await ex_show(
       callback,
       f"Обмен #{offer_id}: <b>{esc(o['give'])}</b> → <b>{esc(o['want'])}</b>\n\n"
-      "Отправь <b>свою ссылку</b>. После этого спишется"
+      "Отправь <b>свою ссылку на фулл</b>. После этого спишется"
       f" {EXCHANGE_COST} токен и ты получишь ссылку обменщика.\n{LINK_RULE}",
       ex_kb([[("❌ Отмена", "ex:cancel")]]),
   )
@@ -3026,9 +3253,6 @@ async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
     )
   except Exception:
     pass
-
-
-# --- жалоба ---
 
 
 @router.callback_query(F.data.startswith("ex:rep:"))
@@ -3109,8 +3333,8 @@ async def ex_admin_ok(callback: CallbackQuery, bot: Bot):
     )
   except Exception:
     pass
-  warns, banned = await add_warn(r["complainer_id"])
-  await send_warn_notice(bot, r["complainer_id"], warns, banned)
+  warns, banned = await add_warn(r["complainer_id"], "Ложная жалоба на обмен")
+  await send_warn_notice(bot, r["complainer_id"], warns, banned, "Ложная жалоба на обмен")
   await callback.answer("Готово.")
   try:
     await callback.message.edit_reply_markup(
@@ -3166,13 +3390,10 @@ async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Не доставлено (человек заблокировал бота).")
 
 
-# --- РУЛЕТКА 50/50 ---
+# --- РУЛЕТКА 50/50 (с балансиром) ---
 
 ROULETTE_MIN = 2
 ROULETTE_MAX = 10
-ROULETTE_WIN_STREAK_LIMIT = 3  # после стольких побед подряд следующая игра проигрыш
-ROULETTE_LOSS_STREAK_LIMIT = 3  # после стольких поражений подряд...
-ROULETTE_PITY_MAX_BETS = (3, 9)  # ...две победы подряд: 1-я при ставке до 3, 2-я до 9
 _roulette_locks = {}
 
 
@@ -3180,30 +3401,15 @@ class RouletteState(StatesGroup):
   bet = State()
 
 
-def roulette_decide(win_streak, loss_streak, guaranteed, bet, roll_win):
-  """Решает исход игры. Возвращает (победа, win_streak, loss_streak, guaranteed)."""
-  if win_streak >= ROULETTE_WIN_STREAK_LIMIT:
-    win = False  # серия побед обрывается
-  elif guaranteed > 0 and bet <= ROULETTE_PITY_MAX_BETS[2 - guaranteed]:
-    win = True  # гарантированная победа после серии поражений
-    guaranteed -= 1
-  else:
-    win = roll_win
-
-  if win:
-    win_streak += 1
-    loss_streak = 0
-  else:
-    win_streak = 0
-    loss_streak += 1
-    if loss_streak >= ROULETTE_LOSS_STREAK_LIMIT:
-      loss_streak = 0
-      guaranteed = len(ROULETTE_PITY_MAX_BETS)
-  return win, win_streak, loss_streak, guaranteed
+def roulette_decide(current_tokens: int, roll_win: bool) -> bool:
+  """Честный рандом 50/50, но если баланс игрока >= 30 токенов, скрытно душим."""
+  if current_tokens >= 30:
+    # 70% шанс проигрыша для тех, кто слишком много выиграл
+    return random.random() < 0.30
+  return roll_win
 
 
 async def roulette_play(user_id: int, bet: int) -> dict:
-  """Один раунд. {'error': 'balance', 'balance': N} или {'win': bool, 'balance': N}."""
   lock = _roulette_locks.setdefault(user_id, asyncio.Lock())
   async with lock:
     async with aiosqlite.connect(DB_NAME) as db:
@@ -3220,21 +3426,25 @@ async def roulette_play(user_id: int, bet: int) -> dict:
           row = await c.fetchone()
         return {"error": "balance", "balance": row[0] if row else 0}
 
+      # Узнаем текущий баланс для скрытого балансира
+      async with db.execute(
+          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?",
+          (user_id,),
+      ) as c:
+        row_bal = await c.fetchone()
+      current_bal = row_bal[0] if row_bal else 0
+
+      # Применяем честный рандом со скрытым балансиром
+      win = roulette_decide(current_bal, random.random() < 0.5)
+
       await db.execute(
           "INSERT OR IGNORE INTO roulette_state (user_id) VALUES (?)",
           (user_id,),
       )
-      async with db.execute(
-          "SELECT win_streak, loss_streak, guaranteed FROM roulette_state"
-          " WHERE user_id = ?",
-          (user_id,),
-      ) as c:
-        ws, ls, g = await c.fetchone()
-      win, ws, ls, g = roulette_decide(ws, ls, g, bet, random.random() < 0.5)
       await db.execute(
-          "UPDATE roulette_state SET win_streak = ?, loss_streak = ?,"
-          " guaranteed = ? WHERE user_id = ?",
-          (ws, ls, g, user_id),
+          "UPDATE roulette_state SET games = COALESCE(games, 0) + 1,"
+          " wins = COALESCE(wins, 0) + ? WHERE user_id = ?",
+          (1 if win else 0, user_id),
       )
       if win:
         await db.execute(
@@ -3346,15 +3556,9 @@ async def roulette_new(callback: CallbackQuery, state: FSMContext):
   await callback.message.answer(await roulette_intro_text(callback.from_user.id))
 
 
-# --- ГЛОБАЛЬНЫЙ ЛОВЕЦ ОШИБОК ---
-
-
 @router.errors()
 async def global_error_handler(event: ErrorEvent):
   logging.exception("Необработанная ошибка: %s", event.exception)
-
-
-# --- ФОНОВЫЕ ЗАДАЧИ ---
 
 
 async def weekly_reset_loop(bot: Bot):
@@ -3362,17 +3566,7 @@ async def weekly_reset_loop(bot: Bot):
     await asyncio.sleep(604800)
     try:
       async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            """
-            SELECT u.user_id, COUNT(r.user_id) as ref_count
-            FROM users u
-            JOIN users r ON r.referrer_id = u.user_id
-            GROUP BY u.user_id
-            HAVING ref_count > 0
-            ORDER BY ref_count DESC
-            LIMIT 1
-            """
-        ) as cursor:
+        async with db.execute(REF_TOP_SQL, (1,)) as cursor:
           winner = await cursor.fetchone()
 
         if winner:
@@ -3398,7 +3592,11 @@ async def weekly_reset_loop(bot: Bot):
           except Exception:
             pass
 
-        await db.execute("UPDATE users SET referrer_id = 0, ref_activated = 1")
+        await db.execute(
+            "UPDATE users SET referrer_id = 0, ref_income = 0"
+            " WHERE ref_activated = 1"
+        )
+        await db.execute("UPDATE users SET ref_extra = 0")
         await db.commit()
 
       try:
