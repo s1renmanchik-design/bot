@@ -122,7 +122,13 @@ async def init_db():
             premium_expires TEXT DEFAULT NULL,
             warns INTEGER DEFAULT 0,
             banned_until TEXT DEFAULT NULL,
-            ban_reason TEXT DEFAULT NULL
+            ban_reason TEXT DEFAULT NULL,
+            ref_joined_at TEXT DEFAULT NULL,
+            notify_lottery INTEGER DEFAULT 1,
+            aura_type TEXT DEFAULT NULL,
+            aura_name TEXT DEFAULT NULL,
+            aura_percent INTEGER DEFAULT 0,
+            aura_expires TEXT DEFAULT NULL
         );
     """
     )
@@ -222,6 +228,12 @@ async def init_db():
             "ban_reason": "TEXT DEFAULT NULL",
             "exchanges": "INTEGER DEFAULT 0",
             "restricted_until": "TEXT DEFAULT NULL",
+            "ref_joined_at": "TEXT DEFAULT NULL",
+            "notify_lottery": "INTEGER DEFAULT 1",
+            "aura_type": "TEXT DEFAULT NULL",
+            "aura_name": "TEXT DEFAULT NULL",
+            "aura_percent": "INTEGER DEFAULT 0",
+            "aura_expires": "TEXT DEFAULT NULL",
         },
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
@@ -295,6 +307,32 @@ class GiveTokensState(StatesGroup):
 
 
 router = Router()
+
+
+# --- ПРОВЕРКА И СБРОС ПРОСРОЧЕННЫХ АУР ---
+
+async def get_user_aura(user_id: int):
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT aura_type, aura_name, aura_percent, aura_expires FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      row = await cur.fetchone()
+    if not row or not row[0] or not row[3]:
+      return None
+    try:
+      exp = datetime.datetime.strptime(row[3], DT_FORMAT)
+      if exp <= datetime.datetime.now():
+        # Аура истекла, стираем
+        await db.execute(
+            "UPDATE users SET aura_type = NULL, aura_name = NULL, aura_percent = 0, aura_expires = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
+        return None
+      return {"type": row[0], "name": row[1], "percent": row[2], "expires": exp}
+    except Exception:
+      return None
 
 
 # --- БАНЫ, ПРЕДУПРЕЖДЕНИЯ И ПРИЧИНЫ ---
@@ -711,7 +749,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
     return f"❌ Ошибка обработки: {esc(e)}"
 
 
-# --- ЛОТЕРЕЯ ---
+# --- ЛОТЕРЕЯ (с учетом ауры) ---
 
 
 def roll_lottery_params():
@@ -738,27 +776,37 @@ async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
       f"⏱ Длится {LOTTERY_HOURS} ч."
   )
   async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT user_id, banned_until FROM users") as cur:
+    async with db.execute("SELECT user_id, banned_until, COALESCE(notify_lottery, 1) FROM users") as cur:
       rows = await cur.fetchall()
   now = datetime.datetime.now()
-  for uid, banned_until in rows:
+  for uid, banned_until, notify in rows:
+    if notify == 0:
+      continue
     if banned_until:
       try:
         if datetime.datetime.strptime(banned_until, DT_FORMAT) > now:
           continue
       except Exception:
         pass
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Участвовать", callback_data="lottery_open")],
+            [InlineKeyboardButton(text="🔕 Отключить уведомления", callback_data="lottery_toggle_notify")]
+        ]
+    )
     try:
-      await bot.send_message(uid, text, reply_markup=lottery_join_keyboard())
+      await bot.send_message(uid, text, reply_markup=kb)
     except Exception:
       pass
     await asyncio.sleep(0.05)
 
 
-def lottery_join_keyboard() -> InlineKeyboardMarkup:
+def lottery_join_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
+  toggle_text = "🔕 Отключить уведомления" if user_notify == 1 else "🔔 Включить уведомления"
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="🎰 Участвовать", callback_data="lottery_open")]
+          [InlineKeyboardButton(text="🎰 Участвовать", callback_data="lottery_open")],
+          [InlineKeyboardButton(text=toggle_text, callback_data="lottery_toggle_notify")]
       ]
   )
 
@@ -802,14 +850,12 @@ async def lottery_stats(db, rnd) -> dict:
   return {"players": players, "pool": pool, "total": total, "cost": cost}
 
 
-def lottery_again_keyboard() -> InlineKeyboardMarkup:
+def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
+  toggle_text = "🔕 Отключить уведомления" if user_notify == 1 else "🔔 Включить уведомления"
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="🎰 Попытать удачу ещё раз", callback_data="lottery_open"
-              )
-          ]
+          [InlineKeyboardButton(text="🎰 Попытать удачу ещё раз", callback_data="lottery_open")],
+          [InlineKeyboardButton(text=toggle_text, callback_data="lottery_toggle_notify")]
       ]
   )
 
@@ -831,6 +877,11 @@ async def build_lottery_view(user_id: int):
         (round_id, user_id),
     ) as cur:
       joined = await cur.fetchone() is not None
+    async with db.execute(
+        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      urow = await cur.fetchone()
+      user_notify = urow[0] if urow else 1
   cost = st["cost"]
 
   text = (
@@ -850,8 +901,16 @@ async def build_lottery_view(user_id: int):
           else "Участие бесплатное."
       )
   )
+  
+  toggle_text = "🔕 Отключить уведомления" if user_notify == 1 else "🔔 Включить уведомления"
+  
   if joined:
-    return text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!", None
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data="lottery_toggle_notify")]
+        ]
+    )
+    return text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!", keyboard
 
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -864,10 +923,36 @@ async def build_lottery_view(user_id: int):
                   ),
                   callback_data=f"lottery_join_{round_id}_{cost}",
               )
-          ]
+          ],
+          [InlineKeyboardButton(text=toggle_text, callback_data="lottery_toggle_notify")]
       ]
   )
   return text, keyboard
+
+
+@router.callback_query(F.data == "lottery_toggle_notify")
+async def lottery_toggle_notify(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    current = row[0] if row else 1
+    new_val = 0 if current == 1 else 1
+    await db.execute(
+        "UPDATE users SET notify_lottery = ? WHERE user_id = ?", (new_val, user_id)
+    )
+    await db.commit()
+
+  status_str = "отключены 🔕" if new_val == 0 else "включены 🔔"
+  await callback.answer(f"Уведомления о крупных лотереях {status_str}!", show_alert=True)
+  
+  try:
+    text, kb = await build_lottery_view(user_id)
+    await callback.message.edit_text(text, reply_markup=kb)
+  except Exception:
+    pass
 
 
 async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
@@ -899,6 +984,10 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
         )
       await db.commit()
       for uid in players:
+        async with aiosqlite.connect(DB_NAME) as udb:
+          async with udb.execute("SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?", (uid,)) as c:
+            urow = await c.fetchone()
+            unotify = urow[0] if urow else 1
         try:
           await bot.send_message(
               uid,
@@ -910,7 +999,7 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
                   else ""
               )
               + "\n\nХотите ещё попытать удачу?",
-              reply_markup=lottery_again_keyboard(),
+              reply_markup=lottery_again_keyboard(unotify),
           )
         except Exception:
           pass
@@ -918,7 +1007,18 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
       return
 
     prize = prize + sum(fee_to_prize(v) for v in paid_map.values())
-    winner = random.choice(players) if players else None
+    
+    # Расчет победителя с учетом ауры типа "lottery"
+    weights = []
+    for uid in players:
+      weight = 1.0
+      aura = await get_user_aura(uid)
+      if aura and aura["type"] == "lottery":
+        weight += (aura["percent"] / 100.0)
+      weights.append(weight)
+    
+    winner = random.choices(players, weights=weights, k=1)[0] if players else None
+    
     if winner is not None:
       await db.execute(
           """
@@ -931,20 +1031,24 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
       await db.commit()
 
   for uid in players:
+    async with aiosqlite.connect(DB_NAME) as udb:
+      async with udb.execute("SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?", (uid,)) as c:
+        urow = await c.fetchone()
+        unotify = urow[0] if urow else 1
     try:
       if uid == winner:
         await bot.send_message(
             uid,
             f"🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено:"
             f" <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?",
-            reply_markup=lottery_again_keyboard(),
+            reply_markup=lottery_again_keyboard(unotify),
         )
       else:
         await bot.send_message(
             uid,
             "😔 В этот раз удача была не на твоей стороне. Победитель уже"
             " получил приз.\n\nХотите ещё попытать удачу?",
-            reply_markup=lottery_again_keyboard(),
+            reply_markup=lottery_again_keyboard(unotify),
         )
     except Exception:
       pass
@@ -1079,6 +1183,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
     if potential_ref != user_id:
       referrer_id = potential_ref
 
+  now_str = datetime.datetime.now().strftime(DT_FORMAT)
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
         "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
@@ -1089,8 +1194,8 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       ref_to_save = referrer_id if referrer_id else 0
       await db.execute(
           "INSERT INTO users (user_id, tokens, is_premium, bought_folders,"
-          " referrer_id, ref_activated) VALUES (?, 0, 0, 0, ?, 0)",
-          (user_id, ref_to_save),
+          " referrer_id, ref_activated, ref_joined_at) VALUES (?, 0, 0, 0, ?, 0, ?)",
+          (user_id, ref_to_save, now_str),
       )
       await db.commit()
 
@@ -1121,14 +1226,70 @@ async def cmd_promocode(
   await state.set_state(PromocodeState.code)
 
 
-# --- АДМИН-КОМАНДЫ (включая /uref и /check) ---
+# --- АДМИН-КОМАНДЫ (включая /aura, /uref и /check) ---
 
 
-def parse_args(command: CommandObject, count: int):
+@router.message(Command("aura"))
+async def cmd_aura(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  
   parts = (command.args or "").split()
-  if len(parts) < count:
-    return None
-  return parts
+  if len(parts) >= 1 and parts[0].lower() == "del" and len(parts) == 2 and parts[1].isdigit():
+    target_id = int(parts[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+      await db.execute(
+          "UPDATE users SET aura_type = NULL, aura_name = NULL, aura_percent = 0, aura_expires = NULL WHERE user_id = ?",
+          (target_id,),
+      )
+      await db.commit()
+    await message.answer(f"✅ У пользователя <code>{target_id}</code> успешно аннулирована аура.")
+    return
+
+  # Использование: /aura add [ID] [lottery/roulette/shop] [процент] [дни] [Название]
+  if len(parts) >= 5 and parts[0].lower() == "add" and parts[1].isdigit() and parts[3].isdigit() and parts[4].isdigit():
+    target_id = int(parts[1])
+    aura_type = parts[2].lower()
+    if aura_type not in ("lottery", "roulette", "shop"):
+      await message.answer("❌ Неверный тип ауры! Доступно: <code>lottery</code>, <code>roulette</code>, <code>shop</code>")
+      return
+    percent = int(parts[3])
+    days = int(parts[4])
+    aura_name = " ".join(parts[5:])
+    if not aura_name:
+      await message.answer("❌ Укажите название ауры!")
+      return
+
+    expires_at = datetime.datetime.now() + datetime.timedelta(days=days)
+    expires_str = expires_at.strftime(DT_FORMAT)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+      await ensure_user(db, target_id)
+      await db.execute(
+          "UPDATE users SET aura_type = ?, aura_name = ?, aura_percent = ?, aura_expires = ? WHERE user_id = ?",
+          (aura_type, aura_name, percent, expires_str, target_id),
+      )
+      await db.commit()
+
+    await message.answer(
+        f"✨ <b>Аура успешно выдана!</b>\n\n"
+        f"🆔 Пользователь: <code>{target_id}</code>\n"
+        f"🏷 Название: <b>{esc(aura_name)}</b>\n"
+        f"⚙️ Тип: <code>{aura_type}</code>\n"
+        f"📊 Бонус: <b>{percent}%</b>\n"
+        f"⏱ Срок: <b>{days} дн.</b> (до {expires_at.strftime('%d.%m.%Y %H:%M')})"
+    )
+    return
+
+  await message.answer(
+      "ℹ️ <b>Управление аурами:</b>\n\n"
+      "1️⃣ Выдать ауру:\n"
+      "<code>/aura add [ID] [lottery/roulette/shop] [процент] [дни] [Название]</code>\n"
+      "<i>Пример: <code>/aura add 5681420389 lottery 15 7 Удача Бога</code></i>\n\n"
+      "2️⃣ Удалить ауру:\n"
+      "<code>/aura del [ID]</code>"
+  )
 
 
 REF_TOP_SQL = """
@@ -1241,7 +1402,7 @@ async def cmd_uref(message: Message, command: CommandObject):
     return
   usage = (
       "ℹ️ Рефералы:\n"
-      "<code>/uref [ID]</code> — список рефералов и доход\n"
+      "<code>/uref [ID]</code> — список рефералов, время входа и доход\n"
       "<code>/uref add [ID] [число]</code> — добавить рефералов"
       f" (+{REF_BONUS} токенов за каждого)\n"
       "<code>/uref del [ID] [число]</code> — убрать N рефералов и забрать"
@@ -1254,24 +1415,26 @@ async def cmd_uref(message: Message, command: CommandObject):
     async with aiosqlite.connect(DB_NAME) as db:
       active, pending, extra, income = await ref_summary(db, target_id)
       async with db.execute(
-          "SELECT user_id, ref_activated, COALESCE(ref_income, 0) FROM users"
+          "SELECT user_id, ref_activated, COALESCE(ref_income, 0), ref_joined_at FROM users"
           " WHERE referrer_id = ? ORDER BY ref_activated DESC, user_id DESC"
           " LIMIT 20",
           (target_id,),
       ) as c:
         rows = await c.fetchall()
-    lines = "\n".join(
-        f"• <code>{rid}</code> — "
-        + ("✅" if act else "⏳ не подписан")
-        + f", принёс {inc}"
-        for rid, act, inc in rows
-    ) or "— нет —"
+    
+    lines = []
+    for rid, act, inc, joined_at in rows:
+      time_str = f" [{joined_at}]" if joined_at else ""
+      status = "✅" if act else "⏳ не подписан"
+      lines.append(f"• <code>{rid}</code> — {status}{time_str}, принёс {inc}")
+    
+    lines_str = "\n".join(lines) or "— нет —"
     await message.answer(
         f"👥 <b>Рефералы ID</b> <code>{target_id}</code>\n"
         f"✅ Засчитано: <b>{active + extra}</b>"
         f" (из них добавлено админом: {extra})\n"
         f"⏳ Не подписались: <b>{pending}</b>\n"
-        f"💰 Доход с рефералов: <b>{income}</b> токенов\n\n{lines}"
+        f"💰 Доход с рефералов: <b>{income}</b> токенов\n\n{lines_str}"
     )
     return
 
@@ -1352,6 +1515,9 @@ async def cmd_check(message: Message, command: CommandObject):
   else:
     prem = "❌ нет"
 
+  aura = await get_user_aura(target_id)
+  aura_info = f"✨ {aura['name']} ({aura['type']}, {aura['percent']}%) до {aura['expires'].strftime('%d.%m.%Y %H:%M')}" if aura else "❌ нет"
+
   def until_text(value):
     dt = parse_dt(value)
     if not dt or dt <= now:
@@ -1375,6 +1541,7 @@ async def cmd_check(message: Message, command: CommandObject):
       f"🔎 <b>Аккаунт</b> <code>{target_id}</code>\n\n"
       f"🪙 Токены: <b>{u['tokens'] or 0}</b>\n"
       f"👑 Премиум: {prem}\n"
+      f"✨ Аура: {aura_info}\n"
       f"📦 Куплено фулов: {u['bought_folders'] or 0}\n"
       f"⚠️ Предупреждения: {u['warns'] or 0}/{MAX_WARNS}\n"
       f"🚫 Бан: {ban_info}\n"
@@ -1394,7 +1561,7 @@ async def cmd_check(message: Message, command: CommandObject):
   )
 
 
-@router.message(Command("premium"))
+@router.message(Command("premium", "p"))
 async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
@@ -1402,20 +1569,19 @@ async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
 
   args = (command.args or "").split()
   if (
-      len(args) < 3
-      or args[0].lower() != "add"
+      len(args) < 2
+      or not args[0].isdigit()
       or not args[1].isdigit()
-      or not args[2].isdigit()
-      or int(args[1]) <= 0
+      or int(args[0]) <= 0
   ):
     await message.answer(
-        "ℹ️ Использование:\n<code>/premium add [дни] [ID]</code>\n"
-        "Пример: <code>/premium add 30 5681420389</code>"
+        "ℹ️ Использование:\n<code>/p [дни] [ID]</code> или <code>/premium add [дни] [ID]</code>\n"
+        "Пример: <code>/p 30 5681420389</code>"
     )
     return
 
-  days = int(args[1])
-  target_id = int(args[2])
+  days = int(args[0])
+  target_id = int(args[1])
 
   try:
     new_expire = await grant_premium(target_id, days)
@@ -1441,7 +1607,7 @@ async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
     pass
 
 
-@router.message(Command("token", "tokens"))
+@router.message(Command("token", "tokens", "t"))
 async def cmd_token(message: Message, command: CommandObject, bot: Bot):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
@@ -1449,20 +1615,19 @@ async def cmd_token(message: Message, command: CommandObject, bot: Bot):
 
   args = (command.args or "").split()
   if (
-      len(args) < 3
-      or args[0].lower() != "add"
+      len(args) < 2
+      or not args[0].isdigit()
       or not args[1].isdigit()
-      or not args[2].isdigit()
-      or int(args[1]) <= 0
+      or int(args[0]) <= 0
   ):
     await message.answer(
-        "ℹ️ Использование:\n<code>/token add [сколько] [ID]</code>\n"
-        "Пример: <code>/token add 50 5681420389</code>"
+        "ℹ️ Использование:\n<code>/t [сколько] [ID]</code> или <code>/token add [сколько] [ID]</code>\n"
+        "Пример: <code>/t 50 5681420389</code>"
     )
     return
 
-  amount = int(args[1])
-  target_id = int(args[2])
+  amount = int(args[0])
+  target_id = int(args[1])
 
   try:
     await grant_tokens(target_id, amount)
@@ -1887,6 +2052,14 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       except Exception:
         prem_status = "✅ Активна"
 
+    # Проверка ауры
+    aura = await get_user_aura(user_id)
+    if aura:
+      aura_days = (aura["expires"] - datetime.datetime.now()).days
+      aura_status = f"✨ <b>{esc(aura['name'])}</b> ({aura['percent']}% бонусов, ещё {aura_days} дн.)"
+    else:
+      aura_status = "❌ Нет"
+
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1900,6 +2073,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
         f"💲 Баланс: {tokens if tokens is not None else 0} токенов\n"
         f"👑 Премиум-подписка: {prem_status}\n"
+        f"✨ Активная аура: {aura_status}\n"
         f"📦 Собрано фулов: {bought} шт.\n"
         f"⚠️ Предупреждения: {warns or 0}/{MAX_WARNS}\n"
         f"🔄 Обменов проведено: {exchanges}"
@@ -2561,9 +2735,20 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       await callback.answer()
       return
 
-    final_price = (
-        max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
-    )
+    # Стандартная или первая цена со скидкой 80%
+    if buyers_count == 0:
+      final_price = max(1, int(base_price * 0.2))
+    else:
+      final_price = base_price
+
+    # Проверка ауры магазина ("shop")
+    aura = await get_user_aura(user_id)
+    aura_discount_text = ""
+    if aura and aura["type"] == "shop":
+      discount_percent = aura["percent"]
+      discounted = int(round(final_price * (1 - discount_percent / 100.0)))
+      final_price = max(1, discounted)
+      aura_discount_text = f"\n✨ Применена аура «{esc(aura['name'])}» (-{discount_percent}%)!"
 
     if tokens < final_price:
       await callback.answer(
@@ -2613,14 +2798,17 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
   if buyers_count == 0:
     text = (
         f"🎉 Поздравляем! Ты первый покупатель фулла {esc(title)}!\n🔥"
-        f" Применилась скидка 80%!\nСписано: {final_price} токенов.\n💲 Ваш"
+        f" Применилась скидка 80%!"
+        f"{aura_discount_text}\n"
+        f"Списано: {final_price} токенов.\n💲 Ваш"
         f" остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание"
         f" (нажми, чтобы показать):\n{hidden_link(link)}"
     )
   else:
     text = (
-        f"✅ Спасибо за покупку фула {esc(title)}!\n💰 Списано:"
-        f" {final_price} токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя"
+        f"✅ Спасибо за покупку фула {esc(title)}!"
+        f"{aura_discount_text}\n"
+        f"💰 Списано: {final_price} токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя"
         f" ссылка на скачивание (нажми, чтобы показать):\n{hidden_link(link)}"
     )
 
@@ -2787,14 +2975,14 @@ EX_PAGE_SIZE = 5
 EX_SEARCH = {}
 LINK_RE = re.compile(r"^(https://mega\.nz/(file|folder)/\S+|https://cloud\.mail\.ru/\S+)$", re.I)
 LINK_RULE = (
-    "⚠️ <b>Ссылка обязана быть рабочей!</b> Поддерживаются:\n"
+    "⚠️ <b>Ссылка с фуллом обязана быть рабочей!</b> Поддерживаются:\n"
     "• <code>https://mega.nz/file/...</code>\n"
     "• <code>https://mega.nz/folder/...</code>\n"
     "• <code>https://cloud.mail.ru/...</code>"
 )
 LINK_ERROR = (
     "❌ Ссылка не подходит. Она должна быть с <b>mega.nz</b> (файл/папка) "
-    "или <b>cloud.mail.ru</b>. Отправь ещё раз."
+    "или <b>cloud.mail.ru</b>. Не знаешь как в Mega.nz кидать видео? Зайди на сайт, Кинь туда свое видео(фулл), И там найдешь где скопировать ссылку Отправь ещё раз."
 )
 
 
@@ -3103,16 +3291,23 @@ async def ex_search_do(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("ex:view:"))
 async def ex_view(callback: CallbackQuery):
   offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
   o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
   if not o or o["status"] != "open":
     await callback.answer("Этот обмен уже недоступен.", show_alert=True)
     return
+  
   text = (
       f"🔄 <b>Обмен #{o['id']}</b>\nОтдаёт: <b>{esc(o['give'])}</b>\nХочет:"
-      f" <b>{esc(o['want'])}</b>\nОбменщик ID: <code>{o['owner_id']}</code>\n"
-      f"Стоимость обмена: {EXCHANGE_COST} токен"
+      f" <b>{esc(o['want'])}</b>\nОбменщик ID: <code>{o['owner_id']}</code>"
   )
-  if o["owner_id"] == callback.from_user.id:
+  
+  if uid == ADMIN_ID:
+    text += f"\n🔗 Ссылка владельца (админ-доступ): {esc(o['owner_link'])}"
+
+  text += f"\nСтоимость обмена: {EXCHANGE_COST} токен"
+
+  if o["owner_id"] == uid:
     kb = ex_kb([[("🗑 Удалить", f"ex:del:{offer_id}")], [("⬅️ Назад", "ex:list:0")]])
   else:
     kb = ex_kb([
@@ -3390,7 +3585,7 @@ async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Не доставлено (человек заблокировал бота).")
 
 
-# --- РУЛЕТКА 50/50 (с балансиром) ---
+# --- РУЛЕТКА 50/50 (с балансиром и аурой) ---
 
 ROULETTE_MIN = 2
 ROULETTE_MAX = 10
@@ -3401,10 +3596,12 @@ class RouletteState(StatesGroup):
   bet = State()
 
 
-def roulette_decide(current_tokens: int, roll_win: bool) -> bool:
-  """Честный рандом 50/50, но если баланс игрока >= 30 токенов, скрытно душим."""
+def roulette_decide(current_tokens: int, roll_win: bool, aura_percent: int) -> bool:
+  # Если у чела аура рулетки, повышаем шанс победы на aura_percent
+  if aura_percent > 0:
+    roll_win = random.random() < (0.50 + (aura_percent / 100.0))
+  
   if current_tokens >= 30:
-    # 70% шанс проигрыша для тех, кто слишком много выиграл
     return random.random() < 0.30
   return roll_win
 
@@ -3426,7 +3623,6 @@ async def roulette_play(user_id: int, bet: int) -> dict:
           row = await c.fetchone()
         return {"error": "balance", "balance": row[0] if row else 0}
 
-      # Узнаем текущий баланс для скрытого балансира
       async with db.execute(
           "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?",
           (user_id,),
@@ -3434,8 +3630,11 @@ async def roulette_play(user_id: int, bet: int) -> dict:
         row_bal = await c.fetchone()
       current_bal = row_bal[0] if row_bal else 0
 
-      # Применяем честный рандом со скрытым балансиром
-      win = roulette_decide(current_bal, random.random() < 0.5)
+      # Проверка ауры рулетки
+      aura = await get_user_aura(user_id)
+      aura_percent = aura["percent"] if (aura and aura["type"] == "roulette") else 0
+
+      win = roulette_decide(current_bal, random.random() < 0.5, aura_percent)
 
       await db.execute(
           "INSERT OR IGNORE INTO roulette_state (user_id) VALUES (?)",
