@@ -2975,14 +2975,14 @@ EX_PAGE_SIZE = 5
 EX_SEARCH = {}
 LINK_RE = re.compile(r"^(https://mega\.nz/(file|folder)/\S+|https://cloud\.mail\.ru/\S+)$", re.I)
 LINK_RULE = (
-    "⚠️ <b>Ссылка с фуллом обязана быть рабочей!</b> Поддерживаются:\n"
+    "⚠️ <b>Ссылка обязана быть рабочей!</b> Поддерживаются:\n"
     "• <code>https://mega.nz/file/...</code>\n"
     "• <code>https://mega.nz/folder/...</code>\n"
     "• <code>https://cloud.mail.ru/...</code>"
 )
 LINK_ERROR = (
     "❌ Ссылка не подходит. Она должна быть с <b>mega.nz</b> (файл/папка) "
-    "или <b>cloud.mail.ru</b>. Не знаешь как в Mega.nz кидать видео? Зайди на сайт, Кинь туда свое видео(фулл), И там найдешь где скопировать ссылку Отправь ещё раз."
+    "или <b>cloud.mail.ru</b>. Отправь ещё раз."
 )
 
 
