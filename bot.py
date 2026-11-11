@@ -1174,6 +1174,41 @@ async def cmd_check(message: Message, command: CommandObject):
         (target_id,),
     ) as c:
       lot_n, lot_paid = await c.fetchone()
+@router.message(Command("check"))
+async def cmd_check(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+
+  args = (command.args or "").strip()
+  if not args:
+    parts = (message.text or "").split()
+    if len(parts) > 1:
+      args = parts[1]
+
+  if not args.isdigit():
+    await message.answer("ℹ️ Использование:\n<code>/check [ID]</code>")
+    return
+
+  target_id = int(args)
+  now = datetime.datetime.now()
+  async with aiosqlite.connect(DB_NAME) as db:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+        "SELECT * FROM users WHERE user_id = ?", (target_id,)
+    ) as c:
+      u = await c.fetchone()
+    if not u:
+      await message.answer("❌ Пользователь не найден в базе.")
+      return
+
+    active, pending, extra, income = await ref_summary(db, target_id)
+    async with db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(COALESCE(paid, 0)), 0)"
+        " FROM lottery_participants WHERE user_id = ?",
+        (target_id,),
+    ) as c:
+      lot_n, lot_paid = await c.fetchone()
     async with db.execute(
         "SELECT COALESCE(games, 0), COALESCE(wins, 0) FROM roulette_state"
         " WHERE user_id = ?",
@@ -1587,7 +1622,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       up_id, title, price, amount = up
       kb_buttons.append([
           InlineKeyboardButton(
-              text=f"💎 {title} — {price} у.т. (осталось: {amount})",
+              text=f"💎 {title} — {price} токенов (осталось: {amount})",
               callback_data=f"ubuy_{up_id}",
           )
       ])
@@ -1615,11 +1650,24 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
   elif text == "🪙 Как получить токены?":
     tokens_text = (
-        "Как получить токены?\n\n"
-        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n"
-        "2. Оставляйте в комментариях под постами.\n"
-        "3. Отправляйте скриншоты в директ канала.\n\n"
-        "💰 1 отправка фото = 1 токен!"
+        "<b>Как получить токены?</b>\n\n"
+        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
+        "2. Оставляйте в комментариях под постами/ответами другим людям.\n\n"
+        "3. Отправляйте доказательства (скриншоты) в директ канала."
+        " https://t.me/JmcDeveloper?direct\n\n"
+        "<b>ГЛАВНОЕ:</b> тема видео должна касаться по типу сестры и брата и"
+        " т.д.\n\n"
+        "💰 1 отправка фото в комментариях = 1 токен!\n\n"
+        "📖 <b>ДЕТАЛЬНО РАСПИСАЛ ТУТ:</b> https://t.me/JmcDeveloper/18\n"
+        "<i>(и могу не выдать некоторые токены если не посмотрите 👆)</i>\n\n"
+        "-----------------------------------\n\n"
+        "💎 <b>Как получить УНИКАЛЬНЫЕ токены?</b>\n"
+        "Его только можно купить, <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
+        "<b>Как купить?</b> Кинуть любой подарок со стоимостью 15 звёзд на аккаунт"
+        " @ucu52\n\n"
+        "<b>Преимущества:</b>\n"
+        "1. Там выходят фулы на 1 день позже чем в стандартный магазин.\n"
+        "2. Там уникальные товары по типу ауры и так далее"
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -1635,18 +1683,24 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         ]
     )
     prem_text = (
-        "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n\n"
-        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно!\n\n"
-        "💳 <b>Способ 1:</b> 50 Звезд (любым подарком на профиль @ucu52).\n\n"
-        "📸 <b>Способ 2 (за 100 фото):</b>\n"
-        "Вы можете получить премиум бесплатно за 100 уникальных фоток! "
+        "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n"
+        "<b>Преимущества:</b>\n"
+        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно c обычного"
+        " магазина!\n\n"
+        "💳 <b>Способ 1:</b> Купить | Заплатить 50 Звезд\n"
+        "(любым подарком на профиль @ucu52)\n\n"
+        "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 Фото в коментарии в тт\n"
+        "подробнее про фото и что делать: https://t.me/JmcDeveloper/18\n\n"
+        "Вы можете получить премиум бесплатно за 100 фото в коменты!\n"
         "<i>Если была хотя бы одна фото дублирована или уже принята как Токен —"
         " подписка не выдается.</i>\n"
         "Если вы сделали все хорошо, отправляйте сюда:"
-        " https://t.me/JmcDeveloper?direct <b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ"
-        " ПОДПИСКИ)</b>"
+        " https://t.me/JmcDeveloper?direct\n"
+        "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
     )
-    await message.answer(prem_text, reply_markup=keyboard)
+    await message.answer(
+        prem_text, reply_markup=keyboard, disable_web_page_preview=True
+    )
 
   elif text == "🎰 Лотерея":
     lottery_text, lottery_kb = await build_lottery_view(user_id)
@@ -2218,8 +2272,7 @@ async def ex_new(callback: CallbackQuery, state: FSMContext):
     return
   await state.set_state(NewOfferState.give)
   await ex_show(
-      callback, "Что вы <b>отдаете</b>?", ex_kb([[("❌ Отмена", "ex:cancel")]])
-  )
+      callback, "Что вы <b>отдаете</b>?", ex_kb([[("❌ Отмена", "ex:cancel")]]))
   await callback.answer()
 
 
