@@ -41,6 +41,8 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO)
 
+_bg_tasks = set()
+
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
   sys.exit("Не задана переменная окружения TOKEN")
