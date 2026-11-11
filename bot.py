@@ -105,6 +105,7 @@ async def init_db():
             user_id INTEGER PRIMARY KEY,
             tokens INTEGER DEFAULT 0,
             y_tokens INTEGER DEFAULT 0,
+            full_tokens INTEGER DEFAULT 0,
             is_premium INTEGER DEFAULT 0,
             bought_folders INTEGER DEFAULT 0,
             referrer_id INTEGER DEFAULT 0,
@@ -233,6 +234,7 @@ async def init_db():
         "users": {
             "tokens": "INTEGER DEFAULT 0",
             "y_tokens": "INTEGER DEFAULT 0",
+            "full_tokens": "INTEGER DEFAULT 0",
             "is_premium": "INTEGER DEFAULT 0",
             "bought_folders": "INTEGER DEFAULT 0",
             "referrer_id": "INTEGER DEFAULT 0",
@@ -330,6 +332,11 @@ class GiveYTokensState(StatesGroup):
   amount = State()
 
 
+class GiveFullTokensState(StatesGroup):
+  user_id = State()
+  amount = State()
+
+
 router = Router()
 
 
@@ -395,8 +402,8 @@ def ban_text(until: datetime.datetime, reason: str = None) -> str:
 
 async def ensure_user(db, user_id: int) -> None:
   await db.execute(
-      "INSERT INTO users (user_id, tokens, y_tokens, is_premium, bought_folders,"
-      " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 0, 0)"
+      "INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders,"
+      " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 0, 0, 0)"
       " ON CONFLICT(user_id) DO NOTHING",
       (user_id,),
   )
@@ -448,7 +455,7 @@ async def add_warn(target_id: int, reason: str = None):
       )
       await db.execute(
           "UPDATE users SET banned_until = ?, ban_reason = ?, is_premium = 0,"
-          " premium_expires = NULL, tokens = 0, y_tokens = 0 WHERE user_id = ?",
+          " premium_expires = NULL, tokens = 0, y_tokens = 0, full_tokens = 0 WHERE user_id = ?",
           (PERM_BAN, ban_msg, target_id),
       )
       banned = True
@@ -630,8 +637,8 @@ async def grant_tokens(target_id: int, amount: int) -> None:
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
         """
-        INSERT INTO users (user_id, tokens, y_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-        VALUES (?, ?, 0, 0, 0, 0, 0)
+        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
+        VALUES (?, ?, 0, 0, 0, 0, 0, 0)
         ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
         """,
         (target_id, amount, amount),
@@ -643,9 +650,22 @@ async def grant_y_tokens(target_id: int, amount: int) -> None:
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
         """
-        INSERT INTO users (user_id, tokens, y_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-        VALUES (?, 0, ?, 0, 0, 0, 0)
+        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
+        VALUES (?, 0, ?, 0, 0, 0, 0, 0)
         ON CONFLICT(user_id) DO UPDATE SET y_tokens = COALESCE(y_tokens, 0) + ?
+        """,
+        (target_id, amount, amount),
+    )
+    await db.commit()
+
+
+async def grant_full_tokens(target_id: int, amount: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        """
+        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
+        VALUES (?, 0, 0, ?, 0, 0, 0, 0)
+        ON CONFLICT(user_id) DO UPDATE SET full_tokens = COALESCE(full_tokens, 0) + ?
         """,
         (target_id, amount, amount),
     )
@@ -674,8 +694,8 @@ async def grant_premium(target_id: int, days: int) -> datetime.datetime:
     expire_str = new_expire.strftime(DT_FORMAT)
     await db.execute(
         """
-        INSERT INTO users (user_id, tokens, y_tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-        VALUES (?, 0, 0, 1, 0, 0, 0, ?)
+        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
+        VALUES (?, 0, 0, 0, 1, 0, 0, 0, ?)
         ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
         """,
         (target_id, expire_str, expire_str),
@@ -719,8 +739,8 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
       if reward_type == "tokens":
         await db.execute(
             """
-            INSERT INTO users (user_id, tokens, y_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-            VALUES (?, ?, 0, 0, 0, 0, 0)
+            INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
+            VALUES (?, ?, 0, 0, 0, 0, 0, 0)
             ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
             """,
             (user_id, val, val),
@@ -748,8 +768,8 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
         expire_str = new_expire.strftime(DT_FORMAT)
         await db.execute(
             """
-            INSERT INTO users (user_id, tokens, y_tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-            VALUES (?, 0, 0, 1, 0, 0, 0, ?)
+            INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
+            VALUES (?, 0, 0, 0, 1, 0, 0, 0, ?)
             ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
             """,
             (user_id, expire_str, expire_str),
@@ -803,9 +823,9 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
     if existing_user is None:
       ref_to_save = referrer_id if referrer_id else 0
       await db.execute(
-          "INSERT INTO users (user_id, tokens, y_tokens, is_premium,"
+          "INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium,"
           " bought_folders, referrer_id, ref_activated, ref_joined_at) VALUES"
-          " (?, 0, 0, 0, 0, ?, 0, ?)",
+          " (?, 0, 0, 0, 0, 0, ?, 0, ?)",
           (user_id, ref_to_save, now_str),
       )
       await db.commit()
@@ -1143,6 +1163,58 @@ async def cmd_ytoken(message: Message, command: CommandObject):
   )
 
 
+@router.message(Command("ftoken"))
+async def cmd_ftoken(message: Message, command: CommandObject):
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return
+  parts = (command.args or "").split()
+  if (
+      len(parts) == 3
+      and parts[0].lower() in ("add", "del")
+      and parts[1].isdigit()
+      and parts[2].isdigit()
+  ):
+    action, target_id, amount = parts[0].lower(), int(parts[1]), int(parts[2])
+    async with aiosqlite.connect(DB_NAME) as db:
+      await ensure_user(db, target_id)
+      if action == "add":
+        await db.execute(
+            "UPDATE users SET full_tokens = COALESCE(full_tokens, 0) + ? WHERE"
+            " user_id = ?",
+            (amount, target_id),
+        )
+        await db.commit()
+        await message.answer(
+            f"✅ Пользователю <code>{target_id}</code> начислено"
+            f" <b>+{amount}</b> фулловых токенов."
+        )
+        try:
+          await message.bot.send_message(
+              target_id,
+              f"🎁 Администратор начислил вам <b>+{amount}</b> фулловых"
+              " токенов!",
+          )
+        except Exception:
+          pass
+      else:
+        await db.execute(
+            "UPDATE users SET full_tokens = MAX(0, COALESCE(full_tokens, 0) - ?) WHERE"
+            " user_id = ?",
+            (amount, target_id),
+        )
+        await db.commit()
+        await message.answer(
+            f"✅ У пользователя <code>{target_id}</code> списано"
+            f" <b>{amount}</b> фулловых токенов."
+        )
+    return
+  await message.answer(
+      "ℹ️ Использование:\n<code>/ftoken add [ID] [количество]</code>\n<code>/ftoken"
+      " del [ID] [количество]</code>"
+  )
+
+
 @router.message(Command("check"))
 async def cmd_check(message: Message, command: CommandObject):
   if message.from_user.id != ADMIN_ID:
@@ -1215,6 +1287,7 @@ async def cmd_check(message: Message, command: CommandObject):
       f"🔎 <b>Аккаунт</b> <code>{target_id}</code>\n\n"
       f"🪙 Токены: <b>{u['tokens'] or 0}</b>\n"
       f"💎 Уникальные токены: <b>{u['y_tokens'] or 0}</b>\n"
+      f"📦 Фулловые токены: <b>{u.get('full_tokens', 0)}</b>\n"
       f"👑 Премиум: {prem}\n"
       f"✨ Аура: {aura_info}\n"
       f"⚠️ Предупреждения: {u['warns'] or 0}/{MAX_WARNS}\n"
@@ -1520,7 +1593,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   if text == "👤 Мой Профиль":
     async with aiosqlite.connect(DB_NAME) as db:
       async with db.execute(
-          "SELECT tokens, y_tokens, is_premium, bought_folders, premium_expires,"
+          "SELECT tokens, y_tokens, full_tokens, is_premium, bought_folders, premium_expires,"
           " warns, COALESCE(exchanges, 0) FROM users WHERE user_id = ?",
           (user_id,),
       ) as cursor:
@@ -1528,7 +1601,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
       if not user_data:
         await ensure_user(db, user_id)
-        tokens, y_tokens, is_prem, bought, prem_expires, warns, exchanges = (
+        tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns, exchanges = (
+            0,
             0,
             0,
             0,
@@ -1538,7 +1612,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
             0,
         )
       else:
-        tokens, y_tokens, is_prem, bought, prem_expires, warns, exchanges = (
+        tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns, exchanges = (
             user_data
         )
 
@@ -1585,6 +1659,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
         f"💲 Баланс токенов: {tokens if tokens is not None else 0}\n"
         f"💎 Уникальные токены: {y_tokens if y_tokens is not None else 0}\n"
+        f"📦 Фулловые токены: {full_tokens if full_tokens is not None else 0}\n"
         f"👑 Премиум-подписка: {prem_status}\n"
         f"✨ Активная аура: {aura_status}\n"
         f"📦 Собрано фулов: {bought} шт.\n"
@@ -1653,8 +1728,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     ref_text = (
         "👥 <b>Реферальная система</b>\n\nПриглашай друзей по своей ссылке:\n"
-        f"<code>{ref_link}</code>\n\n🎁 За каждого приглашенного — {REF_BONUS}"
-        " токенов!"
+        f"<code>{ref_link}</code>\n\n"
+        f"🎁 За каждого приглашенного — <b>{REF_BONUS} токенов</b>!\n"
+        "💰 А также вы получаете <b>15% дохода</b> от трат ваших рефералов токенами в обычном магазине!"
     )
     await message.answer(ref_text)
 
@@ -1774,6 +1850,12 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
             ],
             [
                 InlineKeyboardButton(
+                    text="📦 Выдать фулл. токены",
+                    callback_data="admin_give_ftokens",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="👑 Выдать Премиум",
                     callback_data="admin_give_premium",
                 )
@@ -1867,7 +1949,7 @@ async def start_add_unique_product(callback: CallbackQuery, state: FSMContext):
     return
   await state.clear()
   await callback.message.answer(
-      "💎 Введите название товара (например: Аура Оптовик):"
+      "💎 Введите название товара (например: Фулловый токен х1):"
   )
   await state.set_state(AddUniqueProduct.title)
   await callback.answer()
@@ -1901,8 +1983,7 @@ async def process_u_amount(message: Message, state: FSMContext):
     return
   await state.update_data(amount=int(text))
   await message.answer(
-      "⚙️ Введите команду/действие при покупке (например: <code>aura shop 15 30"
-      " Оптовик</code>):"
+      "⚙️ Введите команду/действие при покупке (например: <code>ftoken add {user_id} 1</code> или <code>aura shop 15 30 Оптовик</code>):"
   )
   await state.set_state(AddUniqueProduct.command)
 
@@ -1960,6 +2041,20 @@ async def start_give_ytokens(callback: CallbackQuery, state: FSMContext):
   await callback.answer()
 
 
+@router.callback_query(F.data == "admin_give_ftokens")
+async def start_give_ftokens(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await state.set_state(GiveFullTokensState.user_id)
+  await callback.message.answer(
+      "📦 Введи Telegram ID пользователя для начисления <b>фулловых"
+      " токенов</b>:"
+  )
+  await callback.answer()
+
+
 @router.callback_query(F.data == "admin_give_premium")
 async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -1993,6 +2088,16 @@ async def process_give_ytokens_id(message: Message, state: FSMContext):
   await message.answer("💎 Сколько уникальных токенов начислить?")
 
 
+@router.message(StateFilter(GiveFullTokensState.user_id))
+async def process_give_ftokens_id(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Только цифры.")
+    return
+  await state.update_data(target_id=int(message.text))
+  await state.set_state(GiveFullTokensState.amount)
+  await message.answer("📦 Сколько фулловых токенов начислить?")
+
+
 @router.message(StateFilter(GiveYTokensState.amount))
 async def process_give_ytokens_amount(message: Message, state: FSMContext):
   if not message.text.isdigit():
@@ -2005,6 +2110,22 @@ async def process_give_ytokens_amount(message: Message, state: FSMContext):
   await grant_y_tokens(target_id, amount)
   await message.answer(
       f"✅ Пользователю <code>{target_id}</code> начислено +{amount} уник."
+      " токенов."
+  )
+
+
+@router.message(StateFilter(GiveFullTokensState.amount))
+async def process_give_ftokens_amount(message: Message, state: FSMContext):
+  if not message.text.isdigit():
+    await message.answer("❌ Введите число.")
+    return
+  amount = int(message.text)
+  data = await state.get_data()
+  target_id = data["target_id"]
+  await state.clear()
+  await grant_full_tokens(target_id, amount)
+  await message.answer(
+      f"✅ Пользователю <code>{target_id}</code> начислено +{amount} фулл."
       " токенов."
   )
 
@@ -2078,16 +2199,17 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       base_price = 0
 
     async with db.execute(
-        "SELECT tokens, is_premium, referrer_id, premium_expires FROM users"
+        "SELECT tokens, full_tokens, is_premium, referrer_id, premium_expires FROM users"
         " WHERE user_id = ?",
         (user_id,),
     ) as cursor:
       u_data = await cursor.fetchone()
 
     tokens = u_data[0] if (u_data and u_data[0] is not None) else 0
-    is_prem = u_data[1] if u_data else 0
-    referrer_id = u_data[2] if u_data else 0
-    prem_expires = u_data[3] if u_data else None
+    full_tokens = u_data[1] if (u_data and u_data[1] is not None) else 0
+    is_prem = u_data[2] if u_data else 0
+    referrer_id = u_data[3] if u_data else 0
+    prem_expires = u_data[4] if u_data else None
 
     if is_prem == 1:
       await db.execute(
@@ -2102,6 +2224,157 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
       await callback.message.answer(text, disable_web_page_preview=True)
       await callback.answer()
       return
+
+    final_price = (
+        max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
+    )
+
+    aura = await get_user_aura(user_id)
+    if aura and aura["type"] == "shop":
+      discount_percent = aura["percent"]
+      final_price = max(
+          1, int(round(final_price * (1 - discount_percent / 100.0)))
+      )
+
+    # Если есть фулловые токены, спрашиваем пользователя
+    if full_tokens > 0:
+      kb = InlineKeyboardMarkup(
+          inline_keyboard=[
+              [
+                  InlineKeyboardButton(
+                      text="📦 Использовать Фулловый токен",
+                      callback_data=f"usefull_{p_id}",
+                  ),
+                  InlineKeyboardButton(
+                      text=f"🪙 Обычными ({final_price} токенов)",
+                      callback_data=f"usenorm_{p_id}",
+                  ),
+              ]
+          ]
+      )
+      await callback.message.answer(
+          f"❓ У вас есть фулловый токен. Хотите использовать Фулловый токен или обычными токенами ({final_price} шт.)?",
+          reply_markup=kb,
+      )
+      await callback.answer()
+      return
+
+    if tokens < final_price:
+      await callback.answer(
+          f"❌ Недостаточно токенов! Нужно: {final_price}.", show_alert=True
+      )
+      return
+
+    await db.execute(
+        "UPDATE users SET tokens = tokens - ?, bought_folders ="
+        " COALESCE(bought_folders, 0) + 1 WHERE user_id = ?",
+        (final_price, user_id),
+    )
+    await db.execute(
+        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
+        (p_id,),
+    )
+    
+    # Реферальный доход 15%
+    if referrer_id and referrer_id != user_id:
+      ref_bonus_tokens = max(1, int(final_price * 0.15))
+      await db.execute(
+          "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
+          (ref_bonus_tokens, referrer_id),
+      )
+      try:
+        await bot.send_message(
+            referrer_id,
+            f"💰 Ваш реферал совершил покупку в магазине!\nВам начислено <b>+{ref_bonus_tokens}</b> токенов (15% от траты).",
+        )
+      except Exception:
+        pass
+
+    await db.commit()
+
+  await callback.message.answer(
+      f"✅ Спасибо за покупку!\n\n🔗 Ссылка:\n{hidden_link(link)}",
+      disable_web_page_preview=True,
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usefull_"))
+async def process_buy_full(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  p_id = int(callback.data.split("_")[1])
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT title, link FROM products WHERE id = ?", (p_id,)
+    ) as cur:
+      prod = await cur.fetchone()
+    if not prod:
+      await callback.answer("❌ Товар не найден.", show_alert=True)
+      return
+    title, link = prod
+
+    async with db.execute(
+        "SELECT COALESCE(full_tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    ftokens = row[0] if row else 0
+
+    if ftokens <= 0:
+      await callback.answer("❌ У вас больше нет фулловых токенов.", show_alert=True)
+      return
+
+    await db.execute(
+        "UPDATE users SET full_tokens = full_tokens - 1, bought_folders = COALESCE(bought_folders, 0) + 1 WHERE user_id = ?",
+        (user_id,),
+    )
+    await db.execute(
+        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?", (p_id,)
+    )
+    await db.commit()
+
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+
+  await callback.message.answer(
+      f"✅ Успешная покупка за фулловый токен!\n\n🔗 Ссылка:\n{hidden_link(link)}",
+      disable_web_page_preview=True,
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usenorm_"))
+async def process_buy_norm(callback: CallbackQuery, bot: Bot):
+  user_id = callback.from_user.id
+  p_id = int(callback.data.split("_")[1])
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
+        (p_id,),
+    ) as cursor:
+      product = await cursor.fetchone()
+
+    if not product:
+      await callback.answer("❌ Товар удален.", show_alert=True)
+      return
+
+    title, price_raw, link, buyers_count = product
+    try:
+      base_price = int("".join(filter(str.isdigit, str(price_raw))))
+    except ValueError:
+      base_price = 0
+
+    async with db.execute(
+        "SELECT tokens, referrer_id FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+      u_data = await cursor.fetchone()
+
+    tokens = u_data[0] if (u_data and u_data[0] is not None) else 0
+    referrer_id = u_data[1] if u_data else 0
 
     final_price = (
         max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
@@ -2129,7 +2402,28 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
         "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
         (p_id,),
     )
+
+    # Реферальный доход 15%
+    if referrer_id and referrer_id != user_id:
+      ref_bonus_tokens = max(1, int(final_price * 0.15))
+      await db.execute(
+          "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
+          (ref_bonus_tokens, referrer_id),
+      )
+      try:
+        await bot.send_message(
+            referrer_id,
+            f"💰 Ваш реферал совершил покупку в магазине!\nВам начислено <b>+{ref_bonus_tokens}</b> токенов (15% от траты).",
+        )
+      except Exception:
+        pass
+
     await db.commit()
+
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
 
   await callback.message.answer(
       f"✅ Спасибо за покупку!\n\n🔗 Ссылка:\n{hidden_link(link)}",
