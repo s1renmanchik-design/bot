@@ -34,7 +34,6 @@ except ImportError:
 
 try:
   from zoneinfo import ZoneInfo
-
   LOCAL_TZ = ZoneInfo("Europe/Kyiv")
 except Exception:
   LOCAL_TZ = datetime.timezone(datetime.timedelta(hours=2))
@@ -83,9 +82,7 @@ def cost_text(cost: int) -> str:
 
 
 def lottery_min_players(prize: int) -> int:
-  return (
-      LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
-  )
+  return LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
 
 
 def hidden_link(link) -> str:
@@ -342,8 +339,7 @@ router = Router()
 async def get_user_aura(user_id: int):
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT aura_type, aura_name, aura_percent, aura_expires FROM users"
-        " WHERE user_id = ?",
+        "SELECT aura_type, aura_name, aura_percent, aura_expires FROM users WHERE user_id = ?",
         (user_id,),
     ) as cur:
       row = await cur.fetchone()
@@ -353,8 +349,7 @@ async def get_user_aura(user_id: int):
       exp = datetime.datetime.strptime(row[3], DT_FORMAT)
       if exp <= datetime.datetime.now():
         await db.execute(
-            "UPDATE users SET aura_type = NULL, aura_name = NULL, aura_percent"
-            " = 0, aura_expires = NULL WHERE user_id = ?",
+            "UPDATE users SET aura_type = NULL, aura_name = NULL, aura_percent = 0, aura_expires = NULL WHERE user_id = ?",
             (user_id,),
         )
         await db.commit()
@@ -367,8 +362,7 @@ async def get_user_aura(user_id: int):
 async def get_active_ban_info(user_id: int):
   async with aiosqlite.connect(DB_NAME) as db:
     async with db.execute(
-        "SELECT banned_until, ban_reason FROM users WHERE user_id = ?",
-        (user_id,),
+        "SELECT banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,)
     ) as cur:
       row = await cur.fetchone()
     if not row or not row[0]:
@@ -379,8 +373,7 @@ async def get_active_ban_info(user_id: int):
       return None, None
     if until <= datetime.datetime.now():
       await db.execute(
-          "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE"
-          " user_id = ?",
+          "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id = ?",
           (user_id,),
       )
       await db.commit()
@@ -433,8 +426,7 @@ async def ban_user(target_id: int, days: int, reason: str = None) -> str:
 async def unban_user(target_id: int) -> None:
   async with aiosqlite.connect(DB_NAME) as db:
     await db.execute(
-        "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id ="
-        " ?",
+        "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id = ?",
         (target_id,),
     )
     await db.commit()
@@ -789,7 +781,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
     return f"❌ Ошибка обработки: {esc(e)}"
 
 
-# --- АДМИНСКИЕ КОМАНДЫ (ПОСТАВЛЕНЫ ДО МЕНЮ!) ---
+# --- АДМИНСКИЕ КОМАНДЫ ---
 
 
 @router.message(Command("start"))
@@ -1449,7 +1441,7 @@ async def back_to_tops(callback: CallbackQuery):
   await callback.answer()
 
 
-# --- ОБРАБОТЧИК КНОПОК ГЛАВНОГО МЕНЮ (СПУЩЕН НИЖЕ КОМАНД!) ---
+# --- ОБРАБОТЧИК КНОПОК ГЛАВНОГО МЕНЮ ---
 
 
 @router.message(
@@ -2750,6 +2742,457 @@ async def roulette_new(callback: CallbackQuery, state: FSMContext):
       await roulette_intro_text(callback.from_user.id)
   )
 
+
+# --- ЛОТЕРЕЯ (ФУНКЦИИ ЦИКЛА) ---
+
+def roll_lottery_params():
+  hour = now_local().hour
+  if 1 <= hour < 8:
+    return 4, 1
+  r = random.random()
+  if r < LOTTERY_NORMAL_CHANCE:
+    return random.randint(4, 10), 0
+  if r < LOTTERY_NORMAL_CHANCE + LOTTERY_BIG_LOW_CHANCE:
+    return random.randint(11, 14), 0
+  return random.randint(15, 20), 0
+
+
+async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
+  text = (
+      "🔥 <b>Началась крупная лотерея!</b>\n\n"
+      f"🏆 Приз: <b>от {prize} токенов</b> (+ взносы участников)\n"
+      f"🎟 Участие: <b>{cost_text(cost)}</b>\n"
+      f"👥 Минимум участников: <b>{lottery_min_players(prize)}</b>\n"
+      f"⏱ Длится {LOTTERY_HOURS} ч."
+  )
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT user_id, banned_until, COALESCE(notify_lottery, 1) FROM users"
+    ) as cur:
+      rows = await cur.fetchall()
+  now = datetime.datetime.now()
+  for uid, banned_until, notify in rows:
+    if notify == 0:
+      continue
+    if banned_until:
+      try:
+        if datetime.datetime.strptime(banned_until, DT_FORMAT) > now:
+          continue
+      except Exception:
+        pass
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎰 Участвовать", callback_data="lottery_open"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔕 Отключить уведомления",
+                    callback_data="lottery_toggle_notify",
+                )
+            ],
+        ]
+    )
+    try:
+      await bot.send_message(uid, text, reply_markup=kb)
+    except Exception:
+      pass
+    await asyncio.sleep(0.05)
+
+
+async def create_lottery_round(bot: Bot = None) -> None:
+  prize, fixed = roll_lottery_params()
+  cost = 1 if fixed else lottery_cost_for_total(prize)
+  ends_at = datetime.datetime.now() + datetime.timedelta(hours=LOTTERY_HOURS)
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        "INSERT INTO lottery_rounds (entry_cost, prize, ends_at, finished,"
+        " cost_fixed) VALUES (?, ?, ?, 0, ?)",
+        (cost, prize, ends_at.strftime(DT_FORMAT), fixed),
+    )
+    await db.commit()
+  if bot is not None and prize >= LOTTERY_NOTIFY_PRIZE:
+    task = asyncio.create_task(notify_big_lottery(bot, cost, prize))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def get_current_round():
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0)"
+        " FROM lottery_rounds WHERE finished = 0 ORDER BY id DESC LIMIT 1"
+    ) as cur:
+      return await cur.fetchone()
+
+
+async def lottery_stats(db, rnd) -> dict:
+  round_id, entry_cost, prize, _, fixed = rnd
+  async with db.execute(
+      "SELECT COUNT(*), COALESCE(SUM((COALESCE(paid, ?) + 1) / 2), 0)"
+      " FROM lottery_participants WHERE round_id = ?",
+      (entry_cost, round_id),
+  ) as cur:
+    players, pool = await cur.fetchone()
+  total = prize + pool
+  cost = entry_cost if fixed else lottery_cost_for_total(total)
+  return {"players": players, "pool": pool, "total": total, "cost": cost}
+
+
+def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
+  toggle_text = (
+      "🔕 Отключить уведомления"
+      if user_notify == 1
+      else "🔔 Включить уведомления"
+  )
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="🎰 Попытать удачу ещё раз",
+                  callback_data="lottery_open",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text=toggle_text, callback_data="lottery_toggle_notify"
+              )
+          ],
+      ]
+  )
+
+
+async def build_lottery_view(user_id: int):
+  rnd = await get_current_round()
+  if not rnd:
+    return "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", None
+
+  round_id, _, prize, ends_at_str, fixed = rnd
+  ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+  left_min = max(
+      0, int((ends_at - datetime.datetime.now()).total_seconds() // 60)
+  )
+  hours, minutes = divmod(left_min, 60)
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    st = await lottery_stats(db, rnd)
+    async with db.execute(
+        "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
+        (round_id, user_id),
+    ) as cur:
+      joined = await cur.fetchone() is not None
+    async with db.execute(
+        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      urow = await cur.fetchone()
+      user_notify = urow[0] if urow else 1
+  cost = st["cost"]
+
+  text = (
+      "🎰 <b>Лотерея</b>\n\n"
+      f"🏆 Приз: <b>{st['total']} токенов</b>"
+      f" ({prize} + {st['pool']} от взносов)\n"
+      f"🎟 Участие: <b>{cost_text(cost)}</b>"
+      + ("" if fixed else " (растёт вместе с призом)")
+      + "\n"
+      f"👥 Участников: <b>{st['players']}</b> (минимум для розыгрыша:"
+      f" {lottery_min_players(prize)})\n"
+      f"⏱ До конца розыгрыша: <b>{hours} ч {minutes} мин</b>\n\n"
+      "Победитель выбирается случайно среди всех участников. "
+      + (
+          "Половина токенов за участие добавляется к призу."
+          if cost
+          else "Участие бесплатное."
+      )
+  )
+
+  toggle_text = (
+      "🔕 Отключить уведомления"
+      if user_notify == 1
+      else "🔔 Включить уведомления"
+  )
+
+  if joined:
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=toggle_text, callback_data="lottery_toggle_notify"
+                )
+            ]
+        ]
+    )
+    return text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!", keyboard
+
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=(
+                      "🎟 Участвовать (бесплатно)"
+                      if cost == 0
+                      else f"🎟 Участвовать ({cost} токен.)"
+                  ),
+                  callback_data=f"lottery_join_{round_id}_{cost}",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text=toggle_text, callback_data="lottery_toggle_notify"
+              )
+          ],
+      ]
+  )
+  return text, keyboard
+
+
+@router.callback_query(F.data == "lottery_toggle_notify")
+async def lottery_toggle_notify(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      row = await cur.fetchone()
+    current = row[0] if row else 1
+    new_val = 0 if current == 1 else 1
+    await db.execute(
+        "UPDATE users SET notify_lottery = ? WHERE user_id = ?", (new_val, user_id)
+    )
+    await db.commit()
+
+  status_str = "отключены 🔕" if new_val == 0 else "включены 🔔"
+  await callback.answer(
+      f"Уведомления о крупных лотереях {status_str}!", show_alert=True
+  )
+
+  try:
+    text, kb = await build_lottery_view(user_id)
+    await callback.message.edit_text(text, reply_markup=kb)
+  except Exception:
+    pass
+
+
+async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
+  async with aiosqlite.connect(DB_NAME) as db:
+    await db.execute(
+        "UPDATE lottery_rounds SET finished = 1 WHERE id = ?", (round_id,)
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT entry_cost FROM lottery_rounds WHERE id = ?", (round_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    cost = row[0] if row and row[0] else 0
+
+    async with db.execute(
+        "SELECT user_id, paid FROM lottery_participants WHERE round_id = ?",
+        (round_id,),
+    ) as cur:
+      part_rows = await cur.fetchall()
+    players = [r[0] for r in part_rows]
+    paid_map = {r[0]: (r[1] if r[1] is not None else cost) for r in part_rows}
+
+    min_players = lottery_min_players(prize)
+    if players and len(players) < min_players:
+      for uid in players:
+        await db.execute(
+            "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
+            (paid_map[uid], uid),
+        )
+      await db.commit()
+      for uid in players:
+        async with aiosqlite.connect(DB_NAME) as udb:
+          async with udb.execute(
+              "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+              (uid,),
+          ) as c:
+            urow = await c.fetchone()
+            unotify = urow[0] if urow else 1
+        try:
+          await bot.send_message(
+              uid,
+              "😔 В розыгрыше не набралось нужное число участников"
+              f" ({len(players)} из {min_players}). Приз не разыгран."
+              + (
+                  f" Тебе вернули <b>{paid_map[uid]} токен(ов)</b>."
+                  if paid_map[uid]
+                  else ""
+              )
+              + "\n\nХотите ещё попытать удачу?",
+              reply_markup=lottery_again_keyboard(unotify),
+          )
+        except Exception:
+          pass
+        await asyncio.sleep(0.05)
+      return
+
+    prize = prize + sum(fee_to_prize(v) for v in paid_map.values())
+
+    weights = []
+    for uid in players:
+      weight = 1.0
+      aura = await get_user_aura(uid)
+      if aura and aura["type"] == "lottery":
+        weight += aura["percent"] / 100.0
+      weights.append(weight)
+
+    winner = random.choices(players, weights=weights, k=1)[0] if players else None
+
+    if winner is not None:
+      await db.execute(
+          "UPDATE users SET tokens = COALESCE(tokens, 0) + ?,"
+          " lottery_wins = COALESCE(lottery_wins, 0) + 1 WHERE user_id = ?",
+          (prize, winner),
+      )
+      await db.commit()
+
+  for uid in players:
+    async with aiosqlite.connect(DB_NAME) as udb:
+      async with udb.execute(
+          "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+          (uid,),
+      ) as c:
+        urow = await c.fetchone()
+        unotify = urow[0] if urow else 1
+    try:
+      if uid == winner:
+        await bot.send_message(
+            uid,
+            f"🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено:"
+            f" <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?",
+            reply_markup=lottery_again_keyboard(unotify),
+        )
+      else:
+        await bot.send_message(
+            uid,
+            "😔 В этот раз удача была не на твоей стороне. Победитель уже"
+            " получил приз.\n\nХотите ещё попытать удачу?",
+            reply_markup=lottery_again_keyboard(unotify),
+        )
+    except Exception:
+      pass
+    await asyncio.sleep(0.05)
+
+
+async def lottery_loop(bot: Bot):
+  while True:
+    try:
+      rnd = await get_current_round()
+      if rnd is None:
+        await create_lottery_round(bot)
+        rnd = await get_current_round()
+
+      round_id, cost, prize, ends_at_str, _fixed = rnd
+      ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+      delay = (ends_at - datetime.datetime.now()).total_seconds()
+      if delay > 0:
+        await asyncio.sleep(min(delay, 15))
+        continue
+      await finish_lottery_round(bot, round_id, prize)
+    except Exception:
+      logging.exception("Ошибка в цикле лотереи")
+      await asyncio.sleep(30)
+
+
+@router.callback_query(F.data == "lottery_open")
+async def lottery_open(callback: CallbackQuery):
+  text, keyboard = await build_lottery_view(callback.from_user.id)
+  await callback.message.answer(text, reply_markup=keyboard)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("lottery_join_"))
+async def lottery_join(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  parts = callback.data.split("_")
+  round_id = int(parts[2])
+  shown_cost = int(parts[3]) if len(parts) > 3 else None
+  price_changed = False
+
+  async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute(
+        "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0),"
+        " finished FROM lottery_rounds WHERE id = ?",
+        (round_id,),
+    ) as cur:
+      row = await cur.fetchone()
+
+    if not row or row[5] == 1:
+      await callback.answer("⏳ Этот розыгрыш уже завершён.", show_alert=True)
+      return
+    rnd = row[:5]
+    try:
+      ends_at = datetime.datetime.strptime(rnd[3], DT_FORMAT)
+    except Exception:
+      ends_at = datetime.datetime.now()
+    if ends_at <= datetime.datetime.now():
+      await callback.answer("⏳ Розыгрыш уже заканчивается.", show_alert=True)
+      return
+
+    async with db.execute(
+        "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
+        (round_id, user_id),
+    ) as cur:
+      if await cur.fetchone():
+        await callback.answer("✅ Ты уже участвуешь!", show_alert=True)
+        return
+
+    st = await lottery_stats(db, rnd)
+    cost = st["cost"]
+    if shown_cost is not None and shown_cost != cost:
+      price_changed = True
+    else:
+      if cost > 0:
+        cur = await db.execute(
+            "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+            " COALESCE(tokens, 0) >= ?",
+            (cost, user_id, cost),
+        )
+        charged = cur.rowcount
+      else:
+        await ensure_user(db, user_id)
+        charged = 1
+      if charged == 0:
+        await db.rollback()
+        await callback.answer(
+            f"❌ Недостаточно токенов! Участие стоит {cost}.", show_alert=True
+        )
+        return
+      await db.execute(
+          "INSERT INTO lottery_participants (round_id, user_id, paid)"
+          " VALUES (?, ?, ?)",
+          (round_id, user_id, cost),
+      )
+      await db.commit()
+
+  if price_changed:
+    await callback.answer(
+        f"💱 Цена участия изменилась: теперь {cost_text(cost)}. Проверь и"
+        " нажми «Участвовать» ещё раз.",
+        show_alert=True,
+    )
+    try:
+      text, kb = await build_lottery_view(user_id)
+      await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+      pass
+    return
+
+  await callback.answer("🎟 Ты в игре! Удачи!", show_alert=True)
+  await callback.message.answer(
+      "🎟 Ты участвуешь в лотерее!"
+      + (f" Списано: <b>{cost} токен(ов)</b>." if cost else " Участие бесплатное.")
+      + "\n"
+      "Результат придёт сюда, когда закончится розыгрыш."
+  )
+
+
+# --- ФОНОВЫЕ ЦИКЛЫ И ЗАПУСК ---
 
 async def weekly_reset_loop(bot: Bot):
   while True:
