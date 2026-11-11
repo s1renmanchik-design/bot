@@ -2525,7 +2525,7 @@ async def ex_admin_msg(callback: CallbackQuery, state: FSMContext):
   report_id = int(callback.data.split(":")[2])
   await state.set_state(ExAdminMsgState.text)
   await state.update_data(report_id=report_id)
-  await callback.message.text = "Напишите текст сообщения:"
+  await callback.message.answer("Напишите текст сообщения:")
   await callback.answer()
 
 
