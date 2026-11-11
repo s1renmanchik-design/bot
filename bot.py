@@ -220,6 +220,14 @@ async def init_db():
         );
     """
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS top_reset (
+            id INTEGER PRIMARY KEY,
+            next_reset TEXT
+        );
+    """
+    )
 
     migrations = {
         "users": {
@@ -1379,6 +1387,28 @@ async def show_specific_top(callback: CallbackQuery):
     return
   top_type = callback.data.split("_")[1]
   async with aiosqlite.connect(DB_NAME) as db:
+    async with db.execute("SELECT next_reset FROM top_reset WHERE id = 1") as cursor:
+      row = await cursor.fetchone()
+    
+    now = datetime.datetime.now()
+    if not row or not row[0]:
+      next_reset = now + datetime.timedelta(days=14)
+      await db.execute("INSERT OR REPLACE INTO top_reset (id, next_reset) VALUES (1, ?)", (next_reset.strftime(DT_FORMAT),))
+      await db.commit()
+    else:
+      try:
+        next_reset = datetime.datetime.strptime(row[0], DT_FORMAT)
+      except Exception:
+        next_reset = now + datetime.timedelta(days=14)
+
+    delta = next_reset - now
+    if delta.total_seconds() > 0:
+      days_left = delta.days
+      hours_left = delta.seconds // 3600
+      timer_text = f"через {days_left} дн. {hours_left} ч."
+    else:
+      timer_text = "скоро сброс..."
+
     if top_type == "refs":
       async with db.execute(REF_TOP_SQL, (10,)) as cursor:
         rows = await cursor.fetchall()
@@ -1422,7 +1452,7 @@ async def show_specific_top(callback: CallbackQuery):
       ]
 
   footer = (
-      "⏳ <b>Сброс топа:</b> каждые 14 дней\n"
+      f"⏳ <b>Сброс топа:</b> {timer_text}\n"
       "🎁 <b>Награда 1 места (на выбор):</b> Премиум на 7 дней <u>ИЛИ</u> 2 уникальных токена!"
   )
 
@@ -3268,7 +3298,7 @@ async def weekly_reset_loop(bot: Bot):
         async with db.execute(REF_TOP_SQL, (1,)) as cursor:
           ref_winner = await cursor.fetchone()
         if ref_winner:
-          await reward_winner(ref_winner[0], "топе по рефералям")
+          await reward_winner(ref_winner[0], "топе по рефералам")
 
         async with db.execute(
             "SELECT user_id FROM users WHERE COALESCE(lottery_wins, 0) > 0"
@@ -3293,6 +3323,13 @@ async def weekly_reset_loop(bot: Bot):
         await db.execute("UPDATE users SET ref_extra = 0")
         await db.execute("UPDATE users SET lottery_wins = 0")
         await db.execute("DELETE FROM roulette_state")
+
+        # Пересчет таймера на следующие 14 дней
+        new_next_reset = datetime.datetime.now() + datetime.timedelta(days=14)
+        await db.execute(
+            "INSERT OR REPLACE INTO top_reset (id, next_reset) VALUES (1, ?)",
+            (new_next_reset.strftime(DT_FORMAT),),
+        )
         await db.commit()
 
       try:
