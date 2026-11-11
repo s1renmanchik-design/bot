@@ -93,17 +93,6 @@ def esc(value) -> str:
   return html.escape(str(value), quote=False)
 
 
-def ru_plural(n: int, one: str, few: str, many: str) -> str:
-  n_abs = abs(n)
-  if n_abs % 10 == 1 and n_abs % 100 != 11:
-    word = one
-  elif 2 <= n_abs % 10 <= 4 and not 12 <= n_abs % 100 <= 14:
-    word = few
-  else:
-    word = many
-  return f"{n} {word}"
-
-
 def now_local() -> datetime.datetime:
   return datetime.datetime.now(LOCAL_TZ).replace(tzinfo=None)
 
@@ -1151,35 +1140,6 @@ async def cmd_check(message: Message, command: CommandObject):
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return
-  parts = (command.args or "").split()
-  if len(parts) != 1 or not parts[0].isdigit():
-    await message.answer("ℹ️ Использование:\n<code>/check [ID]</code>")
-    return
-  target_id = int(parts[0])
-  now = datetime.datetime.now()
-  async with aiosqlite.connect(DB_NAME) as db:
-    db.row_factory = aiosqlite.Row
-    async with db.execute(
-        "SELECT * FROM users WHERE user_id = ?", (target_id,)
-    ) as c:
-      u = await c.fetchone()
-    if not u:
-      await message.answer("❌ Пользователь не найден в базе.")
-      return
-
-    active, pending, extra, income = await ref_summary(db, target_id)
-    async with db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(COALESCE(paid, 0)), 0)"
-        " FROM lottery_participants WHERE user_id = ?",
-        (target_id,),
-    ) as c:
-      lot_n, lot_paid = await c.fetchone()
-@router.message(Command("check"))
-async def cmd_check(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-
   args = (command.args or "").strip()
   if not args:
     parts = (message.text or "").split()
@@ -1384,18 +1344,45 @@ def tops_menu_keyboard() -> InlineKeyboardMarkup:
   )
 
 
+@router.callback_query(F.data.startswith("top_reward_"))
+async def process_top_reward(callback: CallbackQuery):
+  parts = callback.data.split("_")
+  winner_id = int(parts[2])
+  reward_type = parts[3]
+
+  if callback.from_user.id != winner_id:
+    await callback.answer("❌ Это меню не для вас!", show_alert=True)
+    return
+
+  if reward_type == "prem":
+    await grant_premium(winner_id, 7)
+    text = "✅ Вы успешно получили <b>Премиум-подписку на 7 дней</b>!"
+  else:
+    async with aiosqlite.connect(DB_NAME) as db:
+      await db.execute(
+          "UPDATE users SET y_tokens = COALESCE(y_tokens, 0) + 2 WHERE user_id = ?",
+          (winner_id,),
+      )
+      await db.commit()
+    text = "✅ Вы успешно получили <b>2 уникальных токена</b>!"
+
+  try:
+    await callback.message.edit_text(text, reply_markup=None)
+  except Exception:
+    pass
+  await callback.answer()
+
+
 @router.callback_query(F.data.startswith("top_"))
 async def show_specific_top(callback: CallbackQuery):
+  if callback.data.startswith("top_reward_"):
+    return
   top_type = callback.data.split("_")[1]
   async with aiosqlite.connect(DB_NAME) as db:
     if top_type == "refs":
       async with db.execute(REF_TOP_SQL, (10,)) as cursor:
         rows = await cursor.fetchall()
       title = "🏆 <b>Топ-10 по рефералам</b>"
-      footer = (
-          "<i>(каждые 14 дней топ сбрасывается, 1 место получает Премиум на 14"
-          " дней)</i>"
-      )
       items = [
           f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
           f" <b>{r[2]}</b> реф."
@@ -1414,10 +1401,6 @@ async def show_specific_top(callback: CallbackQuery):
         ) as cursor:
           rows = await cursor.fetchall()
       title = "🏆 <b>Топ-10 по победам в лотерее</b>"
-      footer = (
-          "<i>(каждые 14 дней топ сбрасывается, 1 место получает Премиум на 14"
-          " дней)</i>"
-      )
       items = [
           f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
           f" <b>{r[2]}</b> побед"
@@ -1432,15 +1415,16 @@ async def show_specific_top(callback: CallbackQuery):
       ) as cursor:
         rows = await cursor.fetchall()
       title = "🏆 <b>Топ-10 по победам в рулетке</b>"
-      footer = (
-          "<i>(каждые 14 дней топ сбрасывается, 1 место получает Премиум на 14"
-          " дней)</i>"
-      )
       items = [
           f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
           f" <b>{r[2]}</b> побед"
           for i, r in enumerate(rows, 1)
       ]
+
+  footer = (
+      "⏳ <b>Сброс топа:</b> каждые 14 дней\n"
+      "🎁 <b>Награда 1 места (на выбор):</b> Премиум на 7 дней <u>ИЛИ</u> 2 уникальных токена!"
+  )
 
   text = (
       title
@@ -1448,6 +1432,7 @@ async def show_specific_top(callback: CallbackQuery):
       + ("\n".join(items) if items else "Пока пусто.")
       + f"\n\n{footer}"
   )
+  
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
           [
@@ -1622,7 +1607,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       up_id, title, price, amount = up
       kb_buttons.append([
           InlineKeyboardButton(
-              text=f"💎 {title} — {price} токенов (осталось: {amount})",
+              text=f"💎 {title} — {price} токен(ов) (осталось: {amount})",
               callback_data=f"ubuy_{up_id}",
           )
       ])
@@ -3249,78 +3234,57 @@ async def lottery_join(callback: CallbackQuery):
 
 async def weekly_reset_loop(bot: Bot):
   while True:
+    # 14 дней в секундах (14 * 24 * 60 * 60 = 1209600)
     await asyncio.sleep(1209600)
     try:
-      expire_date = (
-          datetime.datetime.now() + datetime.timedelta(days=14)
-      ).strftime(DT_FORMAT)
-
       async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(REF_TOP_SQL, (1,)) as cursor:
-          ref_winner = await cursor.fetchone()
-
-        if ref_winner:
-          w_id = ref_winner[0]
-          await db.execute(
-              "UPDATE users SET is_premium = 1, premium_expires = ? WHERE"
-              " user_id = ?",
-              (expire_date, w_id),
+        async def reward_winner(w_id: int, top_name: str):
+          kb = InlineKeyboardMarkup(
+              inline_keyboard=[
+                  [
+                      InlineKeyboardButton(
+                          text="👑 Премиум на 7 дней",
+                          callback_data=f"top_reward_{w_id}_prem",
+                      )
+                  ],
+                  [
+                      InlineKeyboardButton(
+                          text="💎 2 уникальных токена",
+                          callback_data=f"top_reward_{w_id}_ytoken",
+                      )
+                  ],
+              ]
           )
-          await db.commit()
           try:
             await bot.send_message(
                 w_id,
-                "🏆 <b>Поздравляем! Вы заняли 1 место в топе по рефералям и"
-                " получили Премиум на 14 дней!</b>",
+                f"🏆 <b>Поздравляем! Вы заняли 1 место в {top_name}!</b>\n\n"
+                "Выберите вашу награду:",
+                reply_markup=kb,
             )
           except Exception:
             pass
+
+        async with db.execute(REF_TOP_SQL, (1,)) as cursor:
+          ref_winner = await cursor.fetchone()
+        if ref_winner:
+          await reward_winner(ref_winner[0], "топе по рефералям")
 
         async with db.execute(
             "SELECT user_id FROM users WHERE COALESCE(lottery_wins, 0) > 0"
             " ORDER BY lottery_wins DESC LIMIT 1"
         ) as cursor:
           lot_winner = await cursor.fetchone()
-
         if lot_winner:
-          w_id = lot_winner[0]
-          await db.execute(
-              "UPDATE users SET is_premium = 1, premium_expires = ? WHERE"
-              " user_id = ?",
-              (expire_date, w_id),
-          )
-          await db.commit()
-          try:
-            await bot.send_message(
-                w_id,
-                "🏆 <b>Поздравляем! Вы заняли 1 место в топе по лотерее и"
-                " получили Премиум на 14 дней!</b>",
-            )
-          except Exception:
-            pass
+          await reward_winner(lot_winner[0], "топе по лотерее")
 
         async with db.execute(
             "SELECT user_id FROM roulette_state WHERE COALESCE(wins, 0) > 0"
             " ORDER BY wins DESC LIMIT 1"
         ) as cursor:
           rl_winner = await cursor.fetchone()
-
         if rl_winner:
-          w_id = rl_winner[0]
-          await db.execute(
-              "UPDATE users SET is_premium = 1, premium_expires = ? WHERE"
-              " user_id = ?",
-              (expire_date, w_id),
-          )
-          await db.commit()
-          try:
-            await bot.send_message(
-                w_id,
-                "🏆 <b>Поздравляем! Вы заняли 1 место в топе по рулетке и"
-                " получили Премиум на 14 дней!</b>",
-            )
-          except Exception:
-            pass
+          await reward_winner(rl_winner[0], "топе по рулетке")
 
         await db.execute(
             "UPDATE users SET referrer_id = 0, ref_income = 0 WHERE"
@@ -3335,7 +3299,7 @@ async def weekly_reset_loop(bot: Bot):
         await bot.send_message(
             ADMIN_ID,
             "🔄 Автоматический сброс всех трех топов (каждые 14 дней) выполнен,"
-            " победителям выданы Премиумы!",
+            " победителям отправлен выбор награды!",
         )
       except Exception:
         pass
