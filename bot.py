@@ -1739,7 +1739,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         "🏆 <b>Выберите категорию топа:</b>", reply_markup=tops_menu_keyboard()
     )
 
-  elif text == "🪙 Как получить токены?":
+elif text == "🪙 Как получить токены?":
     tokens_text = (
         "<b>Как получить токены?</b>\n\n"
         "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
@@ -1758,7 +1758,12 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         " @ucu52\n\n"
         "<b>Преимущества:</b>\n"
         "1. Там выходят фулы на 1 день позже чем в стандартный магазин.\n"
-        "2. Там уникальные товары по типу ауры и так далее"
+        "2. Там уникальные товары по типу ауры и так далее\n\n"
+        "-----------------------------------\n\n"
+        "📦 <b>Как получить ФУЛЛОВЫЕ токены?</b>\n"
+        "Их можно купить в <b>Уникальном магазине</b> за уникальные токены.\n\n"
+        "<b>Преимущество:</b>\n"
+        "Позволяет забрать абсолютно любой фулл в обычном магазине бесплатно (без траты обычных токенов), просто используя фулловый токен при покупке!"
     )
     await message.answer(tokens_text, disable_web_page_preview=True)
 
@@ -1767,7 +1772,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⭐ Отправить Подарок 50 Stars (@ucu52)",
+                    text="⭐ Отправить Подарок 50 Stars",
                     url="https://t.me/ucu52",
                 )
             ]
@@ -1781,7 +1786,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         "💳 <b>Способ 1:</b> Купить | Заплатить 50 Звезд\n"
         "(любым подарком на профиль @ucu52)\n\n"
         "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 Фото в коментарии в тт\n"
-        "подробнее про фото и что делать: https://t.me/JmcDeveloper/18\n\n"
+        "подробнее про фото: https://t.me/JmcDeveloper/18\n\n"
         "Вы можете получить премиум бесплатно за 100 фото в коменты!\n"
         "<i>Если была хотя бы одна фото дублирована или уже принята как Токен —"
         " подписка не выдается.</i>\n"
