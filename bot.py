@@ -78,7 +78,7 @@ def fee_to_prize(paid: int) -> int:
 
 
 def cost_text(cost: int) -> str:
-  return "бесплатно" if cost == 0 else f"{cost} токен(ов)"
+  return "бесплатно" if cost == 0 else f"{cost} 1732(ов)"
 
 
 def lottery_min_players(prize: int) -> int:
@@ -547,7 +547,7 @@ async def activate_referral(bot: Bot, user_id: int) -> None:
     await bot.send_message(
         referrer_id,
         "🎉 По вашей рефке зарегистрировался новый пользователь!\n"
-        f"❤️ Вам начислено {REF_BONUS} токенов!",
+        f"❤️ Вам начислено {REF_BONUS} 1732ов!",
     )
   except Exception:
     pass
@@ -622,7 +622,7 @@ def get_main_keyboard(user_id):
           KeyboardButton(text="🏆 Топ игроков"),
       ],
       [
-          KeyboardButton(text="🪙 Как получить токены?"),
+          KeyboardButton(text="🪙 Как получить 1732ы?"),
           KeyboardButton(text="👑 Премиум-подписка"),
       ],
       [KeyboardButton(text="🔄 Обмены"), KeyboardButton(text="🎰 Лотерея")],
@@ -745,7 +745,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
             """,
             (user_id, val, val),
         )
-        reply = f"✅ Промокод активирован!\n🎁 Вам зачислено: <b>{val} токенов</b>"
+        reply = f"✅ Промокод активирован!\n🎁 Вам зачислено: <b>{val} 1732ов</b>"
 
       elif reward_type == "premium":
         async with db.execute(
@@ -1078,7 +1078,7 @@ async def cmd_uref(message: Message, command: CommandObject):
         f"👥 <b>Рефералы ID</b> <code>{target_id}</code>\n"
         f"✅ Засчитано: <b>{active + extra}</b> (из них админом: {extra})\n"
         f"⏳ Не подписались: <b>{pending}</b>\n"
-        f"💰 Доход: <b>{income}</b> токенов\n\n{lines_str}"
+        f"💰 Доход: <b>{income}</b> 1732ов\n\n{lines_str}"
     )
     return
 
@@ -1135,13 +1135,13 @@ async def cmd_ytoken(message: Message, command: CommandObject):
         await db.commit()
         await message.answer(
             f"✅ Пользователю <code>{target_id}</code> начислено"
-            f" <b>+{amount}</b> уникальных токенов."
+            f" <b>+{amount}</b> уникальных 1732ов."
         )
         try:
           await message.bot.send_message(
               target_id,
               f"🎁 Администратор начислил вам <b>+{amount}</b> уникальных"
-              " токенов!",
+              " 1732ов!",
           )
         except Exception:
           pass
@@ -1154,7 +1154,7 @@ async def cmd_ytoken(message: Message, command: CommandObject):
         await db.commit()
         await message.answer(
             f"✅ У пользователя <code>{target_id}</code> списано"
-            f" <b>{amount}</b> уникальных токенов."
+            f" <b>{amount}</b> уникальных 1732ов."
         )
     return
   await message.answer(
@@ -1187,13 +1187,13 @@ async def cmd_ftoken(message: Message, command: CommandObject):
         await db.commit()
         await message.answer(
             f"✅ Пользователю <code>{target_id}</code> начислено"
-            f" <b>+{amount}</b> фулловых токенов."
+            f" <b>+{amount}</b> фулловых 1732ов."
         )
         try:
           await message.bot.send_message(
               target_id,
               f"🎁 Администратор начислил вам <b>+{amount}</b> фулловых"
-              " токенов!",
+              " 1732ов!",
           )
         except Exception:
           pass
@@ -1206,7 +1206,7 @@ async def cmd_ftoken(message: Message, command: CommandObject):
         await db.commit()
         await message.answer(
             f"✅ У пользователя <code>{target_id}</code> списано"
-            f" <b>{amount}</b> фулловых токенов."
+            f" <b>{amount}</b> фулловых 1732ов."
         )
     return
   await message.answer(
@@ -1285,9 +1285,9 @@ async def cmd_check(message: Message, command: CommandObject):
 
   await message.answer(
       f"🔎 <b>Аккаунт</b> <code>{target_id}</code>\n\n"
-      f"🪙 Токены: <b>{u['tokens'] or 0}</b>\n"
-      f"💎 Уникальные токены: <b>{u['y_tokens'] or 0}</b>\n"
-      f"📦 Фулловые токены: <b>{u.get('full_tokens', 0)}</b>\n"
+      f"🪙 1732ы: <b>{u['tokens'] or 0}</b>\n"
+      f"💎 Уникальные 1732ы: <b>{u['y_tokens'] or 0}</b>\n"
+      f"📦 Фулловые 1732ы: <b>{u.get('full_tokens', 0)}</b>\n"
       f"👑 Премиум подписка: {prem}\n"
       f"✨ Аура: {aura_info}\n"
       f"⚠️ Предупреждения: {u['warns'] or 0}/{MAX_WARNS}\n"
@@ -1333,7 +1333,7 @@ async def cmd_token(message: Message, command: CommandObject, bot: Bot):
   amount, target_id = int(args[0]), int(args[1])
   await grant_tokens(target_id, amount)
   await message.answer(
-      f"✅ Выдано +{amount} токенов пользователю <code>{target_id}</code>."
+      f"✅ Выдано +{amount} 1732ов пользователю <code>{target_id}</code>."
   )
 
 
@@ -1445,7 +1445,7 @@ async def process_top_reward(callback: CallbackQuery):
           (winner_id,),
       )
       await db.commit()
-    text = "✅ Вы успешно получили <b>2 уникальных токена</b>!"
+    text = "✅ Вы успешно получили <b>2 уникальных 1732а</b>!"
 
   try:
     await callback.message.edit_text(text, reply_markup=None)
@@ -1526,7 +1526,7 @@ async def show_specific_top(callback: CallbackQuery):
 
   footer = (
       f"⏳ <b>Сброс топа:</b> {timer_text}\n"
-      "🎁 <b>Награда 1 места (на выбор):</b> Премиум на 7 дней <u>ИЛИ</u> 2 уникальных токена!"
+      "🎁 <b>Награда 1 места (на выбор):</b> Премиум на 7 дней <u>ИЛИ</u> 2 уникальных 1732а!"
   )
 
   text = (
@@ -1576,7 +1576,7 @@ async def back_to_tops(callback: CallbackQuery):
             "💎 Уникальный магазин",
             "👥 Реферальная система",
             "🏆 Топ игроков",
-            "🪙 Как получить токены?",
+            "🪙 Как получить 1732ы?",
             "👑 Премиум-подписка",
             "🎰 Лотерея",
             "🔄 Обмены",
@@ -1657,9 +1657,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     )
     profile_text = (
         f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
-        f"💲 Баланс токенов: {tokens if tokens is not None else 0}\n"
-        f"💎 Уникальные токены: {y_tokens if y_tokens is not None else 0}\n"
-        f"📦 Фулловые токены: {full_tokens if full_tokens is not None else 0}\n"
+        f"💲 Баланс 1732ов: {tokens if tokens is not None else 0}\n"
+        f"💎 Уникальные 1732ы: {y_tokens if y_tokens is not None else 0}\n"
+        f"📦 Фулловые 1732ы: {full_tokens if full_tokens is not None else 0}\n"
         f"👑 Премиум-подписка: {prem_status}\n"
         f"✨ Активная аура: {aura_status}\n"
         f"📦 Собрано фулов: {bought} шт.\n"
@@ -1683,9 +1683,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     for prod in products:
       p_id, title, price, buyers_count = prod
       btn_text = (
-          f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+          f"🔥 {title} — {price} 1732ов (ПЕРВАЯ ПОКУПКА -80%!)"
           if buyers_count == 0
-          else f"📁 {title} — {price} токенов"
+          else f"📁 {title} — {price} 1732ов"
       )
       keyboard_buttons.append(
           [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
@@ -1712,14 +1712,14 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       up_id, title, price, amount = up
       kb_buttons.append([
           InlineKeyboardButton(
-              text=f"💎 {title} — {price} токен(ов) (осталось: {amount})",
+              text=f"💎 {title} — {price} 1732(ов) (осталось: {amount})",
               callback_data=f"ubuy_{up_id}",
           )
       ])
 
     await message.answer(
         "💎 <b>Уникальный магазин</b>\nПокупайте уникальные предметы за"
-        " уникальные токены:",
+        " уникальные 1732ы:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
     )
 
@@ -1739,33 +1739,34 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         "🏆 <b>Выберите категорию топа:</b>", reply_markup=tops_menu_keyboard()
     )
 
-    elif text == "🪙 Как получить токены?":
-      tokens_text = (
-          "<b>Как получить токены?</b>\n\n"
-          "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
-          "2. Оставляйте в комментариях под постами/ответами другим людям.\n\n"
-          "3. Отправляйте доказательства (скриншоты) в директ канала."
-          " https://t.me/JmcDeveloper?direct\n\n"
-          "<b>ГЛАВНОЕ:</b> тема видео должна касаться по типу сестры и брата и"
-          " т.д.\n\n"
-          "💰 1 отправка фото в комментариях = 1 токен!\n\n"
-          "📖 <b>ДЕТАЛЬНО РАСПИСАЛ ТУТ:</b> https://t.me/JmcDeveloper/18\n"
-          "<i>(и могу не выдать некоторые токены если не посмотрите 👆)</i>\n\n"
-          "-----------------------------------\n\n"
-          "💎 <b>Как получить УНИКАЛЬНЫЕ токены?</b>\n"
-          "Его только можно купить, <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
-          "<b>Как купить?</b> Кинуть любой подарок со стоимостью 15 звёзд на аккаунт"
-          " @ucu52\n\n"
-          "<b>Преимущества:</b>\n"
-          "1. Там выходят фулы на 1 день позже чем в стандартный магазин.\n"
-          "2. Там уникальные товары по типу ауры и так далее\n\n"
-          "-----------------------------------\n\n"
-          "📦 <b>Как получить ФУЛЛОВЫЕ токены?</b>\n"
-          "Их можно купить в <b>Уникальном магазине</b> за уникальные токены (или получить от администратора).\n\n"
-          "<b>Преимущество:</b>\n"
-          "Позволяет забрать абсолютно любой фулл в обычном магазине бесплатно (без траты обычных токенов), просто используя фулловый токен при покупке!"
-      )
-      await message.answer(tokens_text, disable_web_page_preview=True)
+  elif text == "🪙 Как получить токены?":
+    tokens_text = (
+        "<b>Как получить токены?</b>\n\n"
+        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
+        "2. Оставляйте в комментариях под постами/ответами другим людям.\n\n"
+        "3. Отправляйте доказательства (скриншоты) в директ канала."
+        " https://t.me/JmcDeveloper?direct\n\n"
+        "<b>ГЛАВНОЕ:</b> тема видео должна касаться по типу сестры и брата и"
+        " т.д.\n\n"
+        "💰 1 отправка фото в комментариях = 1 токен!\n\n"
+        "📖 <b>ДЕТАЛЬНО РАСПИСАЛ ТУТ:</b> https://t.me/JmcDeveloper/18\n"
+        "<i>(и могу не выдать некоторые токены если не посмотрите 👆)</i>\n\n"
+        "-----------------------------------\n\n"
+        "💎 <b>Как получить УНИКАЛЬНЫЕ токены?</b>\n"
+        "Его только можно купить, <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
+        "<b>Как купить?</b> Кинуть любой подарок со стоимостью 15 звёзд на аккаунт"
+        " @ucu52\n\n"
+        "<b>Преимущества:</b>\n"
+        "1. Там выходят фулы на 1 день позже чем в стандартный магазин.\n"
+        "2. Там уникальные товары по типу ауры и так далее\n\n"
+        "-----------------------------------\n\n"
+        "📦 <b>Как получить ФУЛЛОВЫЕ токены?</b>\n"
+        "Их можно купить в <b>Уникальном магазине</b> за уникальные токены (или получить от администратора).\n\n"
+        "<b>Преимущество:</b>\n"
+        "Позволяет забрать абсолютно любой фулл в обычном магазине бесплатно (без траты обычных токенов), просто используя фулловый токен при покупке!"
+    )
+    await message.answer(tokens_text, disable_web_page_preview=True)
+
   elif text == "👑 Премиум-подписка":
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
