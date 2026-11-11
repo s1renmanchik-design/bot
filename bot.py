@@ -29,19 +29,21 @@ from aiogram.types import (
 
 try:
   from aiogram.client.default import DefaultBotProperties
-except ImportError:
+except ImportError:  # старые версии aiogram 3.x
   DefaultBotProperties = None
 
 try:
   from zoneinfo import ZoneInfo
+
   LOCAL_TZ = ZoneInfo("Europe/Kyiv")
-except Exception:
+except Exception:  # нет базы часовых поясов -> фиксированный UTC+2
   LOCAL_TZ = datetime.timezone(datetime.timedelta(hours=2))
 
 logging.basicConfig(level=logging.INFO)
 
 _bg_tasks = set()
 
+# ВАЖНО: токен только из переменной окружения TOKEN (на хостинге).
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
   sys.exit("Не задана переменная окружения TOKEN")
@@ -51,29 +53,112 @@ DB_NAME = "bot.db"
 
 ADMIN_ID = 5681420389
 
+# Канал для обязательной подписки (ID = -100 + число).
 CHANNEL_ID = -1002925107145
 CHANNEL_URL = "https://t.me/iiris_cnn_bot"
 
 DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# Модерация
 MAX_WARNS = 3
 PERM_BAN = "2999-12-31 00:00:00"
-REF_BONUS = 7
 
+# Рефералы
+REF_BONUS = 7  # токенов пригласившему за подписавшегося реферала
+
+# Топы
+TOP_RESET_DAYS = 14
+TOP_REWARD_PREMIUM_DAYS = 7
+TOP_REWARD_YTOKENS = 2
+
+# Лотерея
 LOTTERY_HOURS = 3
-LOTTERY_NORMAL_CHANCE = 0.80
-LOTTERY_BIG_LOW_CHANCE = 0.15
+LOTTERY_NORMAL_CHANCE = 0.80  # обычный приз 4-10 токенов
+LOTTERY_BIG_LOW_CHANCE = 0.15  # крупный приз 11-14 токенов
+# остаток (5%) — самый крупный приз 15-20 токенов
 LOTTERY_NOTIFY_PRIZE = 11
 LOTTERY_MIN_PLAYERS = 2
 LOTTERY_BIG_PRIZE = 15
 LOTTERY_BIG_MIN_PLAYERS = 4
 
 
+# --- ОБЩИЕ ХЕЛПЕРЫ ---
+
+
+def connect():
+  """Подключение к БД с увеличенным ожиданием (против 'database is locked')."""
+  return aiosqlite.connect(DB_NAME, timeout=30)
+
+
+def esc(value) -> str:
+  """Экранирует текст для HTML-разметки Telegram."""
+  return html.escape(str(value), quote=False)
+
+
+def hidden_link(link) -> str:
+  """Ссылка под спойлером: скрыта, пока человек не нажмёт на неё."""
+  return f"<tg-spoiler>{esc(link)}</tg-spoiler>"
+
+
+def ru_plural(n: int, one: str, few: str, many: str) -> str:
+  """'1 токен', '2 токена', '5 токенов'."""
+  n_abs = abs(n)
+  if n_abs % 10 == 1 and n_abs % 100 != 11:
+    word = one
+  elif 2 <= n_abs % 10 <= 4 and not 12 <= n_abs % 100 <= 14:
+    word = few
+  else:
+    word = many
+  return f"{n} {word}"
+
+
+def now_local() -> datetime.datetime:
+  """Текущее время по Киеву (naive) - нужно только для ночного режима."""
+  return datetime.datetime.now(LOCAL_TZ).replace(tzinfo=None)
+
+
+def parse_dt(value):
+  try:
+    return datetime.datetime.strptime(value, DT_FORMAT) if value else None
+  except Exception:
+    return None
+
+
+def txt(message: Message) -> str:
+  return (message.text or "").strip()
+
+
+async def safe_send(bot: Bot, uid: int, text: str, **kwargs) -> bool:
+  try:
+    await bot.send_message(uid, text, **kwargs)
+    return True
+  except Exception:
+    return False
+
+
+async def deny(message: Message) -> bool:
+  """True, если пользователь не админ (и ему уже ответили)."""
+  if message.from_user.id != ADMIN_ID:
+    await message.answer("⛔️ У тебя нет доступа!")
+    return True
+  return False
+
+
+def parse_args(command: CommandObject, count: int):
+  """Ровно count целых чисел или None."""
+  parts = (command.args or "").split()
+  if len(parts) != count or not all(p.isdigit() for p in parts):
+    return None
+  return [int(p) for p in parts]
+
+
 def lottery_cost_for_total(total: int) -> int:
+  """Каждые 5 токенов приза = +1 токен к цене участия (минимум 1)."""
   return max(1, total // 5)
 
 
 def fee_to_prize(paid: int) -> int:
+  """В приз уходит 50% потраченных на участие токенов (вверх)."""
   return (paid + 1) // 2
 
 
@@ -82,23 +167,16 @@ def cost_text(cost: int) -> str:
 
 
 def lottery_min_players(prize: int) -> int:
-  return LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
+  return (
+      LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
+  )
 
 
-def hidden_link(link) -> str:
-  return f"<tg-spoiler>{esc(link)}</tg-spoiler>"
-
-
-def esc(value) -> str:
-  return html.escape(str(value), quote=False)
-
-
-def now_local() -> datetime.datetime:
-  return datetime.datetime.now(LOCAL_TZ).replace(tzinfo=None)
+# --- БАЗА ДАННЫХ ---
 
 
 async def init_db():
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -230,6 +308,7 @@ async def init_db():
     """
     )
 
+    # Миграция: добавляем недостающие колонки в таблицы старой базы
     migrations = {
         "users": {
             "tokens": "INTEGER DEFAULT 0",
@@ -255,15 +334,9 @@ async def init_db():
             "aura_expires": "TEXT DEFAULT NULL",
             "lottery_wins": "INTEGER DEFAULT 0",
         },
-        "products": {
-            "buyers_count": "INTEGER DEFAULT 0",
-        },
-        "lottery_participants": {
-            "paid": "INTEGER DEFAULT NULL",
-        },
-        "lottery_rounds": {
-            "cost_fixed": "INTEGER DEFAULT 0",
-        },
+        "products": {"buyers_count": "INTEGER DEFAULT 0"},
+        "lottery_participants": {"paid": "INTEGER DEFAULT NULL"},
+        "lottery_rounds": {"cost_fixed": "INTEGER DEFAULT 0"},
         "promocodes": {
             "max_uses": "INTEGER DEFAULT 0",
             "used_count": "INTEGER DEFAULT 0",
@@ -279,8 +352,12 @@ async def init_db():
       for col, ddl in columns.items():
         if col not in existing:
           await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+          logging.info("Миграция: добавлена колонка %s.%s", table, col)
 
     await db.commit()
+
+
+# --- СОСТОЯНИЯ (FSM) ---
 
 
 class AddProduct(StatesGroup):
@@ -297,14 +374,10 @@ class AddUniqueProduct(StatesGroup):
 
 
 class EditProduct(StatesGroup):
-  product_id = State()
-  field = State()
   new_value = State()
 
 
 class EditUniqueProduct(StatesGroup):
-  product_id = State()
-  field = State()
   new_value = State()
 
 
@@ -328,62 +401,84 @@ class GivePremiumState(StatesGroup):
   days = State()
 
 
-class GiveTokensState(StatesGroup):
+class GiveState(StatesGroup):
   user_id = State()
   amount = State()
 
 
-class GiveYTokensState(StatesGroup):
-  user_id = State()
-  amount = State()
+class NewOfferState(StatesGroup):
+  give = State()
+  want = State()
+  link = State()
 
 
-class GiveFullTokensState(StatesGroup):
-  user_id = State()
-  amount = State()
+class ExSearchState(StatesGroup):
+  query = State()
+
+
+class ExTakeState(StatesGroup):
+  link = State()
+
+
+class ExAdminMsgState(StatesGroup):
+  text = State()
+
+
+class RouletteState(StatesGroup):
+  bet = State()
 
 
 router = Router()
 
 
+# --- АУРА, БАНЫ, ПРЕДУПРЕЖДЕНИЯ ---
+
+
 async def get_user_aura(user_id: int):
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     async with db.execute(
-        "SELECT aura_type, aura_name, aura_percent, aura_expires FROM users WHERE user_id = ?",
+        "SELECT aura_type, aura_name, aura_percent, aura_expires FROM users"
+        " WHERE user_id = ?",
         (user_id,),
     ) as cur:
       row = await cur.fetchone()
     if not row or not row[0] or not row[3]:
       return None
-    try:
-      exp = datetime.datetime.strptime(row[3], DT_FORMAT)
-      if exp <= datetime.datetime.now():
-        await db.execute(
-            "UPDATE users SET aura_type = NULL, aura_name = NULL, aura_percent = 0, aura_expires = NULL WHERE user_id = ?",
-            (user_id,),
-        )
-        await db.commit()
-        return None
-      return {"type": row[0], "name": row[1], "percent": row[2], "expires": exp}
-    except Exception:
+    exp = parse_dt(row[3])
+    if exp is None:
       return None
+    if exp <= datetime.datetime.now():
+      await db.execute(
+          "UPDATE users SET aura_type = NULL, aura_name = NULL,"
+          " aura_percent = 0, aura_expires = NULL WHERE user_id = ?",
+          (user_id,),
+      )
+      await db.commit()
+      return None
+    return {
+        "type": row[0],
+        "name": row[1],
+        "percent": row[2] or 0,
+        "expires": exp,
+    }
 
 
 async def get_active_ban_info(user_id: int):
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     async with db.execute(
-        "SELECT banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,)
+        "SELECT banned_until, ban_reason FROM users WHERE user_id = ?",
+        (user_id,),
     ) as cur:
       row = await cur.fetchone()
     if not row or not row[0]:
       return None, None
-    try:
-      until = datetime.datetime.strptime(row[0], DT_FORMAT)
-    except Exception:
+    until = parse_dt(row[0])
+    if until is None:
       return None, None
     if until <= datetime.datetime.now():
       await db.execute(
-          "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id = ?",
+          "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE"
+          " user_id = ?",
           (user_id,),
       )
       await db.commit()
@@ -408,14 +503,15 @@ def ban_text(until: datetime.datetime, reason: str = None) -> str:
 
 async def ensure_user(db, user_id: int) -> None:
   await db.execute(
-      "INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders,"
-      " referrer_id, ref_activated) VALUES (?, 0, 0, 0, 0, 0, 0, 0)"
-      " ON CONFLICT(user_id) DO NOTHING",
+      "INSERT OR IGNORE INTO users (user_id, tokens, y_tokens, full_tokens,"
+      " is_premium, bought_folders, referrer_id, ref_activated)"
+      " VALUES (?, 0, 0, 0, 0, 0, 0, 0)",
       (user_id,),
   )
 
 
 async def ban_user(target_id: int, days: int, reason: str = None) -> str:
+  """Банит на days дней (0 = навсегда). Возвращает текст срока."""
   if days > 0:
     until = datetime.datetime.now() + datetime.timedelta(days=days)
     until_str = until.strftime(DT_FORMAT)
@@ -423,7 +519,7 @@ async def ban_user(target_id: int, days: int, reason: str = None) -> str:
   else:
     until_str = PERM_BAN
     text = "навсегда"
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await ensure_user(db, target_id)
     await db.execute(
         "UPDATE users SET banned_until = ?, ban_reason = ? WHERE user_id = ?",
@@ -434,16 +530,18 @@ async def ban_user(target_id: int, days: int, reason: str = None) -> str:
 
 
 async def unban_user(target_id: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await db.execute(
-        "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE user_id = ?",
+        "UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE"
+        " user_id = ?",
         (target_id,),
     )
     await db.commit()
 
 
 async def add_warn(target_id: int, reason: str = None):
-  async with aiosqlite.connect(DB_NAME) as db:
+  """Добавляет предупреждение. Возвращает (кол-во варнов, забанен ли)."""
+  async with connect() as db:
     await ensure_user(db, target_id)
     await db.execute(
         "UPDATE users SET warns = COALESCE(warns, 0) + 1 WHERE user_id = ?",
@@ -461,7 +559,8 @@ async def add_warn(target_id: int, reason: str = None):
       )
       await db.execute(
           "UPDATE users SET banned_until = ?, ban_reason = ?, is_premium = 0,"
-          " premium_expires = NULL, tokens = 0, y_tokens = 0, full_tokens = 0 WHERE user_id = ?",
+          " premium_expires = NULL, tokens = 0, y_tokens = 0, full_tokens = 0"
+          " WHERE user_id = ?",
           (PERM_BAN, ban_msg, target_id),
       )
       banned = True
@@ -470,7 +569,7 @@ async def add_warn(target_id: int, reason: str = None):
 
 
 async def remove_warn(target_id: int) -> int:
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await ensure_user(db, target_id)
     await db.execute(
         "UPDATE users SET warns = MAX(0, COALESCE(warns, 0) - 1)"
@@ -485,8 +584,23 @@ async def remove_warn(target_id: int) -> int:
   return row[0] if row and row[0] is not None else 0
 
 
+async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool):
+  if banned:
+    text = (
+        f"🚫 Вы получили {warns}/{MAX_WARNS} предупреждений. Ваш профиль"
+        " заблокирован навсегда, премиум-подписка снята, токены обнулены."
+    )
+  else:
+    text = (
+        f"⚠️ Вам выдано предупреждение ({warns}/{MAX_WARNS}). При"
+        f" {MAX_WARNS} предупреждениях профиль будет заблокирован,"
+        " премиум снят, токены обнулены."
+    )
+  await safe_send(bot, target_id, text)
+
+
 async def remove_premium(target_id: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await db.execute(
         "UPDATE users SET is_premium = 0, premium_expires = NULL"
         " WHERE user_id = ?",
@@ -496,7 +610,8 @@ async def remove_premium(target_id: int) -> None:
 
 
 async def remove_tokens(target_id: int, amount: int) -> int:
-  async with aiosqlite.connect(DB_NAME) as db:
+  """Забирает токены (не уходит ниже 0). Возвращает новый баланс."""
+  async with connect() as db:
     await ensure_user(db, target_id)
     await db.execute(
         "UPDATE users SET tokens = MAX(0, COALESCE(tokens, 0) - ?)"
@@ -511,10 +626,16 @@ async def remove_tokens(target_id: int, amount: int) -> int:
   return row[0] if row and row[0] is not None else 0
 
 
+# --- ОБЯЗАТЕЛЬНАЯ ПОДПИСКА И РЕФЕРАЛЫ ---
+
+
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
   try:
     member = await bot.get_chat_member(CHANNEL_ID, user_id)
   except Exception:
+    # Бот не админ в канале или неверный CHANNEL_ID: не блокируем всех,
+    # но пишем ошибку в лог.
+    logging.exception("Не удалось проверить подписку")
     return True
   if member.status in (
       ChatMemberStatus.MEMBER,
@@ -528,7 +649,8 @@ async def is_subscribed(bot: Bot, user_id: int) -> bool:
 
 
 async def activate_referral(bot: Bot, user_id: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
+  """Бонус пригласившему: один раз и только после подписки."""
+  async with connect() as db:
     cur = await db.execute(
         "UPDATE users SET ref_activated = 1, ref_income = ? WHERE user_id = ?"
         " AND ref_activated = 0 AND referrer_id != 0",
@@ -540,23 +662,21 @@ async def activate_referral(bot: Bot, user_id: int) -> None:
         "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
     ) as c:
       row = await c.fetchone()
-      if not row:
-        return
-      referrer_id = row[0]
+    if not row:
+      return
+    referrer_id = row[0]
     await ensure_user(db, referrer_id)
     await db.execute(
         "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
         (REF_BONUS, referrer_id),
     )
     await db.commit()
-  try:
-    await bot.send_message(
-        referrer_id,
-        "🎉 По вашей рефке зарегистрировался новый пользователь!\n"
-        f"❤️ Вам начислено {REF_BONUS} токенов!",
-    )
-  except Exception:
-    pass
+  await safe_send(
+      bot,
+      referrer_id,
+      "🎉 По вашей рефке зарегистрировался новый пользователь!\n"
+      f"❤️ Вам начислено {REF_BONUS} токенов!",
+  )
 
 
 def sub_keyboard() -> InlineKeyboardMarkup:
@@ -587,19 +707,23 @@ class SubscribeMiddleware(BaseMiddleware):
     if user is None or user.id == ADMIN_ID:
       return await handler(event, data)
 
+    # Забаненные пользователи не могут пользоваться ботом
     until, reason = await get_active_ban_info(user.id)
     if until is not None:
       msg_text = ban_text(until, reason)
       if isinstance(event, CallbackQuery):
-        await event.message.answer(msg_text)
+        if event.message:
+          await event.message.answer(msg_text)
         await event.answer()
       else:
         await event.answer(msg_text)
       return None
 
+    # /start пропускаем, чтобы реферальная ссылка успела сработать
     if isinstance(event, Message) and (event.text or "").startswith("/start"):
       return await handler(event, data)
 
+    # кнопку проверки подписки пропускаем
     if isinstance(event, CallbackQuery) and event.data == "check_sub":
       return await handler(event, data)
 
@@ -608,7 +732,8 @@ class SubscribeMiddleware(BaseMiddleware):
       return await handler(event, data)
 
     if isinstance(event, CallbackQuery):
-      await event.message.answer(SUB_TEXT, reply_markup=sub_keyboard())
+      if event.message:
+        await event.message.answer(SUB_TEXT, reply_markup=sub_keyboard())
       await event.answer()
     else:
       await event.answer(SUB_TEXT, reply_markup=sub_keyboard())
@@ -639,73 +764,66 @@ def get_main_keyboard(user_id):
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-async def grant_tokens(target_id: int, amount: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
+# --- ВЫДАЧА ТОКЕНОВ, ПРЕМИУМА, ПРОМОКОДЫ ---
+
+
+async def _add_balance(target_id: int, column: str, amount: int) -> None:
+  if column not in ("tokens", "y_tokens", "full_tokens"):
+    raise ValueError("bad column")
+  async with connect() as db:
+    await ensure_user(db, target_id)
     await db.execute(
-        """
-        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-        VALUES (?, ?, 0, 0, 0, 0, 0, 0)
-        ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
-        """,
-        (target_id, amount, amount),
+        f"UPDATE users SET {column} = COALESCE({column}, 0) + ? WHERE"
+        " user_id = ?",
+        (amount, target_id),
     )
     await db.commit()
+
+
+async def grant_tokens(target_id: int, amount: int) -> None:
+  await _add_balance(target_id, "tokens", amount)
 
 
 async def grant_y_tokens(target_id: int, amount: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        """
-        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-        VALUES (?, 0, ?, 0, 0, 0, 0, 0)
-        ON CONFLICT(user_id) DO UPDATE SET y_tokens = COALESCE(y_tokens, 0) + ?
-        """,
-        (target_id, amount, amount),
-    )
-    await db.commit()
+  await _add_balance(target_id, "y_tokens", amount)
 
 
 async def grant_full_tokens(target_id: int, amount: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        """
-        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-        VALUES (?, 0, 0, ?, 0, 0, 0, 0)
-        ON CONFLICT(user_id) DO UPDATE SET full_tokens = COALESCE(full_tokens, 0) + ?
-        """,
-        (target_id, amount, amount),
-    )
-    await db.commit()
+  await _add_balance(target_id, "full_tokens", amount)
+
+
+def premium_active(is_prem, expires_str) -> bool:
+  if is_prem != 1:
+    return False
+  exp = parse_dt(expires_str)
+  return exp is None or exp > datetime.datetime.now()
+
+
+async def apply_premium(db, user_id: int, days: int) -> datetime.datetime:
+  """Выдаёт/продлевает премиум в уже открытом соединении (без commit)."""
+  await ensure_user(db, user_id)
+  async with db.execute(
+      "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
+      (user_id,),
+  ) as cur:
+    row = await cur.fetchone()
+  now = datetime.datetime.now()
+  base = now
+  if row and row[0] == 1:
+    cur_exp = parse_dt(row[1])
+    if cur_exp and cur_exp > now:
+      base = cur_exp
+  new_expire = base + datetime.timedelta(days=days)
+  await db.execute(
+      "UPDATE users SET is_premium = 1, premium_expires = ? WHERE user_id = ?",
+      (new_expire.strftime(DT_FORMAT), user_id),
+  )
+  return new_expire
 
 
 async def grant_premium(target_id: int, days: int) -> datetime.datetime:
-  now = datetime.datetime.now()
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
-        (target_id,),
-    ) as cursor:
-      u_info = await cursor.fetchone()
-
-    base_date = now
-    if u_info and u_info[0] == 1 and u_info[1]:
-      try:
-        curr_exp = datetime.datetime.strptime(u_info[1], DT_FORMAT)
-        if curr_exp > now:
-          base_date = curr_exp
-      except Exception:
-        pass
-
-    new_expire = base_date + datetime.timedelta(days=days)
-    expire_str = new_expire.strftime(DT_FORMAT)
-    await db.execute(
-        """
-        INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-        VALUES (?, 0, 0, 0, 1, 0, 0, 0, ?)
-        ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
-        """,
-        (target_id, expire_str, expire_str),
-    )
+  async with connect() as db:
+    new_expire = await apply_premium(db, target_id, days)
     await db.commit()
   return new_expire
 
@@ -714,97 +832,67 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
   code_text = (code_text or "").strip()
   if not code_text:
     return "❌ Промокод не указан."
-
   try:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect() as db:
       async with db.execute(
-          "SELECT code, reward_type, reward_value, max_uses, used_count "
-          "FROM promocodes WHERE LOWER(code) = LOWER(?)",
+          "SELECT code, reward_type, reward_value, max_uses, used_count"
+          " FROM promocodes WHERE LOWER(code) = LOWER(?)",
           (code_text,),
       ) as cur:
         promo = await cur.fetchone()
-
       if not promo:
         return "❌ Неверный или несуществующий промокод."
 
-      real_code, reward_type, reward_value, max_uses, used_count = promo
+      real_code, reward_type, reward_value, _max_uses, _used = promo
+      try:
+        val = int(reward_value)
+      except (TypeError, ValueError):
+        return "❌ У промокода неверно задана награда."
+      if reward_type not in ("tokens", "premium"):
+        return "❌ Неизвестный тип награды у промокода."
 
-      async with db.execute(
-          "SELECT 1 FROM promo_activations WHERE user_id = ? AND"
-          " LOWER(code) = LOWER(?)",
-          (user_id, real_code),
-      ) as cur:
-        if await cur.fetchone():
-          return "❌ Вы уже активировали этот промокод!"
+      await ensure_user(db, user_id)
+      # Активация: PRIMARY KEY не даст активировать дважды
+      try:
+        await db.execute(
+            "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
+            (user_id, real_code),
+        )
+      except aiosqlite.IntegrityError:
+        return "❌ Вы уже активировали этот промокод!"
 
-      if max_uses > 0 and used_count >= max_uses:
+      # Лимит активаций проверяем атомарно
+      cur = await db.execute(
+          "UPDATE promocodes SET used_count = COALESCE(used_count, 0) + 1"
+          " WHERE code = ? AND (COALESCE(max_uses, 0) = 0 OR"
+          " COALESCE(used_count, 0) < max_uses)",
+          (real_code,),
+      )
+      if cur.rowcount == 0:
+        await db.rollback()
         return "❌ У этого промокода закончились активации."
-
-      val = int(reward_value)
 
       if reward_type == "tokens":
         await db.execute(
-            """
-            INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated)
-            VALUES (?, ?, 0, 0, 0, 0, 0, 0)
-            ON CONFLICT(user_id) DO UPDATE SET tokens = COALESCE(tokens, 0) + ?
-            """,
-            (user_id, val, val),
+            "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE"
+            " user_id = ?",
+            (val, user_id),
         )
         reply = f"✅ Промокод активирован!\n🎁 Вам зачислено: <b>{val} токенов</b>"
-
-      elif reward_type == "premium":
-        async with db.execute(
-            "SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cur:
-          u_info = await cur.fetchone()
-
-        now = datetime.datetime.now()
-        base_date = now
-        if u_info and u_info[0] == 1 and u_info[1]:
-          try:
-            curr_exp = datetime.datetime.strptime(u_info[1], DT_FORMAT)
-            if curr_exp > now:
-              base_date = curr_exp
-          except Exception:
-            pass
-
-        new_expire = base_date + datetime.timedelta(days=val)
-        expire_str = new_expire.strftime(DT_FORMAT)
-        await db.execute(
-            """
-            INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium, bought_folders, referrer_id, ref_activated, premium_expires)
-            VALUES (?, 0, 0, 0, 1, 0, 0, 0, ?)
-            ON CONFLICT(user_id) DO UPDATE SET is_premium = 1, premium_expires = ?
-            """,
-            (user_id, expire_str, expire_str),
-        )
+      else:
+        new_expire = await apply_premium(db, user_id, val)
         reply = (
             f"✅ Промокод активирован!\n👑 Премиум на <b>{val} дней</b> "
             f"(до {new_expire.strftime('%d.%m.%Y')})!"
         )
-      else:
-        return "❌ Неизвестный тип награды у промокода."
-
-      await db.execute(
-          "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
-          (user_id, real_code),
-      )
-      await db.execute(
-          "UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?",
-          (real_code,),
-      )
       await db.commit()
-
     return reply
-
   except Exception as e:
     logging.exception("Ошибка промокода")
     return f"❌ Ошибка обработки: {esc(e)}"
 
 
-# --- АДМИНСКИЕ КОМАНДЫ ---
+# --- СТАРТ, ПРОМОКОД, ОТМЕНА ---
 
 
 @router.message(Command("start"))
@@ -820,19 +908,25 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       referrer_id = potential_ref
 
   now_str = datetime.datetime.now().strftime(DT_FORMAT)
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     async with db.execute(
-        "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
+        "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
     ) as cursor:
       existing_user = await cursor.fetchone()
 
     if existing_user is None:
-      ref_to_save = referrer_id if referrer_id else 0
+      # Реферером может быть только тот, кто уже есть в базе
+      if referrer_id:
+        async with db.execute(
+            "SELECT 1 FROM users WHERE user_id = ?", (referrer_id,)
+        ) as cursor:
+          if await cursor.fetchone() is None:
+            referrer_id = None
       await db.execute(
-          "INSERT INTO users (user_id, tokens, y_tokens, full_tokens, is_premium,"
-          " bought_folders, referrer_id, ref_activated, ref_joined_at) VALUES"
-          " (?, 0, 0, 0, 0, 0, ?, 0, ?)",
-          (user_id, ref_to_save, now_str),
+          "INSERT INTO users (user_id, tokens, y_tokens, full_tokens,"
+          " is_premium, bought_folders, referrer_id, ref_activated,"
+          " ref_joined_at) VALUES (?, 0, 0, 0, 0, 0, ?, 0, ?)",
+          (user_id, referrer_id or 0, now_str),
       )
       await db.commit()
 
@@ -846,6 +940,14 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
   )
 
 
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+  await state.clear()
+  await message.answer(
+      "Отменено.", reply_markup=get_main_keyboard(message.from_user.id)
+  )
+
+
 @router.message(Command("promocode"))
 async def cmd_promocode(
     message: Message, command: CommandObject, state: FSMContext
@@ -853,44 +955,298 @@ async def cmd_promocode(
   await state.clear()
   user_id = message.from_user.id
   code_text = (command.args or "").strip()
-
   if code_text:
     reply = await apply_promocode(user_id, code_text)
     await message.answer(reply, reply_markup=get_main_keyboard(user_id))
     return
-
   await message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
 
 
-@router.message(Command("aura"))
-async def cmd_aura(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
+@router.callback_query(F.data == "check_sub")
+async def check_sub(callback: CallbackQuery, bot: Bot):
+  if await is_subscribed(bot, callback.from_user.id):
+    await activate_referral(bot, callback.from_user.id)
+    try:
+      await callback.message.delete()
+    except Exception:
+      pass
+    await callback.message.answer(
+        "✅ Спасибо за подписку! Выбирай раздел в меню.",
+        reply_markup=get_main_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
+  else:
+    await callback.answer("❌ Ты ещё не подписан на канал!", show_alert=True)
 
+
+# --- АДМИН-КОМАНДЫ: ВЫДАЧА, БАНЫ, ПРЕДУПРЕЖДЕНИЯ ---
+
+
+@router.message(Command("premium", "p"))
+async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  args = [a for a in (command.args or "").split() if a.lower() != "add"]
+  if len(args) != 2 or not all(a.isdigit() for a in args) or int(args[0]) <= 0:
+    await message.answer(
+        "ℹ️ Использование: <code>/p [дни] [ID]</code>\n"
+        "Пример: <code>/p 30 5681420389</code>"
+    )
+    return
+  days, target_id = int(args[0]), int(args[1])
+  try:
+    new_expire = await grant_premium(target_id, days)
+  except Exception as e:
+    logging.exception("Ошибка выдачи премиума командой")
+    await message.answer(f"❌ Ошибка выдачи премиума: {esc(e)}")
+    return
+  formatted = new_expire.strftime("%d.%m.%Y")
+  await message.answer(
+      f"✅ <b>Премиум выдан!</b>\n🆔 <code>{target_id}</code>\n📅 {days} дн."
+      f" (до {formatted})"
+  )
+  await safe_send(
+      bot,
+      target_id,
+      f"🎉 <b>Вам активирована Премиум-подписка на {days} дней!</b>\n📅 До"
+      f" <b>{formatted}</b>.\n\nТеперь любые фулы в магазине бесплатны!",
+  )
+
+
+@router.message(Command("token", "tokens", "t"))
+async def cmd_token(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  args = [a for a in (command.args or "").split() if a.lower() != "add"]
+  if len(args) != 2 or not all(a.isdigit() for a in args) or int(args[0]) <= 0:
+    await message.answer(
+        "ℹ️ Использование: <code>/t [сколько] [ID]</code>\n"
+        "Пример: <code>/t 50 5681420389</code>"
+    )
+    return
+  amount, target_id = int(args[0]), int(args[1])
+  try:
+    await grant_tokens(target_id, amount)
+  except Exception as e:
+    logging.exception("Ошибка выдачи токенов командой")
+    await message.answer(f"❌ Ошибка выдачи токенов: {esc(e)}")
+    return
+  await message.answer(
+      f"✅ Выдано <b>+{amount}</b> токенов пользователю"
+      f" <code>{target_id}</code>."
+  )
+  await safe_send(
+      bot,
+      target_id,
+      f"🎁 <b>Администратор начислил вам {amount} токенов!</b>",
+  )
+
+
+async def _special_token_cmd(
+    message: Message, command: CommandObject, bot: Bot, column: str, label: str
+):
+  if await deny(message):
+    return
+  name = "ytoken" if column == "y_tokens" else "ftoken"
   parts = (command.args or "").split()
   if (
-      len(parts) >= 1
-      and parts[0].lower() == "del"
-      and len(parts) == 2
-      and parts[1].isdigit()
+      len(parts) != 3
+      or parts[0].lower() not in ("add", "del")
+      or not parts[1].isdigit()
+      or not parts[2].isdigit()
   ):
-    target_id = int(parts[1])
-    async with aiosqlite.connect(DB_NAME) as db:
+    await message.answer(
+        f"ℹ️ Использование:\n<code>/{name} add [ID] [количество]</code>\n"
+        f"<code>/{name} del [ID] [количество]</code>"
+    )
+    return
+  action, target_id, amount = parts[0].lower(), int(parts[1]), int(parts[2])
+  async with connect() as db:
+    await ensure_user(db, target_id)
+    if action == "add":
       await db.execute(
-          "UPDATE users SET aura_type = NULL, aura_name = NULL, aura_percent ="
-          " 0, aura_expires = NULL WHERE user_id = ?",
+          f"UPDATE users SET {column} = COALESCE({column}, 0) + ? WHERE"
+          " user_id = ?",
+          (amount, target_id),
+      )
+    else:
+      await db.execute(
+          f"UPDATE users SET {column} = MAX(0, COALESCE({column}, 0) - ?)"
+          " WHERE user_id = ?",
+          (amount, target_id),
+      )
+    await db.commit()
+  if action == "add":
+    await message.answer(
+        f"✅ <code>{target_id}</code>: начислено <b>+{amount}</b> {label}."
+    )
+    await safe_send(
+        bot,
+        target_id,
+        f"🎁 Администратор начислил вам <b>+{amount}</b> {label}!",
+    )
+  else:
+    await message.answer(
+        f"✅ У <code>{target_id}</code> списано <b>{amount}</b> {label}."
+    )
+
+
+@router.message(Command("ytoken"))
+async def cmd_ytoken(message: Message, command: CommandObject, bot: Bot):
+  await _special_token_cmd(message, command, bot, "y_tokens", "уникальных токенов")
+
+
+@router.message(Command("ftoken"))
+async def cmd_ftoken(message: Message, command: CommandObject, bot: Bot):
+  await _special_token_cmd(message, command, bot, "full_tokens", "фулловых токенов")
+
+
+@router.message(Command("untoken"))
+async def cmd_untoken(message: Message, command: CommandObject):
+  if await deny(message):
+    return
+  args = parse_args(command, 2)
+  if not args or args[1] <= 0:
+    await message.answer(
+        "ℹ️ Использование:\n<code>/untoken [ID] [число токенов]</code>"
+    )
+    return
+  target_id, amount = args
+  new_balance = await remove_tokens(target_id, amount)
+  await message.answer(
+      f"✅ У <code>{target_id}</code> забрано до <b>{amount}</b> токенов."
+      f" Баланс: <b>{new_balance}</b>."
+  )
+
+
+@router.message(Command("unpremium"))
+async def cmd_unpremium(message: Message, command: CommandObject):
+  if await deny(message):
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer("ℹ️ Использование:\n<code>/unpremium [ID]</code>")
+    return
+  await remove_premium(args[0])
+  await message.answer(f"✅ Премиум у <code>{args[0]}</code> снят.")
+
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  parts = (command.args or "").split()
+  if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+    await message.answer(
+        "ℹ️ Использование:\n<code>/ban [ID] [дни] [причина]</code>\n"
+        "Пример: <code>/ban 5681420389 7 спам</code>\n"
+        "<i>(0 дней = бан навсегда)</i>"
+    )
+    return
+  target_id, days = int(parts[0]), int(parts[1])
+  reason = " ".join(parts[2:]) or None
+  if target_id == ADMIN_ID:
+    await message.answer("❌ Нельзя забанить админа.")
+    return
+  term = await ban_user(target_id, days, reason)
+  await message.answer(
+      f"🚫 Пользователь <code>{target_id}</code> заблокирован {term}."
+  )
+  await safe_send(
+      bot,
+      target_id,
+      f"🚫 Ваш профиль заблокирован {term}."
+      + (f"\n📝 Причина: <b>{esc(reason)}</b>" if reason else "")
+      + f"\n\n{APPEAL_TEXT}",
+  )
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer("ℹ️ Использование:\n<code>/unban [ID]</code>")
+    return
+  await unban_user(args[0])
+  await message.answer(f"✅ Пользователь <code>{args[0]}</code> разблокирован.")
+  await safe_send(bot, args[0], "✅ Ваш профиль разблокирован.")
+
+
+@router.message(Command("warn"))
+async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  parts = (command.args or "").split()
+  if not parts or not parts[0].isdigit():
+    await message.answer(
+        "ℹ️ Использование:\n<code>/warn [ID] [причина]</code>"
+    )
+    return
+  target_id = int(parts[0])
+  reason = " ".join(parts[1:]) or None
+  if target_id == ADMIN_ID:
+    await message.answer("❌ Нельзя выдать предупреждение админу.")
+    return
+  warns, banned = await add_warn(target_id, reason)
+  if banned:
+    await message.answer(
+        f"⚠️ <code>{target_id}</code> получил {warns}/{MAX_WARNS}"
+        " предупреждений и заблокирован навсегда (премиум снят, токены"
+        " обнулены)."
+    )
+  else:
+    await message.answer(
+        f"⚠️ <code>{target_id}</code>: выдано предупреждение"
+        f" ({warns}/{MAX_WARNS})."
+    )
+  await send_warn_notice(bot, target_id, warns, banned)
+
+
+@router.message(Command("unwarn"))
+async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer("ℹ️ Использование:\n<code>/unwarn [ID]</code>")
+    return
+  warns = await remove_warn(args[0])
+  await message.answer(
+      f"✅ У <code>{args[0]}</code> снято предупреждение (осталось"
+      f" {warns}/{MAX_WARNS})."
+  )
+  await safe_send(
+      bot,
+      args[0],
+      f"✅ С вас снято предупреждение (осталось {warns}/{MAX_WARNS}).",
+  )
+
+
+@router.message(Command("aura"))
+async def cmd_aura(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  parts = (command.args or "").split()
+
+  if len(parts) == 2 and parts[0].lower() == "del" and parts[1].isdigit():
+    target_id = int(parts[1])
+    async with connect() as db:
+      await db.execute(
+          "UPDATE users SET aura_type = NULL, aura_name = NULL,"
+          " aura_percent = 0, aura_expires = NULL WHERE user_id = ?",
           (target_id,),
       )
       await db.commit()
     await message.answer(
-        f"✅ У пользователя <code>{target_id}</code> успешно аннулирована аура."
+        f"✅ У пользователя <code>{target_id}</code> аннулирована аура."
     )
     return
 
   if (
-      len(parts) >= 5
+      len(parts) >= 6
       and parts[0].lower() == "add"
       and parts[1].isdigit()
       and parts[3].isdigit()
@@ -904,44 +1260,98 @@ async def cmd_aura(message: Message, command: CommandObject):
           " <code>roulette</code>, <code>shop</code>"
       )
       return
-    percent = int(parts[3])
-    days = int(parts[4])
+    percent, days = int(parts[3]), int(parts[4])
     aura_name = " ".join(parts[5:])
-    if not aura_name:
-      await message.answer("❌ Укажите название ауры!")
-      return
-
     expires_at = datetime.datetime.now() + datetime.timedelta(days=days)
-    expires_str = expires_at.strftime(DT_FORMAT)
-
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect() as db:
       await ensure_user(db, target_id)
       await db.execute(
           "UPDATE users SET aura_type = ?, aura_name = ?, aura_percent = ?,"
           " aura_expires = ? WHERE user_id = ?",
-          (aura_type, aura_name, percent, expires_str, target_id),
+          (
+              aura_type,
+              aura_name,
+              percent,
+              expires_at.strftime(DT_FORMAT),
+              target_id,
+          ),
       )
       await db.commit()
-
     await message.answer(
-        "✨ <b>Аура успешно выдана!</b>\n\n"
-        f"🆔 Пользователь: <code>{target_id}</code>\n"
+        "✨ <b>Аура выдана!</b>\n\n"
+        f"🆔 <code>{target_id}</code>\n"
         f"🏷 Название: <b>{esc(aura_name)}</b>\n"
         f"⚙️ Тип: <code>{aura_type}</code>\n"
         f"📊 Бонус: <b>{percent}%</b>\n"
         f"⏱ Срок: <b>{days} дн.</b> (до {expires_at.strftime('%d.%m.%Y %H:%M')})"
     )
+    await safe_send(
+        bot,
+        target_id,
+        f"✨ Вам выдана аура <b>{esc(aura_name)}</b> ({percent}%) на {days} дн.!",
+    )
     return
 
   await message.answer(
       "ℹ️ <b>Управление аурами:</b>\n\n"
-      "1️⃣ Выдать ауру:\n"
-      "<code>/aura add [ID] [lottery/roulette/shop] [процент] [дни] [Название]</code>"
-      " \n\n"
-      "2️⃣ Удалить ауру:\n"
-      "<code>/aura del [ID]</code>"
+      "Выдать:\n"
+      "<code>/aura add [ID] [lottery/roulette/shop] [процент] [дни]"
+      " [Название]</code>\n\n"
+      "Удалить:\n<code>/aura del [ID]</code>"
   )
 
+
+@router.message(Command("all"))
+async def cmd_all(message: Message, command: CommandObject, bot: Bot):
+  if await deny(message):
+    return
+  parts = (command.args or "").split()
+  if (
+      len(parts) != 2
+      or parts[0].lower() not in ("token", "tokens")
+      or not parts[1].isdigit()
+      or int(parts[1]) <= 0
+  ):
+    await message.answer(
+        "ℹ️ Использование:\n<code>/all token [сколько]</code>\n"
+        "Пример: <code>/all token 5</code> — выдать всем по 5 токенов."
+    )
+    return
+  amount = int(parts[1])
+  now_str = datetime.datetime.now().strftime(DT_FORMAT)
+  async with connect() as db:
+    cur = await db.execute(
+        "UPDATE users SET tokens = COALESCE(tokens, 0) + ?"
+        " WHERE banned_until IS NULL OR banned_until <= ?",
+        (amount, now_str),
+    )
+    await db.commit()
+    count = cur.rowcount
+    async with db.execute(
+        "SELECT user_id FROM users WHERE banned_until IS NULL"
+        " OR banned_until <= ?",
+        (now_str,),
+    ) as cur2:
+      user_ids = [row[0] for row in await cur2.fetchall()]
+
+  await message.answer(
+      f"✅ Выдано по <b>{amount}</b> токенов: <b>{count}</b> чел."
+      " Рассылаю уведомления…"
+  )
+
+  async def _notify_all():
+    for uid in user_ids:
+      await safe_send(
+          bot, uid, f"🎁 Администратор выдал всем по <b>{amount}</b> токенов!"
+      )
+      await asyncio.sleep(0.05)
+
+  task = asyncio.create_task(_notify_all())
+  _bg_tasks.add(task)
+  task.add_done_callback(_bg_tasks.discard)
+
+
+# --- РЕФЕРАЛЫ: /uref и /check ---
 
 REF_TOP_SQL = """
     SELECT user_id, is_premium, ref_count FROM (
@@ -957,21 +1367,16 @@ REF_TOP_SQL = """
 """
 
 
-def parse_dt(value):
-  try:
-    return datetime.datetime.strptime(value, DT_FORMAT) if value else None
-  except Exception:
-    return None
-
-
 async def ref_summary(db, uid: int):
+  """(подписавшиеся, не подписавшиеся, добавлено админом, общий доход)."""
   async with db.execute(
       "SELECT COALESCE(SUM(ref_activated = 1), 0),"
       " COALESCE(SUM(ref_activated = 0), 0), COALESCE(SUM(ref_income), 0)"
       " FROM users WHERE referrer_id = ?",
       (uid,),
   ) as c:
-    active, pending, income = await c.fetchone()
+    row = await c.fetchone()
+  active, pending, income = row[0], row[1], row[2]
   async with db.execute(
       "SELECT COALESCE(ref_extra, 0) FROM users WHERE user_id = ?", (uid,)
   ) as c:
@@ -981,7 +1386,7 @@ async def ref_summary(db, uid: int):
 
 
 async def uref_add(target_id: int, count: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await ensure_user(db, target_id)
     await db.execute(
         "UPDATE users SET ref_extra = COALESCE(ref_extra, 0) + ?,"
@@ -992,16 +1397,19 @@ async def uref_add(target_id: int, count: int) -> None:
 
 
 async def uref_remove(target_id: int, count):
+  """Убирает count рефералов (None = всех) и забирает их доход.
+  Возвращает (убрано, забрано токенов, баланс)."""
   removed, taken = 0, 0
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await ensure_user(db, target_id)
     async with db.execute(
         "SELECT COALESCE(ref_extra, 0) FROM users WHERE user_id = ?",
         (target_id,),
     ) as c:
       row = await c.fetchone()
-      extra = row[0] if row else 0
+    extra = row[0] if row else 0
 
+    # сначала снимаем рефералов, добавленных админом
     n_extra = extra if count is None else min(count, extra)
     if n_extra:
       await db.execute(
@@ -1011,6 +1419,7 @@ async def uref_remove(target_id: int, count):
       removed += n_extra
       taken += n_extra * REF_BONUS
 
+    # потом настоящих
     left = None if count is None else count - n_extra
     if left is None or left > 0:
       where = "referrer_id = ?" + (
@@ -1031,9 +1440,11 @@ async def uref_remove(target_id: int, count):
           removed += 1
           taken += income if income > 0 else REF_BONUS
         await db.execute(
-            "UPDATE users SET referrer_id = 0, ref_income = 0 WHERE user_id = ?",
+            "UPDATE users SET referrer_id = 0, ref_income = 0 WHERE"
+            " user_id = ?",
             (rid,),
         )
+
     if taken:
       await db.execute(
           "UPDATE users SET tokens = MAX(0, COALESCE(tokens, 0) - ?)"
@@ -1050,20 +1461,22 @@ async def uref_remove(target_id: int, count):
 
 @router.message(Command("uref"))
 async def cmd_uref(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
+  if await deny(message):
     return
   usage = (
       "ℹ️ Рефералы:\n"
       "<code>/uref [ID]</code> — список рефералов и доход\n"
-      "<code>/uref add [ID] [число]</code> — добавить рефералов\n"
-      "<code>/uref del [ID] [число]</code> — убрать N рефералов\n"
+      f"<code>/uref add [ID] [число]</code> — добавить (+{REF_BONUS} токенов"
+      " за каждого)\n"
+      "<code>/uref del [ID] [число]</code> — убрать N рефералов и забрать"
+      " их доход\n"
       "<code>/uref del [ID] all</code> — убрать всех"
   )
   parts = (command.args or "").split()
+
   if len(parts) == 1 and parts[0].isdigit():
     target_id = int(parts[0])
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect() as db:
       active, pending, extra, income = await ref_summary(db, target_id)
       async with db.execute(
           "SELECT user_id, ref_activated, COALESCE(ref_income, 0),"
@@ -1072,19 +1485,16 @@ async def cmd_uref(message: Message, command: CommandObject):
           (target_id,),
       ) as c:
         rows = await c.fetchall()
-
     lines = []
     for rid, act, inc, joined_at in rows:
       time_str = f" [{joined_at}]" if joined_at else ""
       status = "✅" if act else "⏳ не подписан"
       lines.append(f"• <code>{rid}</code> — {status}{time_str}, принёс {inc}")
-
-    lines_str = "\n".join(lines) or "— нет —"
     await message.answer(
         f"👥 <b>Рефералы ID</b> <code>{target_id}</code>\n"
         f"✅ Засчитано: <b>{active + extra}</b> (из них админом: {extra})\n"
         f"⏳ Не подписались: <b>{pending}</b>\n"
-        f"💰 Доход: <b>{income}</b> токенов\n\n{lines_str}"
+        f"💰 Доход: <b>{income}</b> токенов\n\n" + ("\n".join(lines) or "— нет —")
     )
     return
 
@@ -1100,7 +1510,10 @@ async def cmd_uref(message: Message, command: CommandObject):
         return
       count = int(raw)
       await uref_add(target_id, count)
-      await message.answer(f"✅ Добавлено рефералов: {count}")
+      await message.answer(
+          f"✅ ID <code>{target_id}</code>: добавлено рефералов:"
+          f" <b>{count}</b>, начислено <b>{count * REF_BONUS}</b> токенов."
+      )
       return
     if raw == "all":
       count = None
@@ -1111,134 +1524,27 @@ async def cmd_uref(message: Message, command: CommandObject):
       return
     removed, taken, balance = await uref_remove(target_id, count)
     await message.answer(
-        f"✅ Убрано рефералов: {removed}, списано дохода: {taken}"
+        f"✅ ID <code>{target_id}</code>: убрано рефералов:"
+        f" <b>{removed}</b>, списано дохода: <b>{taken}</b> токенов.\n"
+        f"Баланс сейчас: <b>{balance}</b>."
     )
     return
+
   await message.answer(usage)
-
-
-@router.message(Command("ytoken"))
-async def cmd_ytoken(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  parts = (command.args or "").split()
-  if (
-      len(parts) == 3
-      and parts[0].lower() in ("add", "del")
-      and parts[1].isdigit()
-      and parts[2].isdigit()
-  ):
-    action, target_id, amount = parts[0].lower(), int(parts[1]), int(parts[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-      await ensure_user(db, target_id)
-      if action == "add":
-        await db.execute(
-            "UPDATE users SET y_tokens = COALESCE(y_tokens, 0) + ? WHERE"
-            " user_id = ?",
-            (amount, target_id),
-        )
-        await db.commit()
-        await message.answer(
-            f"✅ Пользователю <code>{target_id}</code> начислено"
-            f" <b>+{amount}</b> уникальных токенов."
-        )
-        try:
-          await message.bot.send_message(
-              target_id,
-              f"🎁 Администратор начислил вам <b>+{amount}</b> уникальных"
-              " токенов!",
-          )
-        except Exception:
-          pass
-      else:
-        await db.execute(
-            "UPDATE users SET y_tokens = MAX(0, COALESCE(y_tokens, 0) - ?) WHERE"
-            " user_id = ?",
-            (amount, target_id),
-        )
-        await db.commit()
-        await message.answer(
-            f"✅ У пользователя <code>{target_id}</code> списано"
-            f" <b>{amount}</b> уникальных токенов."
-        )
-    return
-  await message.answer(
-      "ℹ️ Использование:\n<code>/ytoken add [ID] [количество]</code>\n<code>/ytoken"
-      " del [ID] [количество]</code>"
-  )
-
-
-@router.message(Command("ftoken"))
-async def cmd_ftoken(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  parts = (command.args or "").split()
-  if (
-      len(parts) == 3
-      and parts[0].lower() in ("add", "del")
-      and parts[1].isdigit()
-      and parts[2].isdigit()
-  ):
-    action, target_id, amount = parts[0].lower(), int(parts[1]), int(parts[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-      await ensure_user(db, target_id)
-      if action == "add":
-        await db.execute(
-            "UPDATE users SET full_tokens = COALESCE(full_tokens, 0) + ? WHERE"
-            " user_id = ?",
-            (amount, target_id),
-        )
-        await db.commit()
-        await message.answer(
-            f"✅ Пользователю <code>{target_id}</code> начислено"
-            f" <b>+{amount}</b> фулловых токенов."
-        )
-        try:
-          await message.bot.send_message(
-              target_id,
-              f"🎁 Администратор начислил вам <b>+{amount}</b> фулловых"
-              " токенов!",
-          )
-        except Exception:
-          pass
-      else:
-        await db.execute(
-            "UPDATE users SET full_tokens = MAX(0, COALESCE(full_tokens, 0) - ?) WHERE"
-            " user_id = ?",
-            (amount, target_id),
-        )
-        await db.commit()
-        await message.answer(
-            f"✅ У пользователя <code>{target_id}</code> списано"
-            f" <b>{amount}</b> фулловых токенов."
-        )
-    return
-  await message.answer(
-      "ℹ️ Использование:\n<code>/ftoken add [ID] [количество]</code>\n<code>/ftoken"
-      " del [ID] [количество]</code>"
-  )
 
 
 @router.message(Command("check"))
 async def cmd_check(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
+  if await deny(message):
     return
-  args = (command.args or "").strip()
+  args = parse_args(command, 1)
   if not args:
-    parts = (message.text or "").split()
-    if len(parts) > 1:
-      args = parts[1]
-
-  if not args.isdigit():
     await message.answer("ℹ️ Использование:\n<code>/check [ID]</code>")
     return
-
-  target_id = int(args)
+  target_id = args[0]
   now = datetime.datetime.now()
-  async with aiosqlite.connect(DB_NAME) as db:
+
+  async with connect() as db:
     db.row_factory = aiosqlite.Row
     async with db.execute(
         "SELECT * FROM users WHERE user_id = ?", (target_id,)
@@ -1247,35 +1553,38 @@ async def cmd_check(message: Message, command: CommandObject):
     if not u:
       await message.answer("❌ Пользователь не найден в базе.")
       return
-
     active, pending, extra, income = await ref_summary(db, target_id)
     async with db.execute(
         "SELECT COUNT(*), COALESCE(SUM(COALESCE(paid, 0)), 0)"
         " FROM lottery_participants WHERE user_id = ?",
         (target_id,),
     ) as c:
-      lot_n, lot_paid = await c.fetchone()
+      lot = await c.fetchone()
     async with db.execute(
         "SELECT COALESCE(games, 0), COALESCE(wins, 0) FROM roulette_state"
         " WHERE user_id = ?",
         (target_id,),
     ) as c:
       rl = await c.fetchone()
+    async with db.execute(
+        "SELECT COUNT(*) FROM ex_offers WHERE owner_id = ? AND status = 'open'",
+        (target_id,),
+    ) as c:
+      open_offers = (await c.fetchone())[0]
+  lot_n, lot_paid = lot[0], lot[1]
+  rl_games, rl_wins = (rl[0], rl[1]) if rl else (0, 0)
 
-  rl_games, rl_wins = rl if rl else (0, 0)
   prem_exp = parse_dt(u["premium_expires"])
-  if u["is_premium"] == 1 and (prem_exp is None or prem_exp > now):
+  if premium_active(u["is_premium"], u["premium_expires"]):
     prem = (
-        f"✅ до {prem_exp.strftime('%d.%m.%Y %H:%M')}"
-        if prem_exp
-        else "✅ активна"
+        f"✅ до {prem_exp.strftime('%d.%m.%Y %H:%M')}" if prem_exp else "✅ активна"
     )
   else:
     prem = "❌ нет"
 
   aura = await get_user_aura(target_id)
   aura_info = (
-      f"✨ {aura['name']} ({aura['type']}, {aura['percent']}%) до"
+      f"✨ {esc(aura['name'])} ({aura['type']}, {aura['percent']}%) до"
       f" {aura['expires'].strftime('%d.%m.%Y %H:%M')}"
       if aura
       else "❌ нет"
@@ -1289,170 +1598,97 @@ async def cmd_check(message: Message, command: CommandObject):
       return "🚫 навсегда"
     return f"🚫 до {dt.strftime('%d.%m.%Y %H:%M')}"
 
+  if u["referrer_id"]:
+    invited = f"<code>{u['referrer_id']}</code> " + (
+        "(подписался ✅)" if u["ref_activated"] else "(ещё не подписался ⏳)"
+    )
+  else:
+    invited = "никто / сброшено"
+
   await message.answer(
       f"🔎 <b>Аккаунт</b> <code>{target_id}</code>\n\n"
       f"🪙 Токены: <b>{u['tokens'] or 0}</b>\n"
       f"💎 Уникальные токены: <b>{u['y_tokens'] or 0}</b>\n"
-      f"📦 Фулловые токены: <b>{u.get('full_tokens', 0)}</b>\n"
+      f"📦 Фулловые токены: <b>{u['full_tokens'] or 0}</b>\n"
       f"👑 Премиум: {prem}\n"
       f"✨ Аура: {aura_info}\n"
+      f"📦 Куплено фулов: {u['bought_folders'] or 0}\n"
       f"⚠️ Предупреждения: {u['warns'] or 0}/{MAX_WARNS}\n"
-      f"🚫 Бан: {until_text(u['banned_until'])}\n\n"
-      f"👥 Рефералы: {active + extra} (доход: {income})\n"
-      f"🎰 Лотерея побед: {u.get('lottery_wins', 0)}\n"
-      f"🎲 Рулетка побед: {rl_wins} из {rl_games}"
+      f"🚫 Бан: {until_text(u['banned_until'])}\n"
+      f"🔒 Ограничение обменов: {until_text(u['restricted_until'])}\n\n"
+      "👥 <b>Рефералы</b>\n"
+      f"• Засчитано: <b>{active + extra}</b> (добавлено админом: {extra})\n"
+      f"• Не подписались: {pending}\n"
+      f"• Доход с рефералов: <b>{income}</b> токенов\n"
+      f"• Пригласил его: {invited}\n\n"
+      "🔄 <b>Обмены</b>\n"
+      f"• Проведено: <b>{u['exchanges'] or 0}</b>\n"
+      f"• Открытых сейчас: {open_offers}\n\n"
+      "🎰 <b>Лотерея</b>\n"
+      f"• Участий: <b>{lot_n}</b>, заплачено всего: {lot_paid} токенов\n"
+      f"• Побед за период: {u['lottery_wins'] or 0}\n\n"
+      "🎲 <b>Рулетка</b>\n"
+      f"• Игр: <b>{rl_games}</b> (побед: {rl_wins}, поражений:"
+      f" {rl_games - rl_wins})"
   )
 
 
-@router.message(Command("premium", "p"))
-async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  args = (command.args or "").split()
-  if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
-    await message.answer("ℹ️ Использование: <code>/p [дни] [ID]</code>")
-    return
-  days, target_id = int(args[0]), int(args[1])
-  new_expire = await grant_premium(target_id, days)
-  formatted_date = new_expire.strftime("%d.%m.%Y")
-  await message.answer(
-      f"✅ Премиум выдан пользователю <code>{target_id}</code> на {days} дн."
-  )
-  try:
-    await bot.send_message(
-        target_id, f"🎉 Вам активирована Премиум-подписка на {days} дней!"
-    )
-  except Exception:
-    pass
-
-
-@router.message(Command("token", "tokens", "t"))
-async def cmd_token(message: Message, command: CommandObject, bot: Bot):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  args = (command.args or "").split()
-  if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
-    await message.answer("ℹ️ Использование: <code>/t [сколько] [ID]</code>")
-    return
-  amount, target_id = int(args[0]), int(args[1])
-  await grant_tokens(target_id, amount)
-  await message.answer(
-      f"✅ Выдано +{amount} токенов пользователю <code>{target_id}</code>."
-  )
-
-
-@router.message(Command("ban"))
-async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  parts = (command.args or "").split()
-  if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-    await message.answer(
-        "ℹ️ Использование: <code>/ban [ID] [дни] [причина]</code>"
-    )
-    return
-  target_id, days = int(parts[0]), int(parts[1])
-  reason = " ".join(parts[2:]) if len(parts) > 2 else None
-  term = await ban_user(target_id, days, reason)
-  await message.answer(
-      f"🚫 Пользователь <code>{target_id}</code> заблокирован {term}."
-  )
-
-
-@router.message(Command("unban"))
-async def cmd_unban(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  parts = (command.args or "").split()
-  if len(parts) != 1 or not parts[0].isdigit():
-    await message.answer("ℹ️ Использование: <code>/unban [ID]</code>")
-    return
-  target_id = int(parts[0])
-  await unban_user(target_id)
-  await message.answer(f"✅ Пользователь <code>{target_id}</code> разблокирован.")
-
-
-@router.message(Command("warn"))
-async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  parts = (command.args or "").split()
-  if len(parts) < 1 or not parts[0].isdigit():
-    await message.answer("ℹ️ Использование: <code>/warn [ID] [причина]</code>")
-    return
-  target_id = int(parts[0])
-  reason = " ".join(parts[1:]) if len(parts) > 1 else None
-  warns, banned = await add_warn(target_id, reason)
-  await message.answer(
-      f"⚠️ Предупреждение выдано пользователю <code>{target_id}</code>"
-      f" ({warns}/{MAX_WARNS})."
-  )
-
-
-@router.message(Command("unwarn"))
-async def cmd_unwarn(message: Message, command: CommandObject):
-  if message.from_user.id != ADMIN_ID:
-    await message.answer("⛔️ У тебя нет доступа!")
-    return
-  parts = (command.args or "").split()
-  if len(parts) != 1 or not parts[0].isdigit():
-    await message.answer("ℹ️ Использование: <code>/unwarn [ID]</code>")
-    return
-  warns = await remove_warn(int(parts[0]))
-  await message.answer(
-      f"✅ Предупреждение снято (осталось {warns}/{MAX_WARNS})."
-  )
+# --- ТОПЫ ---
 
 
 def tops_menu_keyboard() -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="👥 Топ по рефералам", callback_data="top_refs"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🎰 Топ по лотерее", callback_data="top_lottery"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🎲 Топ по рулетке", callback_data="top_roulette"
-              )
-          ],
+          [InlineKeyboardButton(text="👥 Топ по рефералам", callback_data="top_refs")],
+          [InlineKeyboardButton(text="🎰 Топ по лотерее", callback_data="top_lottery")],
+          [InlineKeyboardButton(text="🎲 Топ по рулетке", callback_data="top_roulette")],
       ]
   )
+
+
+async def get_next_reset(db) -> datetime.datetime:
+  async with db.execute("SELECT next_reset FROM top_reset WHERE id = 1") as cur:
+    row = await cur.fetchone()
+  nxt = parse_dt(row[0]) if row and row[0] else None
+  if nxt is None:
+    nxt = datetime.datetime.now() + datetime.timedelta(days=TOP_RESET_DAYS)
+    await db.execute(
+        "INSERT OR REPLACE INTO top_reset (id, next_reset) VALUES (1, ?)",
+        (nxt.strftime(DT_FORMAT),),
+    )
+    await db.commit()
+  return nxt
 
 
 @router.callback_query(F.data.startswith("top_reward_"))
 async def process_top_reward(callback: CallbackQuery):
   parts = callback.data.split("_")
-  winner_id = int(parts[2])
-  reward_type = parts[3]
-
+  try:
+    winner_id = int(parts[2])
+    reward_type = parts[3]
+  except (IndexError, ValueError):
+    await callback.answer()
+    return
   if callback.from_user.id != winner_id:
     await callback.answer("❌ Это меню не для вас!", show_alert=True)
     return
 
-  if reward_type == "prem":
-    await grant_premium(winner_id, 7)
-    text = "✅ Вы успешно получили <b>Премиум-подписку на 7 дней</b>!"
-  else:
-    async with aiosqlite.connect(DB_NAME) as db:
-      await db.execute(
-          "UPDATE users SET y_tokens = COALESCE(y_tokens, 0) + 2 WHERE user_id = ?",
-          (winner_id,),
-      )
-      await db.commit()
-    text = "✅ Вы успешно получили <b>2 уникальных токена</b>!"
+  # Сначала убираем кнопки: повторное нажатие уже не сработает
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    await callback.answer("Награда уже получена.", show_alert=True)
+    return
 
+  if reward_type == "prem":
+    await grant_premium(winner_id, TOP_REWARD_PREMIUM_DAYS)
+    text = (
+        f"✅ Вы получили <b>Премиум-подписку на {TOP_REWARD_PREMIUM_DAYS}"
+        " дней</b>!"
+    )
+  else:
+    await grant_y_tokens(winner_id, TOP_REWARD_YTOKENS)
+    text = f"✅ Вы получили <b>{TOP_REWARD_YTOKENS} уникальных токена</b>!"
   try:
     await callback.message.edit_text(text, reply_markup=None)
   except Exception:
@@ -1460,88 +1696,54 @@ async def process_top_reward(callback: CallbackQuery):
   await callback.answer()
 
 
-@router.callback_query(F.data.startswith("top_"))
+@router.callback_query(F.data.in_({"top_refs", "top_lottery", "top_roulette"}))
 async def show_specific_top(callback: CallbackQuery):
-  if callback.data.startswith("top_reward_"):
-    return
   top_type = callback.data.split("_")[1]
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT next_reset FROM top_reset WHERE id = 1") as cursor:
-      row = await cursor.fetchone()
-    
-    now = datetime.datetime.now()
-    if not row or not row[0]:
-      next_reset = now + datetime.timedelta(days=14)
-      await db.execute("INSERT OR REPLACE INTO top_reset (id, next_reset) VALUES (1, ?)", (next_reset.strftime(DT_FORMAT),))
-      await db.commit()
-    else:
-      try:
-        next_reset = datetime.datetime.strptime(row[0], DT_FORMAT)
-      except Exception:
-        next_reset = now + datetime.timedelta(days=14)
-
-    delta = next_reset - now
-    if delta.total_seconds() > 0:
-      days_left = delta.days
-      hours_left = delta.seconds // 3600
-      timer_text = f"через {days_left} дн. {hours_left} ч."
-    else:
-      timer_text = "скоро сброс..."
+  async with connect() as db:
+    next_reset = await get_next_reset(db)
 
     if top_type == "refs":
       async with db.execute(REF_TOP_SQL, (10,)) as cursor:
         rows = await cursor.fetchall()
       title = "🏆 <b>Топ-10 по рефералам</b>"
-      items = [
-          f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
-          f" <b>{r[2]}</b> реф."
-          for i, r in enumerate(rows, 1)
-      ]
-
+      unit = "реф."
     elif top_type == "lottery":
-      async with db.execute("PRAGMA table_info(users)") as cur:
-        cols = {row[1] for row in await cur.fetchall()}
-      if "lottery_wins" not in cols:
-        rows = []
-      else:
-        async with db.execute(
-            "SELECT user_id, is_premium, COALESCE(lottery_wins, 0) as lw FROM"
-            " users WHERE lw > 0 ORDER BY lw DESC LIMIT 10"
-        ) as cursor:
-          rows = await cursor.fetchall()
-      title = "🏆 <b>Топ-10 по победам в лотерее</b>"
-      items = [
-          f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
-          f" <b>{r[2]}</b> побед"
-          for i, r in enumerate(rows, 1)
-      ]
-
-    else:  # roulette
       async with db.execute(
-          "SELECT u.user_id, u.is_premium, COALESCE(r.wins, 0) as w FROM users"
-          " u LEFT JOIN roulette_state r ON u.user_id = r.user_id WHERE w > 0"
+          "SELECT user_id, is_premium, COALESCE(lottery_wins, 0) AS lw FROM"
+          " users WHERE lw > 0 ORDER BY lw DESC LIMIT 10"
+      ) as cursor:
+        rows = await cursor.fetchall()
+      title = "🏆 <b>Топ-10 по победам в лотерее</b>"
+      unit = "побед"
+    else:
+      async with db.execute(
+          "SELECT u.user_id, u.is_premium, COALESCE(r.wins, 0) AS w FROM users"
+          " u JOIN roulette_state r ON u.user_id = r.user_id WHERE w > 0"
           " ORDER BY w DESC LIMIT 10"
       ) as cursor:
         rows = await cursor.fetchall()
       title = "🏆 <b>Топ-10 по победам в рулетке</b>"
-      items = [
-          f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
-          f" <b>{r[2]}</b> побед"
-          for i, r in enumerate(rows, 1)
-      ]
+      unit = "побед"
+
+  items = [
+      f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
+      f" <b>{r[2]}</b> {unit}"
+      for i, r in enumerate(rows, 1)
+  ]
+
+  delta = next_reset - datetime.datetime.now()
+  if delta.total_seconds() > 0:
+    timer_text = f"через {delta.days} дн. {delta.seconds // 3600} ч."
+  else:
+    timer_text = "скоро сброс..."
 
   footer = (
       f"⏳ <b>Сброс топа:</b> {timer_text}\n"
-      "🎁 <b>Награда 1 места (на выбор):</b> Премиум на 7 дней <u>ИЛИ</u> 2 уникальных токена!"
+      "🎁 <b>Награда 1 места (на выбор):</b> Премиум на"
+      f" {TOP_REWARD_PREMIUM_DAYS} дней <u>ИЛИ</u> {TOP_REWARD_YTOKENS}"
+      " уникальных токена!"
   )
-
-  text = (
-      title
-      + "\n\n"
-      + ("\n".join(items) if items else "Пока пусто.")
-      + f"\n\n{footer}"
-  )
-  
+  text = title + "\n\n" + ("\n".join(items) if items else "Пока пусто.") + f"\n\n{footer}"
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
           [
@@ -1560,2042 +1762,20 @@ async def show_specific_top(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_tops")
 async def back_to_tops(callback: CallbackQuery):
-  kb = tops_menu_keyboard()
   try:
     await callback.message.edit_text(
-        "🏆 <b>Выберите категорию топа:</b>", reply_markup=kb
-    )
-  except Exception:
-    pass
-  await callback.answer()
-
-
-# --- ОБРАБОТЧИК КНОПОК ГЛАВНОГО МЕНЮ ---
-
-
-@router.message(
-    F.text.in_(
-        {
-            "👤 Мой Профиль",
-            "🛒 Магазин",
-            "🛍 Магазин",
-            "💎 Уникальный магазин",
-            "👥 Реферальная система",
-            "🏆 Топ игроков",
-            "🪙 Как получить токены?",
-            "👑 Премиум-подписка",
-            "🎰 Лотерея",
-            "🔄 Обмены",
-            "🎲 Рулетка",
-            "⚙️ Админ-панель",
-        }
-    )
-)
-async def menu_router(message: Message, bot: Bot, state: FSMContext):
-  await state.clear()
-  user_id = message.from_user.id
-  text = message.text
-
-  if text == "👤 Мой Профиль":
-    async with aiosqlite.connect(DB_NAME) as db:
-      async with db.execute(
-          "SELECT tokens, y_tokens, full_tokens, is_premium, bought_folders, premium_expires,"
-          " warns, COALESCE(exchanges, 0) FROM users WHERE user_id = ?",
-          (user_id,),
-      ) as cursor:
-        user_data = await cursor.fetchone()
-
-      if not user_data:
-        await ensure_user(db, user_id)
-        tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns, exchanges = (
-            0,
-            0,
-            0,
-            0,
-            0,
-            None,
-            0,
-            0,
-        )
-      else:
-        tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns, exchanges = (
-            user_data
-        )
-
-    prem_status = "❌ Не активна"
-    if is_prem == 1 and prem_expires:
-      try:
-        exp_date = datetime.datetime.strptime(prem_expires, DT_FORMAT)
-        if datetime.datetime.now() < exp_date:
-          days_left = (exp_date - datetime.datetime.now()).days
-          formatted_date = exp_date.strftime("%d.%m.%Y")
-          prem_status = f"✅ До {formatted_date} ({days_left} дн.)"
-        else:
-          async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(
-                "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
-                " user_id = ?",
-                (user_id,),
-            )
-            await db.commit()
-          prem_status = "❌ Не активна (истекла)"
-      except Exception:
-        prem_status = "✅ Активна"
-
-    aura = await get_user_aura(user_id)
-    if aura:
-      aura_days = (aura["expires"] - datetime.datetime.now()).days
-      aura_status = (
-          f"✨ <b>{esc(aura['name'])}</b> ({aura['percent']}% бонусов, ещё"
-          f" {aura_days} дн.)"
-      )
-    else:
-      aura_status = "❌ Нет"
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎟 Ввести промокод", callback_data="enter_promocode"
-                )
-            ]
-        ]
-    )
-    profile_text = (
-        f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
-        f"💲 Баланс токенов: {tokens if tokens is not None else 0}\n"
-        f"💎 Уникальные токены: {y_tokens if y_tokens is not None else 0}\n"
-        f"📦 Фулловые токены: {full_tokens if full_tokens is not None else 0}\n"
-        f"👑 Премиум-подписка: {prem_status}\n"
-        f"✨ Активная аура: {aura_status}\n"
-        f"📦 Собрано фулов: {bought} шт.\n"
-        f"⚠️ Предупреждения: {warns or 0}/{MAX_WARNS}\n"
-        f"🔄 Обменов проведено: {exchanges}"
-    )
-    await message.answer(profile_text, reply_markup=keyboard)
-
-  elif text in ("🛒 Магазин", "🛍 Магазин"):
-    async with aiosqlite.connect(DB_NAME) as db:
-      async with db.execute(
-          "SELECT id, title, price, buyers_count FROM products"
-      ) as cursor:
-        products = await cursor.fetchall()
-
-    if not products:
-      await message.answer("📭 В магазине пока пусто.")
-      return
-
-    keyboard_buttons = []
-    for prod in products:
-      p_id, title, price, buyers_count = prod
-      btn_text = (
-          f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
-          if buyers_count == 0
-          else f"📁 {title} — {price} токенов"
-      )
-      keyboard_buttons.append(
-          [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
-      )
-
-    await message.answer(
-        "🛍 <b>Доступные фулы:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
-    )
-
-  elif text == "💎 Уникальный магазин":
-    async with aiosqlite.connect(DB_NAME) as db:
-      async with db.execute(
-          "SELECT id, title, price, amount FROM unique_products WHERE amount > 0"
-      ) as cursor:
-        u_products = await cursor.fetchall()
-
-    if not u_products:
-      await message.answer("📭 Уникальный магазин пуст.")
-      return
-
-    kb_buttons = []
-    for up in u_products:
-      up_id, title, price, amount = up
-      kb_buttons.append([
-          InlineKeyboardButton(
-              text=f"💎 {title} — {price} токен(ов) (осталось: {amount})",
-              callback_data=f"ubuy_{up_id}",
-          )
-      ])
-
-    await message.answer(
-        "💎 <b>Уникальный магазин</b>\nПокупайте уникальные предметы за"
-        " уникальные токены:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
-    )
-
-  elif text == "👥 Реферальная система":
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-    ref_text = (
-        "👥 <b>Реферальная система</b>\n\nПриглашай друзей по своей ссылке:\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"🎁 За каждого приглашенного — <b>{REF_BONUS} токенов</b>!\n"
-        "💰 А также вы получаете <b>15% дохода</b> от трат ваших рефералов токенами в обычном магазине!"
-    )
-    await message.answer(ref_text)
-
-  elif text == "🏆 Топ игроков":
-    await message.answer(
         "🏆 <b>Выберите категорию топа:</b>", reply_markup=tops_menu_keyboard()
     )
-
-  elif text == "🪙 Как получить токены?":
-    tokens_text = (
-        "<b>Как получить токены?</b>\n\n"
-        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
-        "2. Оставляйте в комментариях под постами/ответами другим людям.\n\n"
-        "3. Отправляйте доказательства (скриншоты) в директ канала."
-        " https://t.me/JmcDeveloper?direct\n\n"
-        "<b>ГЛАВНОЕ:</b> тема видео должна касаться по типу сестры и брата и"
-        " т.д.\n\n"
-        "💰 1 отправка фото в комментариях = 1 токен!\n\n"
-        "📖 <b>ДЕТАЛЬНО РАСПИСАЛ ТУТ:</b> https://t.me/JmcDeveloper/18\n"
-        "<i>(и могу не выдать некоторые токены если не посмотрите 👆)</i>\n\n"
-        "-----------------------------------\n\n"
-        "💎 <b>Как получить УНИКАЛЬНЫЕ токены?</b>\n"
-        "Его только можно купить, <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
-        "<b>Как купить?</b> Кинуть любой подарок со стоимостью 15 звёзд на аккаунт"
-        " @ucu52\n\n"
-        "<b>Преимущества:</b>\n"
-        "1. Там выходят фулы на 1 день позже чем в стандартный магазин.\n"
-        "2. Там уникальные товары по типу ауры и так далее\n\n"
-        "-----------------------------------\n\n"
-        "📦 <b>Как получить ФУЛЛОВЫЕ токены?</b>\n"
-        "Их можно купить в <b>Уникальном магазине</b> за уникальные токены (или получить от администратора).\n\n"
-        "<b>Преимущество:</b>\n"
-        "Позволяет забрать абсолютно любой фулл в обычном магазине бесплатно (без траты обычных токенов), просто используя фулловый токен при покупке!"
-    )
-    await message.answer(tokens_text, disable_web_page_preview=True)
-
-  elif text == "👑 Премиум-подписка":
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⭐ Отправить Подарок 50 Stars",
-                    url="https://t.me/ucu52",
-                )
-            ]
-        ]
-    )
-    prem_text = (
-        "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n"
-        "<b>Преимущества:</b>\n"
-        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно c обычного"
-        " магазина!\n\n"
-        "💳 <b>Способ 1:</b> Купить | Заплатить 50 Звезд\n"
-        "(любым подарком на профиль @ucu52)\n\n"
-        "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 Фото в коментарии в тт\n"
-        "подробнее про фото: https://t.me/JmcDeveloper/18\n\n"
-        "Вы можете получить премиум бесплатно за 100 фото в коменты!\n"
-        "<i>Если была хотя бы одна фото дублирована или уже принята как Токен —"
-        " подписка не выдается.</i>\n"
-        "Если вы сделали все хорошо, отправляйте сюда:"
-        " https://t.me/JmcDeveloper?direct\n"
-        "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
-    )
-    await message.answer(
-        prem_text, reply_markup=keyboard, disable_web_page_preview=True
-    )
-
-  elif text == "🎰 Лотерея":
-    lottery_text, lottery_kb = await build_lottery_view(user_id)
-    await message.answer(lottery_text, reply_markup=lottery_kb)
-
-  elif text == "🔄 Обмены":
-    await message.answer(await ex_menu_text(), reply_markup=exchange_menu_kb())
-
-  elif text == "🎲 Рулетка":
-    await state.set_state(RouletteState.bet)
-    await message.answer(await roulette_intro_text(user_id))
-
-  elif text == "⚙️ Админ-панель":
-    if user_id != ADMIN_ID:
-      await message.answer("⛔️ У тебя нет доступа!")
-      return
-    admin_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить фулл", callback_data="add_product"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💎 Добавить в уник. магазин",
-                    callback_data="add_unique_product",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Редактировать товар",
-                    callback_data="ed_list",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Удалить товар", callback_data="del_list"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Ред. уник. товар",
-                    callback_data="ued_list",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Уд. уник. товар", callback_data="udel_list"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎟 Создать промокод", callback_data="admin_create_promo"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🪙 Выдать токены", callback_data="admin_give_tokens"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💎 Выдать уник. токены",
-                    callback_data="admin_give_ytokens",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 Выдать фулл. токены",
-                    callback_data="admin_give_ftokens",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👑 Выдать Премиум",
-                    callback_data="admin_give_premium",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📢 Сделать рассылку", callback_data="start_broadcast"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💾 Скачать бэкап БД", callback_data="admin_backup_db"
-                )
-            ],
-        ]
-    )
-    await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
-
-
-@router.callback_query(F.data == "add_product")
-async def start_add_product(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer("📦 Введите название нового товара:")
-  await state.set_state(AddProduct.title)
-  await callback.answer()
-
-
-@router.message(StateFilter(AddProduct.title))
-async def process_product_title(message: Message, state: FSMContext):
-  await state.update_data(title=message.text)
-  await message.answer("💰 Введите цену товара (например: 10):")
-  await state.set_state(AddProduct.price)
-
-
-@router.message(StateFilter(AddProduct.price))
-async def process_product_price(message: Message, state: FSMContext):
-  await state.update_data(price=message.text)
-  await message.answer("🔗 Введите ссылку на товар (скрытая ссылка):")
-  await state.set_state(AddProduct.link)
-
-
-@router.message(StateFilter(AddProduct.link))
-async def process_product_link(message: Message, state: FSMContext):
-  link = (message.text or "").strip()
-  data = await state.get_data()
-  await state.clear()
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        "INSERT INTO products (title, price, link, buyers_count) VALUES (?, ?, ?, 0)",
-        (data["title"], data["price"], link),
-    )
-    await db.commit()
-
-  await message.answer("✅ Товар успешно добавлен в магазин!")
-
-
-@router.callback_query(F.data == "ed_list")
-async def show_edit_products_list(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT id, title FROM products") as cur:
-      products = await cur.fetchall()
-
-  if not products:
-    await callback.message.answer("📭 В магазине нет товаров для редактирования.")
-    await callback.answer()
-    return
-
-  kb = [
-      [InlineKeyboardButton(text=f"✏️ {p[1]}", callback_data=f"ep_{p[0]}")]
-      for p in products
-  ]
-  await callback.message.answer(
-      "✏️ Выберите товар для редактирования:",
-      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ep_"))
-async def process_edit_product_select(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  p_id = int(callback.data.split("_")[1])
-  await state.update_data(product_id=p_id)
-
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [InlineKeyboardButton(text="Название", callback_data="ef_title")],
-          [InlineKeyboardButton(text="Цена", callback_data="ef_price")],
-          [InlineKeyboardButton(text="Ссылка", callback_data="ef_link")],
-      ]
-  )
-  await callback.message.answer("Что именно вы хотите изменить?", reply_markup=kb)
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ef_"))
-async def process_edit_product_field(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  field = callback.data.split("_")[1]
-  await state.update_data(field=field)
-  await state.set_state(EditProduct.new_value)
-  await callback.message.answer(f"✍️ Введите новое значение для поля <b>{field}</b>:")
-  await callback.answer()
-
-
-@router.message(StateFilter(EditProduct.new_value))
-async def process_edit_product_save(message: Message, state: FSMContext):
-  if message.from_user.id != ADMIN_ID:
-    return
-  data = await state.get_data()
-  p_id = data["product_id"]
-  field = data["field"]
-  new_val = message.text.strip()
-  await state.clear()
-
-  if field not in ("title", "price", "link"):
-    await message.answer("❌ Неверное поле.")
-    return
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        f"UPDATE products SET {field} = ? WHERE id = ?", (new_val, p_id)
-    )
-    await db.commit()
-
-  await message.answer(f"✅ Товар успешно обновлен!")
-
-
-@router.callback_query(F.data == "del_list")
-async def show_delete_products_list(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT id, title FROM products") as cur:
-      products = await cur.fetchall()
-
-  if not products:
-    await callback.message.answer("📭 В магазине нет товаров для удаления.")
-    await callback.answer()
-    return
-
-  kb = [
-      [InlineKeyboardButton(text=f"🗑 {p[1]}", callback_data=f"dp_{p[0]}")]
-      for p in products
-  ]
-  await callback.message.answer(
-      "🗑 Выберите товар для удаления:",
-      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("dp_"))
-async def process_delete_product(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  p_id = int(callback.data.split("_")[1])
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute("DELETE FROM products WHERE id = ?", (p_id,))
-    await db.commit()
-
-  await callback.message.answer("✅ Товар успешно удален из магазина.")
-  await callback.answer()
-
-
-@router.callback_query(F.data == "ued_list")
-async def show_edit_unique_products_list(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT id, title FROM unique_products") as cur:
-      products = await cur.fetchall()
-
-  if not products:
-    await callback.message.answer("📭 Уникальный магазин пуст.")
-    await callback.answer()
-    return
-
-  kb = [
-      [InlineKeyboardButton(text=f"✏️ {p[1]}", callback_data=f"uep_{p[0]}")]
-      for p in products
-  ]
-  await callback.message.answer(
-      "✏️ Выберите уникальный товар для редактирования:",
-      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("uep_"))
-async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  p_id = int(callback.data.split("_")[1])
-  await state.update_data(product_id=p_id)
-
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [InlineKeyboardButton(text="Название", callback_data="uef_title")],
-          [InlineKeyboardButton(text="Цена", callback_data="uef_price")],
-          [InlineKeyboardButton(text="Количество", callback_data="uef_amount")],
-          [InlineKeyboardButton(text="Команда", callback_data="uef_command")],
-      ]
-  )
-  await callback.message.answer("Что изменить в уникальном товаре?", reply_markup=kb)
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("uef_"))
-async def process_edit_unique_field(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  field = callback.data.split("_")[1]
-  await state.update_data(field=field)
-  await state.set_state(EditUniqueProduct.new_value)
-  await callback.message.answer(f"✍️ Введите новое значение для поля <b>{field}</b>:")
-  await callback.answer()
-
-
-@router.message(StateFilter(EditUniqueProduct.new_value))
-async def process_edit_unique_save(message: Message, state: FSMContext):
-  if message.from_user.id != ADMIN_ID:
-    return
-  data = await state.get_data()
-  p_id = data["product_id"]
-  field = data["field"]
-  new_val = message.text.strip()
-  await state.clear()
-
-  if field not in ("title", "price", "amount", "command"):
-    await message.answer("❌ Неверное поле.")
-    return
-
-  if field in ("price", "amount") and not new_val.isdigit():
-    await message.answer("❌ Это поле должно быть числом.")
-    return
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        f"UPDATE unique_products SET {field} = ? WHERE id = ?", (new_val, p_id)
-    )
-    await db.commit()
-
-  await message.answer("✅ Уникальный товар успешно обновлен!")
-
-
-@router.callback_query(F.data == "udel_list")
-async def show_delete_unique_products_list(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT id, title FROM unique_products") as cur:
-      products = await cur.fetchall()
-
-  if not products:
-    await callback.message.answer("📭 Уникальный магазин пуст.")
-    await callback.answer()
-    return
-
-  kb = [
-      [InlineKeyboardButton(text=f"🗑 {p[1]}", callback_data=f"udp_{p[0]}")]
-      for p in products
-  ]
-  await callback.message.answer(
-      "🗑 Выберите уникальный товар для удаления:",
-      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("udp_"))
-async def process_delete_unique(callback: CallbackQuery):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  p_id = int(callback.data.split("_")[1])
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute("DELETE FROM unique_products WHERE id = ?", (p_id,))
-    await db.commit()
-
-  await callback.message.answer("✅ Уникальный товар успешно удален.")
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_create_promo")
-async def start_create_promo(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await state.set_state(CreatePromoState.code)
-  await callback.message.answer("🎟 Введите промокод (слово):")
-  await callback.answer()
-
-
-@router.message(StateFilter(CreatePromoState.code))
-async def process_promo_code(message: Message, state: FSMContext):
-  await state.update_data(code=message.text.strip())
-  await state.set_state(CreatePromoState.type)
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="Токены", callback_data="promo_type_tokens"
-              ),
-              InlineKeyboardButton(
-                  text="Премиум (дни)", callback_data="promo_type_premium"
-              ),
-          ]
-      ]
-  )
-  await message.answer("🎁 Выберите тип награды:", reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("promo_type_"))
-async def process_promo_type(callback: CallbackQuery, state: FSMContext):
-  t = callback.data.split("_")[2]
-  await state.update_data(type=t)
-  await state.set_state(CreatePromoState.value)
-  await callback.message.answer(
-      "🔢 Введите значение награды (число токенов или дней премиума):"
-  )
-  await callback.answer()
-
-
-@router.message(StateFilter(CreatePromoState.value))
-async def process_promo_value(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Введите число.")
-    return
-  await state.update_data(value=int(message.text))
-  await state.set_state(CreatePromoState.uses)
-  await message.answer(
-      "👥 Введите максимальное количество активаций (0 — без лимита):"
-  )
-
-
-@router.message(StateFilter(CreatePromoState.uses))
-async def process_promo_uses(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Введите число.")
-    return
-  max_uses = int(message.text)
-  data = await state.get_data()
-  await state.clear()
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        "INSERT OR REPLACE INTO promocodes (code, reward_type, reward_value,"
-        " max_uses, used_count) VALUES (?, ?, ?, ?, 0)",
-        (data["code"], data["type"], str(data["value"]), max_uses),
-    )
-    await db.commit()
-
-  await message.answer(
-      f"✅ Промокод <code>{esc(data['code'])}</code> успешно создан!"
-  )
-
-
-@router.callback_query(F.data == "start_broadcast")
-async def start_broadcast(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await state.set_state(BroadcastState.message)
-  await callback.message.answer(
-      "📢 Отправьте сообщение для рассылки (поддерживается форматирование):"
-  )
-  await callback.answer()
-
-
-@router.message(StateFilter(BroadcastState.message))
-async def process_broadcast(message: Message, state: FSMContext, bot: Bot):
-  if message.from_user.id != ADMIN_ID:
-    return
-  await state.clear()
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute("SELECT user_id FROM users") as cur:
-      users = await cur.fetchall()
-
-  sent, blocked = 0, 0
-  for u in users:
-    try:
-      await message.send_copy(u[0])
-      sent += 1
-      await asyncio.sleep(0.05)
-    except Exception:
-      blocked += 1
-
-  await message.answer(
-      f"📢 Рассылка завершена!\n✅ Успешно: {sent}\n❌ Заблокировали бота: {blocked}"
-  )
-
-
-@router.callback_query(F.data == "admin_backup_db")
-async def admin_backup(callback: CallbackQuery, bot: Bot):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  if os.path.exists(DB_NAME):
-    document = FSInputFile(DB_NAME)
-    await bot.send_document(
-        callback.from_user.id,
-        document,
-        caption=(
-            "💾 Ручной бэкап БД:"
-            f" {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
-        ),
-    )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ubuy_"))
-async def process_ubuy(callback: CallbackQuery, bot: Bot):
-  user_id = callback.from_user.id
-  up_id = int(callback.data.split("_")[1])
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT title, price, amount, command FROM unique_products WHERE id = ?",
-        (up_id,),
-    ) as cur:
-      prod = await cur.fetchone()
-    if not prod or prod[2] <= 0:
-      await callback.answer("❌ Товар закончился или удален.", show_alert=True)
-      return
-    title, price, amount, command_str = prod
-
-    async with db.execute(
-        "SELECT COALESCE(y_tokens, 0) FROM users WHERE user_id = ?", (user_id,)
-    ) as cur:
-      row = await cur.fetchone()
-    my_ytokens = row[0] if row else 0
-
-    if my_ytokens < price:
-      await callback.answer(
-          f"❌ Недостаточно уникальных токенов! Нужно: {price}, у вас:"
-          f" {my_ytokens}.",
-          show_alert=True,
-      )
-      return
-
-    await db.execute(
-        "UPDATE users SET y_tokens = y_tokens - ? WHERE user_id = ?",
-        (price, user_id),
-    )
-    await db.execute(
-        "UPDATE unique_products SET amount = amount - 1 WHERE id = ?", (up_id,)
-    )
-    await db.commit()
-
-  try:
-    formatted_cmd = command_str.replace("{user_id}", str(user_id))
-    cmd_parts = formatted_cmd.strip().split()
-    
-    if cmd_parts:
-      action = cmd_parts[0].lower()
-      
-      if action == "ftoken" and len(cmd_parts) >= 3:
-        amount_val = int(cmd_parts[3]) if len(cmd_parts) > 3 and cmd_parts[3].isdigit() else 1
-        await grant_full_tokens(user_id, amount_val)
-        
-      elif action == "ytoken" and len(cmd_parts) >= 3:
-        amount_val = int(cmd_parts[3]) if len(cmd_parts) > 3 and cmd_parts[3].isdigit() else 1
-        await grant_y_tokens(user_id, amount_val)
-        
-      elif action == "token" and len(cmd_parts) >= 3:
-        amount_val = int(cmd_parts[3]) if len(cmd_parts) > 3 and cmd_parts[3].isdigit() else 1
-        await grant_tokens(user_id, amount_val)
-        
-      elif action == "aura":
-        if len(cmd_parts) >= 4:
-          aura_type = cmd_parts[1].lower()
-          percent = int(cmd_parts[2])
-          days = int(cmd_parts[3])
-          aura_name = " ".join(cmd_parts[4:]) if len(cmd_parts) > 4 else title
-
-          expires_at = datetime.datetime.now() + datetime.timedelta(days=days)
-          expires_str = expires_at.strftime(DT_FORMAT)
-          async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(
-                "UPDATE users SET aura_type = ?, aura_name = ?, aura_percent = ?,"
-                " aura_expires = ? WHERE user_id = ?",
-                (aura_type, aura_name, percent, expires_str, user_id),
-            )
-            await db.commit()
-  except Exception:
-    logging.exception("Ошибка выполнения команды товара уник. магазина")
-
-  await callback.message.answer(
-      f"💎 <b>Успешная покупка!</b>\nВы приобрели: <b>{esc(title)}</b> за {price}"
-      " уникальных токенов."
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data == "add_unique_product")
-async def start_add_unique_product(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await callback.message.answer(
-      "💎 Введите название товара (например: Фулловый токен х1):"
-  )
-  await state.set_state(AddUniqueProduct.title)
-  await callback.answer()
-
-
-@router.message(StateFilter(AddUniqueProduct.title))
-async def process_u_title(message: Message, state: FSMContext):
-  await state.update_data(title=message.text)
-  await message.answer(
-      "💰 Введите цену в <b>уникальных токенах</b> (например: 10):"
-  )
-  await state.set_state(AddUniqueProduct.price)
-
-
-@router.message(StateFilter(AddUniqueProduct.price))
-async def process_u_price(message: Message, state: FSMContext):
-  text = (message.text or "").strip()
-  if not text.isdigit():
-    await message.answer("❌ Введите число!")
-    return
-  await state.update_data(price=int(text))
-  await message.answer("📦 Введите количество (штук в наличии, например: 5):")
-  await state.set_state(AddUniqueProduct.amount)
-
-
-@router.message(StateFilter(AddUniqueProduct.amount))
-async def process_u_amount(message: Message, state: FSMContext):
-  text = (message.text or "").strip()
-  if not text.isdigit():
-    await message.answer("❌ Введите число!")
-    return
-  await state.update_data(amount=int(text))
-  await message.answer(
-      "⚙️ Введите команду/действие при покупке (например: <code>ftoken add {user_id} 1</code> или <code>aura shop 15 30 Оптовик</code>):"
-  )
-  await state.set_state(AddUniqueProduct.command)
-
-
-@router.message(StateFilter(AddUniqueProduct.command))
-async def process_u_command(message: Message, state: FSMContext):
-  cmd = (message.text or "").strip()
-  data = await state.get_data()
-  await state.clear()
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    await db.execute(
-        "INSERT INTO unique_products (title, price, amount, command) VALUES (?,"
-        " ?, ?, ?)",
-        (data["title"], data["price"], data["amount"], cmd),
-    )
-    await db.commit()
-
-  await message.answer("✅ Товар успешно добавлен в уникальный магазин!")
-
-
-@router.message(StateFilter(PromocodeState.code))
-async def promo_check(message: Message, state: FSMContext):
-  user_id = message.from_user.id
-  code_text = (message.text or "").strip()
-  await state.clear()
-  reply = await apply_promocode(user_id, code_text)
-  await message.answer(reply, reply_markup=get_main_keyboard(user_id))
-
-
-@router.callback_query(F.data == "admin_give_tokens")
-async def start_give_tokens(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await state.set_state(GiveTokensState.user_id)
-  await callback.message.answer(
-      "🪙 Введи Telegram ID пользователя для начисления токенов:"
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_give_ytokens")
-async def start_give_ytokens(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await state.set_state(GiveYTokensState.user_id)
-  await callback.message.answer(
-      "💎 Введи Telegram ID пользователя для начисления <b>уникальных"
-      " токенов</b>:"
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_give_ftokens")
-async def start_give_ftokens(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await state.set_state(GiveFullTokensState.user_id)
-  await callback.message.answer(
-      "📦 Введи Telegram ID пользователя для начисления <b>фулловых"
-      " токенов</b>:"
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data == "admin_give_premium")
-async def start_give_premium(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  await state.clear()
-  await state.set_state(GivePremiumState.user_id)
-  await callback.message.answer(
-      "👑 Введи Telegram ID пользователя для выдачи Премиума:"
-  )
-  await callback.answer()
-
-
-@router.message(StateFilter(GiveTokensState.user_id))
-async def process_give_tokens_id(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Только цифры.")
-    return
-  await state.update_data(target_id=int(message.text))
-  await state.set_state(GiveTokensState.amount)
-  await message.answer("🪙 Сколько токенов начислить?")
-
-
-@router.message(StateFilter(GiveYTokensState.user_id))
-async def process_give_ytokens_id(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Только цифры.")
-    return
-  await state.update_data(target_id=int(message.text))
-  await state.set_state(GiveYTokensState.amount)
-  await message.answer("💎 Сколько уникальных токенов начислить?")
-
-
-@router.message(StateFilter(GiveFullTokensState.user_id))
-async def process_give_ftokens_id(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Только цифры.")
-    return
-  await state.update_data(target_id=int(message.text))
-  await state.set_state(GiveFullTokensState.amount)
-  await message.answer("📦 Сколько фулловых токенов начислить?")
-
-
-@router.message(StateFilter(GiveYTokensState.amount))
-async def process_give_ytokens_amount(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Введите число.")
-    return
-  amount = int(message.text)
-  data = await state.get_data()
-  target_id = data["target_id"]
-  await state.clear()
-  await grant_y_tokens(target_id, amount)
-  await message.answer(
-      f"✅ Пользователю <code>{target_id}</code> начислено +{amount} уник."
-      " токенов."
-  )
-
-
-@router.message(StateFilter(GiveFullTokensState.amount))
-async def process_give_ftokens_amount(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Введите число.")
-    return
-  amount = int(message.text)
-  data = await state.get_data()
-  target_id = data["target_id"]
-  await state.clear()
-  await grant_full_tokens(target_id, amount)
-  await message.answer(
-      f"✅ Пользователю <code>{target_id}</code> начислено +{amount} фулл."
-      " токенов."
-  )
-
-
-@router.message(StateFilter(GiveTokensState.amount))
-async def process_give_tokens_amount(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Введите число.")
-    return
-  amount = int(message.text)
-  data = await state.get_data()
-  target_id = data["target_id"]
-  await state.clear()
-  await grant_tokens(target_id, amount)
-  await message.answer(
-      f"✅ Начислено +{amount} токенов пользователю <code>{target_id}</code>."
-  )
-
-
-@router.message(StateFilter(GivePremiumState.user_id))
-async def process_give_premium_id(message: Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("❌ Только цифры.")
-    return
-  await state.update_data(target_id=int(message.text))
-  await state.set_state(GivePremiumState.days)
-  await message.answer("⏳ На сколько дней выдать Премиум?")
-
-
-@router.message(StateFilter(GivePremiumState.days))
-async def process_give_premium_days(
-    message: Message, state: FSMContext, bot: Bot
-):
-  if not message.text.isdigit():
-    await message.answer("❌ Введите число дней.")
-    return
-  days = int(message.text)
-  data = await state.get_data()
-  target_id = data["target_id"]
-  await state.clear()
-  new_expire = await grant_premium(target_id, days)
-  await message.answer(f"✅ Премиум выдан на {days} дней.")
-  try:
-    await bot.send_message(
-        target_id, f"🎉 Вам активирована Премиум-подписка на {days} дней!"
-    )
   except Exception:
     pass
-
-
-@router.callback_query(F.data.startswith("buy_"))
-async def process_buy(callback: CallbackQuery, bot: Bot):
-  user_id = callback.from_user.id
-  p_id = int(callback.data.split("_")[1])
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
-        (p_id,),
-    ) as cursor:
-      product = await cursor.fetchone()
-
-    if not product:
-      await callback.answer("❌ Товар удален.", show_alert=True)
-      return
-
-    title, price_raw, link, buyers_count = product
-    try:
-      base_price = int("".join(filter(str.isdigit, str(price_raw))))
-    except ValueError:
-      base_price = 0
-
-    async with db.execute(
-        "SELECT tokens, full_tokens, is_premium, referrer_id, premium_expires FROM users"
-        " WHERE user_id = ?",
-        (user_id,),
-    ) as cursor:
-      u_data = await cursor.fetchone()
-
-    tokens = u_data[0] if (u_data and u_data[0] is not None) else 0
-    full_tokens = u_data[1] if (u_data and u_data[1] is not None) else 0
-    is_prem = u_data[2] if u_data else 0
-    referrer_id = u_data[3] if u_data else 0
-    prem_expires = u_data[4] if u_data else None
-
-    if is_prem == 1:
-      await db.execute(
-          "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
-          (p_id,),
-      )
-      await db.commit()
-      text = (
-          f"👑 Премиум-доступ!\n\n✅ Фулл {esc(title)}"
-          f" бесплатно!\n\n🔗 Ссылка:\n{hidden_link(link)}"
-      )
-      await callback.message.answer(text, disable_web_page_preview=True)
-      await callback.answer()
-      return
-
-    final_price = (
-        max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
-    )
-
-    aura = await get_user_aura(user_id)
-    if aura and aura["type"] == "shop":
-      discount_percent = aura["percent"]
-      final_price = max(
-          1, int(round(final_price * (1 - discount_percent / 100.0)))
-      )
-
-    if full_tokens > 0:
-      kb = InlineKeyboardMarkup(
-          inline_keyboard=[
-              [
-                  InlineKeyboardButton(
-                      text="📦 Использовать Фулловый токен",
-                      callback_data=f"usefull_{p_id}",
-                  ),
-                  InlineKeyboardButton(
-                      text=f"🪙 Обычными ({final_price} токенов)",
-                      callback_data=f"usenorm_{p_id}",
-                  ),
-              ]
-          ]
-      )
-      await callback.message.answer(
-          f"❓ У вас есть фулловый токен. Хотите использовать Фулловый токен или обычными токенами ({final_price} шт.)?",
-          reply_markup=kb,
-      )
-      await callback.answer()
-      return
-
-    if tokens < final_price:
-      await callback.answer(
-          f"❌ Недостаточно токенов! Нужно: {final_price}.", show_alert=True
-      )
-      return
-
-    await db.execute(
-        "UPDATE users SET tokens = tokens - ?, bought_folders ="
-        " COALESCE(bought_folders, 0) + 1 WHERE user_id = ?",
-        (final_price, user_id),
-    )
-    await db.execute(
-        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
-        (p_id,),
-    )
-    
-    if referrer_id and referrer_id != user_id:
-      ref_bonus_tokens = max(1, int(final_price * 0.15))
-      await db.execute(
-          "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
-          (ref_bonus_tokens, referrer_id),
-      )
-      try:
-        await bot.send_message(
-            referrer_id,
-            f"💰 Ваш реферал совершил покупку в магазине!\nВам начислено <b>+{ref_bonus_tokens}</b> токенов (15% от траты).",
-        )
-      except Exception:
-        pass
-
-    await db.commit()
-
-  await callback.message.answer(
-      f"✅ Спасибо за покупку!\n\n🔗 Ссылка:\n{hidden_link(link)}",
-      disable_web_page_preview=True,
-  )
   await callback.answer()
 
 
-@router.callback_query(F.data.startswith("usefull_"))
-async def process_buy_full(callback: CallbackQuery):
-  user_id = callback.from_user.id
-  p_id = int(callback.data.split("_")[1])
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT title, link FROM products WHERE id = ?", (p_id,),
-    ) as cur:
-      prod = await cur.fetchone()
-    if not prod:
-      await callback.answer("❌ Товар не найден.", show_alert=True)
-      return
-    title, link = prod
-
-    async with db.execute(
-        "SELECT COALESCE(full_tokens, 0) FROM users WHERE user_id = ?", (user_id,)
-    ) as cur:
-      row = await cur.fetchone()
-    ftokens = row[0] if row else 0
-
-    if ftokens <= 0:
-      await callback.answer("❌ У вас больше нет фулловых токенов.", show_alert=True)
-      return
-
-    await db.execute(
-        "UPDATE users SET full_tokens = full_tokens - 1, bought_folders = COALESCE(bought_folders, 0) + 1 WHERE user_id = ?",
-        (user_id,),
-    )
-    await db.execute(
-        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?", (p_id,)
-    )
-    await db.commit()
-
-  try:
-    await callback.message.edit_reply_markup(reply_markup=None)
-  except Exception:
-    pass
-
-  await callback.message.answer(
-      f"✅ Успешная покупка за фулловый токен!\n\n🔗 Ссылка:\n{hidden_link(link)}",
-      disable_web_page_preview=True,
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("usenorm_"))
-async def process_buy_norm(callback: CallbackQuery, bot: Bot):
-  user_id = callback.from_user.id
-  p_id = int(callback.data.split("_")[1])
-
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
-        (p_id,),
-    ) as cursor:
-      product = await cursor.fetchone()
-
-    if not product:
-      await callback.answer("❌ Товар удален.", show_alert=True)
-      return
-
-    title, price_raw, link, buyers_count = product
-    try:
-      base_price = int("".join(filter(str.isdigit, str(price_raw))))
-    except ValueError:
-      base_price = 0
-
-    async with db.execute(
-        "SELECT tokens, referrer_id FROM users WHERE user_id = ?",
-        (user_id,),
-    ) as cursor:
-      u_data = await cursor.fetchone()
-
-    tokens = u_data[0] if (u_data and u_data[0] is not None) else 0
-    referrer_id = u_data[1] if u_data else 0
-
-    final_price = (
-        max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
-    )
-
-    aura = await get_user_aura(user_id)
-    if aura and aura["type"] == "shop":
-      discount_percent = aura["percent"]
-      final_price = max(
-          1, int(round(final_price * (1 - discount_percent / 100.0)))
-      )
-
-    if tokens < final_price:
-      await callback.answer(
-          f"❌ Недостаточно токенов! Нужно: {final_price}.", show_alert=True
-      )
-      return
-
-    await db.execute(
-        "UPDATE users SET tokens = tokens - ?, bought_folders ="
-        " COALESCE(bought_folders, 0) + 1 WHERE user_id = ?",
-        (final_price, user_id),
-    )
-    await db.execute(
-        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
-        (p_id,),
-    )
-
-    if referrer_id and referrer_id != user_id:
-      ref_bonus_tokens = max(1, int(final_price * 0.15))
-      await db.execute(
-          "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
-          (ref_bonus_tokens, referrer_id),
-      )
-      try:
-        await bot.send_message(
-            referrer_id,
-            f"💰 Ваш реферал совершил покупку в магазине!\nВам начислено <b>+{ref_bonus_tokens}</b> токенов (15% от траты).",
-        )
-      except Exception:
-        pass
-
-    await db.commit()
-
-  try:
-    await callback.message.edit_reply_markup(reply_markup=None)
-  except Exception:
-    pass
-
-  await callback.message.answer(
-      f"✅ Спасибо за покупку!\n\n🔗 Ссылка:\n{hidden_link(link)}",
-      disable_web_page_preview=True,
-  )
-  await callback.answer()
-
-
-EXCHANGE_COST = 1
-RESTRICT_HOURS = 72
-MAX_OPEN_OFFERS = 5
-EX_PAGE_SIZE = 5
-EX_SEARCH = {}
-LINK_RE = re.compile(
-    r"^(https://mega\.nz/(file|folder)/\S+|https://cloud\.mail\.ru/\S+)$", re.I
-)
-LINK_RULE = "⚠️ Ссылка должна быть с mega.nz или cloud.mail.ru"
-LINK_ERROR = "❌ Неверная ссылка."
-
-
-class NewOfferState(StatesGroup):
-  give = State()
-  want = State()
-  link = State()
-
-
-class ExSearchState(StatesGroup):
-  query = State()
-
-
-class ExTakeState(StatesGroup):
-  link = State()
-
-
-class ExAdminMsgState(StatesGroup):
-  text = State()
-
-
-async def ex_exec(sql, args=()):
-  async with aiosqlite.connect(DB_NAME) as db:
-    cur = await db.execute(sql, args)
-    await db.commit()
-    return cur.rowcount, cur.lastrowid
-
-
-async def ex_one(sql, args=()):
-  async with aiosqlite.connect(DB_NAME) as db:
-    db.row_factory = aiosqlite.Row
-    async with db.execute(sql, args) as cur:
-      return await cur.fetchone()
-
-
-async def ex_all(sql, args=()):
-  async with aiosqlite.connect(DB_NAME) as db:
-    db.row_factory = aiosqlite.Row
-    async with db.execute(sql, args) as cur:
-      return await cur.fetchall()
-
-
-async def get_restriction(user_id: int):
-  row = await ex_one(
-      "SELECT restricted_until FROM users WHERE user_id = ?", (user_id,)
-  )
-  if not row or not row["restricted_until"]:
-    return None
-  try:
-    until = datetime.datetime.strptime(row["restricted_until"], DT_FORMAT)
-  except Exception:
-    return None
-  if until <= datetime.datetime.now():
-    await ex_exec(
-        "UPDATE users SET restricted_until = NULL WHERE user_id = ?",
-        (user_id,),
-    )
-    return None
-  return until
-
-
-RESTRICTED_TEXT = "🔒 На вас подана жалоба. Обмены и магазин ограничены."
-RESTRICTED_ALERT = "🔒 Вы ограничены от обменов."
-
-
-def ex_kb(rows) -> InlineKeyboardMarkup:
-  return InlineKeyboardMarkup(
-      inline_keyboard=[
-          [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
-          for row in rows
-      ]
-  )
-
-
-async def ex_show(event, text, kb=None):
-  if isinstance(event, CallbackQuery):
-    try:
-      await event.message.edit_text(
-          text, reply_markup=kb, disable_web_page_preview=True
-      )
-      return
-    except TelegramBadRequest:
-      pass
-    await event.message.answer(
-        text, reply_markup=kb, disable_web_page_preview=True
-    )
-  else:
-    await event.answer(text, reply_markup=kb, disable_web_page_preview=True)
-
-
-def exchange_menu_kb() -> InlineKeyboardMarkup:
-  return ex_kb([
-      [("➕ Выставить обмен", "ex:new"), ("📋 Все обмены", "ex:all")],
-      [("🔍 Поиск", "ex:search"), ("📦 Мои обмены", "ex:my")],
-  ])
-
-
-async def ex_menu_text() -> str:
-  return (
-      "🔄 <b>Обмены фуллами</b>\nСтоимость проведения обмена:"
-      f" {EXCHANGE_COST} токен."
-  )
-
-
-@router.callback_query(F.data == "ex:menu")
-async def ex_menu_cb(callback: CallbackQuery, state: FSMContext):
-  await state.clear()
-  await ex_show(callback, await ex_menu_text(), exchange_menu_kb())
-  await callback.answer()
-
-
-@router.callback_query(F.data == "ex:cancel")
-async def ex_cancel(callback: CallbackQuery, state: FSMContext):
-  await state.clear()
-  await ex_show(callback, "Отменено.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
-  await callback.answer()
-
-
-@router.callback_query(F.data == "ex:noop")
-async def ex_noop(callback: CallbackQuery):
-  await callback.answer()
-
-
-@router.callback_query(F.data == "ex:my")
-async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
-  await state.clear()
-  uid = callback.from_user.id
-  rows = await ex_all(
-      "SELECT * FROM ex_offers WHERE owner_id = ? ORDER BY id DESC LIMIT 10",
-      (uid,),
-  )
-  if not rows:
-    await ex_show(
-        callback,
-        "📦 У вас нет активных обменов.",
-        ex_kb([[("⬅️ В обмены", "ex:menu")]]),
-    )
-    await callback.answer()
-    return
-
-  buttons = [
-      [(f"#{r['id']} {r['give']} → {r['want']} ({r['status']})"[:60], f"ex:view:{r['id']}")]
-      for r in rows
-  ]
-  buttons.append([("⬅️ В обмены", "ex:menu")])
-  await ex_show(callback, "📦 <b>Ваши обмены:</b>", ex_kb(buttons))
-  await callback.answer()
-
-
-@router.callback_query(F.data == "ex:new")
-async def ex_new(callback: CallbackQuery, state: FSMContext):
-  uid = callback.from_user.id
-  if await get_restriction(uid):
-    await callback.answer(RESTRICTED_ALERT, show_alert=True)
-    return
-  cnt = await ex_one(
-      "SELECT COUNT(*) n FROM ex_offers WHERE owner_id = ? AND status = 'open'",
-      (uid,),
-  )
-  if cnt["n"] >= MAX_OPEN_OFFERS:
-    await callback.answer(
-        f"У вас уже {MAX_OPEN_OFFERS} открытых обменов.", show_alert=True
-    )
-    return
-  await state.set_state(NewOfferState.give)
-  await ex_show(
-      callback, "Что вы <b>отдаете</b>?", ex_kb([[("❌ Отмена", "ex:cancel")]]))
-  await callback.answer()
-
-
-@router.message(StateFilter(NewOfferState.give))
-async def ex_new_give(message: Message, state: FSMContext):
-  text = (message.text or "").strip()[:60]
-  if not text:
-    return
-  await state.update_data(give=text)
-  await state.set_state(NewOfferState.want)
-  await message.answer(
-      "Что хотите <b>получить</b>?",
-      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
-  )
-
-
-@router.message(StateFilter(NewOfferState.want))
-async def ex_new_want(message: Message, state: FSMContext):
-  text = (message.text or "").strip()[:60]
-  if not text:
-    return
-  await state.update_data(want=text)
-  await state.set_state(NewOfferState.link)
-  await message.answer(
-      f"Отправьте <b>ссылку на свой фулл</b>:\n{LINK_RULE}",
-      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
-  )
-
-
-@router.message(StateFilter(NewOfferState.link))
-async def ex_new_link(message: Message, state: FSMContext):
-  link = (message.text or "").strip()
-  if not LINK_RE.match(link):
-    await message.answer(LINK_ERROR)
-    return
-  data = await state.get_data()
-  await state.clear()
-  _, offer_id = await ex_exec(
-      "INSERT INTO ex_offers (owner_id, give, want, owner_link, search,"
-      " created) VALUES (?, ?, ?, ?, ?, ?)",
-      (
-          message.from_user.id,
-          data["give"],
-          data["want"],
-          link,
-          (data["give"] + " " + data["want"]).lower(),
-          int(datetime.datetime.now().timestamp()),
-      ),
-  )
-  await message.answer(
-      f"✅ Обмен #{offer_id} выставлен!",
-      reply_markup=ex_kb([[("🔄 Обмены", "ex:menu")]]),
-  )
-
-
-async def ex_render_list(event, user_id: int, page: int):
-  q = EX_SEARCH.get(user_id)
-  where, args = "status = 'open'", []
-  if q:
-    for w in q.lower().split()[:3]:
-      where += " AND search LIKE ?"
-      args.append(f"%{w}%")
-  total = (
-      await ex_one(f"SELECT COUNT(*) n FROM ex_offers WHERE {where}", args)
-  )["n"]
-  pages = max(1, -(-total // EX_PAGE_SIZE))
-  page = max(0, min(page, pages - 1))
-  rows = await ex_all(
-      f"SELECT * FROM ex_offers WHERE {where} ORDER BY id DESC LIMIT ? OFFSET"
-      " ?",
-      args + [EX_PAGE_SIZE, page * EX_PAGE_SIZE],
-  )
-  head = f"📋 <b>Открытые обмены</b> (стр. {page + 1}/{pages})"
-  buttons = [
-      [(f"#{r['id']} {r['give']} → {r['want']}"[:60], f"ex:view:{r['id']}")]
-      for r in rows
-  ]
-  nav = []
-  if page > 0:
-    nav.append(("⬅️", f"ex:list:{page - 1}"))
-  nav.append((f"{page + 1}/{pages}", "ex:noop"))
-  if page < pages - 1:
-    nav.append(("➡️", f"ex:list:{page + 1}"))
-  buttons.append(nav)
-  buttons.append([("🔍 Поиск", "ex:search"), ("🧹 Сбросить", "ex:all")])
-  buttons.append([("⬅️ В обмены", "ex:menu")])
-  await ex_show(event, head, ex_kb(buttons))
-
-
-@router.callback_query(F.data == "ex:all")
-async def ex_all_cb(callback: CallbackQuery, state: FSMContext):
-  await state.clear()
-  EX_SEARCH.pop(callback.from_user.id, None)
-  await ex_render_list(callback, callback.from_user.id, 0)
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ex:list:"))
-async def ex_list_cb(callback: CallbackQuery):
-  await ex_render_list(
-      callback, callback.from_user.id, int(callback.data.split(":")[2])
-  )
-  await callback.answer()
-
-
-@router.callback_query(F.data == "ex:search")
-async def ex_search(callback: CallbackQuery, state: FSMContext):
-  await state.set_state(ExSearchState.query)
-  await ex_show(
-      callback,
-      "Введите название для поиска:",
-      ex_kb([[("❌ Отмена", "ex:cancel")]]),
-  )
-  await callback.answer()
-
-
-@router.message(StateFilter(ExSearchState.query))
-async def ex_search_do(message: Message, state: FSMContext):
-  await state.clear()
-  EX_SEARCH[message.from_user.id] = (message.text or "").strip()[:60]
-  await ex_render_list(message, message.from_user.id, 0)
-
-
-@router.callback_query(F.data.startswith("ex:view:"))
-async def ex_view(callback: CallbackQuery):
-  offer_id = int(callback.data.split(":")[2])
-  uid = callback.from_user.id
-  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
-  if not o or o["status"] not in ("open", "taken"):
-    await callback.answer("Обмен недоступен.", show_alert=True)
-    return
-
-  if o["status"] == "open":
-    text = (
-        f"🔄 <b>Обмен #{o['id']}</b>\nОтдает: <b>{esc(o['give'])}</b>\nХочет:"
-        f" <b>{esc(o['want'])}</b>"
-    )
-    if o["owner_id"] == uid:
-      kb = ex_kb(
-          [[("🗑 Удалить", f"ex:del:{offer_id}")], [("⬅️ Назад", "ex:list:0")]]
-      )
-    else:
-      kb = ex_kb([
-          [("🤝 Провести обмен", f"ex:take:{offer_id}")],
-          [("⬅️ Назад", "ex:list:0")],
-      ])
-  else:
-    if uid == o["owner_id"]:
-      text = (
-          f"✅ <b>Обмен #{o['id']} завершен!</b>\n"
-          f"🆔 ID обменщика: <code>{o['taker_id']}</code>\n"
-          f"🔗 Ссылка взявшегося:\n{esc(o['taker_link'])}"
-      )
-      kb = ex_kb([
-          [("🚨 Пожаловаться", f"ex:confirm_rep:{offer_id}")],
-          [("⬅️ Назад", "ex:menu")],
-      ])
-    elif uid == o["taker_id"]:
-      text = (
-          f"✅ <b>Обмен #{o['id']} завершен!</b>\n"
-          f"🆔 ID владельца: <code>{o['owner_id']}</code>\n"
-          f"🔗 Ссылка владельца:\n{esc(o['owner_link'])}"
-      )
-      kb = ex_kb([
-          [("🚨 Пожаловаться", f"ex:confirm_rep:{offer_id}")],
-          [("⬅️ Назад", "ex:menu")],
-      ])
-    else:
-      return
-
-  await ex_show(callback, text, kb)
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ex:del:"))
-async def ex_delete_offer(callback: CallbackQuery):
-  offer_id = int(callback.data.split(":")[2])
-  uid = callback.from_user.id
-  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
-  if not o or o["owner_id"] != uid or o["status"] != "open":
-    await callback.answer("Нельзя удалить этот обмен.", show_alert=True)
-    return
-  await ex_exec("UPDATE ex_offers SET status = 'deleted' WHERE id = ?", (offer_id,))
-  await ex_show(callback, "🗑 Обмен удален.", ex_kb([[("🔄 Обмены", "ex:menu")]]))
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ex:confirm_rep:"))
-async def ex_confirm_report(callback: CallbackQuery):
-  offer_id = int(callback.data.split(":")[2])
-  text = (
-      "⚠️ <b>Вы уверены, что хотите кинуть жалобу на данного"
-      " пользователя?</b>\n\n• При ложном репорте вы получите <b>1"
-      " Предупреждение</b>.\n• Если вас реально обманули и ссылка оказалась"
-      " неверной или есть ключ, то отправляйте смело жалобу и получите токены"
-      " за моральный ущерб."
-  )
-  kb = ex_kb([
-      [("✅ Да, отправить жалобу", f"ex:rep:{offer_id}")],
-      [("❌ Отмена", f"ex:view:{offer_id}")],
-  ])
-  await ex_show(callback, text, kb)
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ex:rep:"))
-async def ex_report(callback: CallbackQuery, bot: Bot):
-  offer_id = int(callback.data.split(":")[2])
-  uid = callback.from_user.id
-  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
-  if not o or o["status"] != "taken":
-    await callback.answer("Жалоба недоступна.", show_alert=True)
-    return
-
-  if uid == o["owner_id"]:
-    accused = o["taker_id"]
-  elif uid == o["taker_id"]:
-    accused = o["owner_id"]
-  else:
-    await callback.answer("Ошибка доступа.", show_alert=True)
-    return
-
-  try:
-    _, report_id = await ex_exec(
-        "INSERT INTO ex_reports (offer_id, complainer_id, accused_id, created)"
-        " VALUES (?, ?, ?, ?)",
-        (offer_id, uid, accused, int(datetime.datetime.now().timestamp())),
-    )
-  except aiosqlite.IntegrityError:
-    await callback.answer(
-        "Вы уже отправляли жалобу по этому обмену.", show_alert=True
-    )
-    return
-
-  until = datetime.datetime.now() + datetime.timedelta(hours=RESTRICT_HOURS)
-  await ex_exec(
-      "UPDATE users SET restricted_until = ? WHERE user_id = ?",
-      (until.strftime(DT_FORMAT), accused),
-  )
-  await callback.answer(
-      "🚨 Жалоба успешно отправлена администратору.", show_alert=True
-  )
-
-  try:
-    await bot.send_message(
-        accused,
-        "🚨 На вас подана жалоба по обмену. Обмены временно ограничены.",
-    )
-  except Exception:
-    pass
-
-  try:
-    await bot.send_message(
-        ADMIN_ID,
-        f"🚨 <b>Жалоба #{report_id}</b>\nОт ID <code>{uid}</code> на ID"
-        f" <code>{accused}</code>\nОбмен #{offer_id}: {esc(o['give'])} →"
-        f" {esc(o['want'])}",
-        reply_markup=ex_kb([
-            [
-                (
-                    "✅ Снять ограничения (ложная жалоба)",
-                    f"ex:ok:{report_id}",
-                )
-            ],
-            [("✉️ Написать пользователю", f"ex:msg:{report_id}")],
-        ]),
-        disable_web_page_preview=True,
-    )
-  except Exception:
-    pass
-
-
-@router.callback_query(F.data.startswith("ex:ok:"))
-async def ex_admin_ok(callback: CallbackQuery, bot: Bot):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  report_id = int(callback.data.split(":")[2])
-  r = await ex_one("SELECT * FROM ex_reports WHERE id = ?", (report_id,))
-  if not r:
-    await callback.answer("Не найдено.", show_alert=True)
-    return
-  await ex_exec(
-      "UPDATE ex_reports SET status = 'released' WHERE id = ?", (report_id,)
-  )
-  await ex_exec(
-      "UPDATE users SET restricted_until = NULL WHERE user_id = ?",
-      (r["accused_id"],),
-  )
-
-  warns, banned = await add_warn(r["complainer_id"], "Ложная жалоба на обмен")
-  try:
-    await bot.send_message(
-        r["complainer_id"],
-        f"⚠️ Ваша жалоба признана ложной. Вы получили предупреждение"
-        f" ({warns}/{MAX_WARNS}).",
-    )
-  except Exception:
-    pass
-
-  await callback.answer("Готово.")
-  await callback.message.answer(
-      f"✅ Жалоба #{report_id} закрыта. Жаловшемуся выдано предупреждение."
-  )
-
-
-@router.callback_query(F.data.startswith("ex:msg:"))
-async def ex_admin_msg(callback: CallbackQuery, state: FSMContext):
-  if callback.from_user.id != ADMIN_ID:
-    await callback.answer()
-    return
-  report_id = int(callback.data.split(":")[2])
-  await state.set_state(ExAdminMsgState.text)
-  await state.update_data(report_id=report_id)
-  await callback.message.answer("Напишите текст сообщения:")
-  await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ex:take:"))
-async def ex_take(callback: CallbackQuery, state: FSMContext):
-  offer_id = int(callback.data.split(":")[2])
-  uid = callback.from_user.id
-  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
-  if not o or o["status"] != "open":
-    await callback.answer("Этот обмен уже забрали.", show_alert=True)
-    return
-  if o["owner_id"] == uid:
-    await callback.answer("Это ваш обмен.", show_alert=True)
-    return
-  bal = await ex_one(
-      "SELECT COALESCE(tokens, 0) t FROM users WHERE user_id = ?", (uid,)
-  )
-  if not bal or bal["t"] < EXCHANGE_COST:
-    await callback.answer(
-        f"Нужно {EXCHANGE_COST} токен для обмена.", show_alert=True
-    )
-    return
-  await state.set_state(ExTakeState.link)
-  await state.update_data(offer_id=offer_id)
-  await ex_show(
-      callback,
-      f"Отправьте <b>ссылку на свой фулл</b>:\n{LINK_RULE}",
-      ex_kb([[("❌ Отмена", "ex:cancel")]]),
-  )
-  await callback.answer()
-
-
-@router.message(StateFilter(ExTakeState.link))
-async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
-  link = (message.text or "").strip()
-  if not LINK_RE.match(link):
-    await message.answer(LINK_ERROR)
-    return
-  uid = message.from_user.id
-  offer_id = (await state.get_data())["offer_id"]
-  await state.clear()
-
-  rc, _ = await ex_exec(
-      "UPDATE ex_offers SET status = 'taken', taker_id = ?, taker_link = ?,"
-      " taken = ? WHERE id = ? AND status = 'open' AND owner_id != ?",
-      (uid, link, int(datetime.datetime.now().timestamp()), offer_id, uid),
-  )
-  if not rc:
-    await message.answer("Не успели — этот обмен уже забрали.")
-    return
-  await ex_exec(
-      "UPDATE users SET tokens = tokens - ? WHERE user_id = ?",
-      (EXCHANGE_COST, uid),
-  )
-  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
-
-  await message.answer(
-      f"🤝 <b>Обмен #{offer_id} успешно проведен!</b>\n"
-      f"🆔 ID обменщика: <code>{o['owner_id']}</code>\n"
-      f"🔗 Ссылка владельца:\n{esc(o['owner_link'])}\n\nСписан {EXCHANGE_COST} токен.",
-      disable_web_page_preview=True,
-  )
-  try:
-    await bot.send_message(
-        o["owner_id"],
-        f"🔔 Пользователь <code>{uid}</code> взял ваш обмен #{offer_id}!\n"
-        f"🆔 ID взявшегося: <code>{uid}</code>\n"
-        f"🔗 Ссылка:\n{esc(link)}",
-        disable_web_page_preview=True,
-    )
-  except Exception:
-    pass
-
-
-ROULETTE_MIN = 2
-ROULETTE_MAX = 10
-_roulette_locks = {}
-
-
-class RouletteState(StatesGroup):
-  bet = State()
-
-
-def roulette_decide(
-    current_tokens: int, roll_win: bool, aura_percent: int
-) -> bool:
-  if aura_percent > 0:
-    roll_win = random.random() < (0.50 + (aura_percent / 100.0))
-  if current_tokens >= 30:
-    return random.random() < 0.30
-  return roll_win
-
-
-async def roulette_play(user_id: int, bet: int) -> dict:
-  lock = _roulette_locks.setdefault(user_id, asyncio.Lock())
-  async with lock:
-    async with aiosqlite.connect(DB_NAME) as db:
-      cur = await db.execute(
-          "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
-          " COALESCE(tokens, 0) >= ?",
-          (bet, user_id, bet),
-      )
-      if cur.rowcount == 0:
-        async with db.execute(
-            "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as c:
-          row = await c.fetchone()
-        return {"error": "balance", "balance": row[0] if row else 0}
-
-      async with db.execute(
-          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?",
-          (user_id,),
-      ) as c:
-        row_bal = await c.fetchone()
-      current_bal = row_bal[0] if row_bal else 0
-
-      aura = await get_user_aura(user_id)
-      aura_percent = (
-          aura["percent"] if (aura and aura["type"] == "roulette") else 0
-      )
-
-      win = roulette_decide(current_bal, random.random() < 0.5, aura_percent)
-
-      await db.execute(
-          "INSERT OR IGNORE INTO roulette_state (user_id) VALUES (?)",
-          (user_id,),
-      )
-      await db.execute(
-          "UPDATE roulette_state SET games = COALESCE(games, 0) + 1, wins ="
-          " COALESCE(wins, 0) + ? WHERE user_id = ?",
-          (1 if win else 0, user_id),
-      )
-      if win:
-        await db.execute(
-            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-            (bet * 2, user_id),
-        )
-      async with db.execute(
-          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
-      ) as c:
-        balance = (await c.fetchone())[0]
-      await db.commit()
-  return {"win": win, "balance": balance}
-
-
-def roulette_result_kb(bet: int) -> InlineKeyboardMarkup:
-  return InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text=f"🔁 Сыграть снова ({bet} ток.)",
-                  callback_data=f"rl_again_{bet}",
-              )
-          ],
-          [InlineKeyboardButton(text="💰 Другая ставка", callback_data="rl_new")],
-      ]
-  )
-
-
-async def roulette_intro_text(user_id: int) -> str:
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
-    ) as cur:
-      row = await cur.fetchone()
-  balance = row[0] if row else 0
-  return (
-      "🎲 <b>Рулетка 50/50</b>\nСтавка: от"
-      f" {ROULETTE_MIN} до {ROULETTE_MAX} токенов.\nВаш баланс:"
-      f" <b>{balance}</b>.\n\nНапишите сумму ставки в чат:"
-  )
-
-
-@router.message(StateFilter(RouletteState.bet))
-async def roulette_bet(message: Message, state: FSMContext):
-  raw = (message.text or "").strip()
-  if not raw.isdigit() or not ROULETTE_MIN <= int(raw) <= ROULETTE_MAX:
-    await message.answer(f"Напишите число от {ROULETTE_MIN} до {ROULETTE_MAX}.")
-    return
-  bet = int(raw)
-  res = await roulette_play(message.from_user.id, bet)
-  if "error" in res:
-    await message.answer(f"❌ Недостаточно токенов. Баланс: {res['balance']}.")
-    return
-  await state.clear()
-  text = (
-      f"🎉 <b>Победа!</b> +{bet} токенов."
-      if res["win"]
-      else "💥 <b>Проигрыш.</b> Ставка сгорела."
-  )
-  text += f"\nБаланс: <b>{res['balance']}</b>"
-  await message.answer(text, reply_markup=roulette_result_kb(bet))
-
-
-@router.callback_query(F.data.startswith("rl_again_"))
-async def roulette_again(callback: CallbackQuery):
-  bet = int(callback.data.split("_")[2])
-  res = await roulette_play(callback.from_user.id, bet)
-  if "error" in res:
-    await callback.answer("❌ Недостаточно токенов.", show_alert=True)
-    return
-  await callback.answer()
-  text = (
-      f"🎉 <b>Победа!</b> +{bet} токенов."
-      if res["win"]
-      else "💥 <b>Проигрыш.</b>"
-  )
-  text += f"\nБаланс: <b>{res['balance']}</b>"
-  try:
-    await callback.message.edit_reply_markup(reply_markup=None)
-  except Exception:
-    pass
-  await callback.message.answer(text, reply_markup=roulette_result_kb(bet))
-
-
-@router.callback_query(F.data == "rl_new")
-async def roulette_new(callback: CallbackQuery, state: FSMContext):
-  await state.set_state(RouletteState.bet)
-  await callback.answer()
-  await callback.message.answer(
-      await roulette_intro_text(callback.from_user.id)
-  )
+# --- ЛОТЕРЕЯ ---
 
 
 def roll_lottery_params():
+  """(приз, цена_фиксирована). Ночью 1:00-8:00 (Киев): приз 4, участие 1."""
   hour = now_local().hour
   if 1 <= hour < 8:
     return 4, 1
@@ -3615,40 +1795,30 @@ async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
       f"👥 Минимум участников: <b>{lottery_min_players(prize)}</b>\n"
       f"⏱ Длится {LOTTERY_HOURS} ч."
   )
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     async with db.execute(
         "SELECT user_id, banned_until, COALESCE(notify_lottery, 1) FROM users"
     ) as cur:
       rows = await cur.fetchall()
   now = datetime.datetime.now()
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="🎰 Участвовать", callback_data="lottery_open")],
+          [
+              InlineKeyboardButton(
+                  text="🔕 Отключить уведомления",
+                  callback_data="lottery_toggle_notify",
+              )
+          ],
+      ]
+  )
   for uid, banned_until, notify in rows:
     if notify == 0:
       continue
-    if banned_until:
-      try:
-        if datetime.datetime.strptime(banned_until, DT_FORMAT) > now:
-          continue
-      except Exception:
-        pass
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎰 Участвовать", callback_data="lottery_open"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔕 Отключить уведомления",
-                    callback_data="lottery_toggle_notify",
-                )
-            ],
-        ]
-    )
-    try:
-      await bot.send_message(uid, text, reply_markup=kb)
-    except Exception:
-      pass
+    until = parse_dt(banned_until)
+    if until and until > now:
+      continue
+    await safe_send(bot, uid, text, reply_markup=kb)
     await asyncio.sleep(0.05)
 
 
@@ -3656,7 +1826,7 @@ async def create_lottery_round(bot: Bot = None) -> None:
   prize, fixed = roll_lottery_params()
   cost = 1 if fixed else lottery_cost_for_total(prize)
   ends_at = datetime.datetime.now() + datetime.timedelta(hours=LOTTERY_HOURS)
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     await db.execute(
         "INSERT INTO lottery_rounds (entry_cost, prize, ends_at, finished,"
         " cost_fixed) VALUES (?, ?, ?, 0, ?)",
@@ -3670,7 +1840,8 @@ async def create_lottery_round(bot: Bot = None) -> None:
 
 
 async def get_current_round():
-  async with aiosqlite.connect(DB_NAME) as db:
+  """(id, entry_cost, prize, ends_at, cost_fixed) или None."""
+  async with connect() as db:
     async with db.execute(
         "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0)"
         " FROM lottery_rounds WHERE finished = 0 ORDER BY id DESC LIMIT 1"
@@ -3701,8 +1872,7 @@ def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
       inline_keyboard=[
           [
               InlineKeyboardButton(
-                  text="🎰 Попытать удачу ещё раз",
-                  callback_data="lottery_open",
+                  text="🎰 Попытать удачу ещё раз", callback_data="lottery_open"
               )
           ],
           [
@@ -3715,18 +1885,19 @@ def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
 
 
 async def build_lottery_view(user_id: int):
+  """Возвращает (текст, клавиатура) для экрана лотереи."""
   rnd = await get_current_round()
   if not rnd:
     return "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", None
 
   round_id, _, prize, ends_at_str, fixed = rnd
-  ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+  ends_at = parse_dt(ends_at_str) or datetime.datetime.now()
   left_min = max(
       0, int((ends_at - datetime.datetime.now()).total_seconds() // 60)
   )
   hours, minutes = divmod(left_min, 60)
 
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     st = await lottery_stats(db, rnd)
     async with db.execute(
         "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
@@ -3764,71 +1935,32 @@ async def build_lottery_view(user_id: int):
       if user_notify == 1
       else "🔔 Включить уведомления"
   )
+  toggle_row = [
+      InlineKeyboardButton(text=toggle_text, callback_data="lottery_toggle_notify")
+  ]
 
   if joined:
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=toggle_text, callback_data="lottery_toggle_notify"
-                )
-            ]
-        ]
+    return (
+        text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!",
+        InlineKeyboardMarkup(inline_keyboard=[toggle_row]),
     )
-    return text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!", keyboard
 
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text=(
-                      "🎟 Участвовать (бесплатно)"
-                      if cost == 0
-                      else f"🎟 Участвовать ({cost} токен.)"
-                  ),
-                  callback_data=f"lottery_join_{round_id}_{cost}",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text=toggle_text, callback_data="lottery_toggle_notify"
-              )
-          ],
-      ]
-  )
-  return text, keyboard
-
-
-@router.callback_query(F.data == "lottery_toggle_notify")
-async def lottery_toggle_notify(callback: CallbackQuery):
-  user_id = callback.from_user.id
-  async with aiosqlite.connect(DB_NAME) as db:
-    async with db.execute(
-        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
-        (user_id,),
-    ) as cur:
-      row = await cur.fetchone()
-    current = row[0] if row else 1
-    new_val = 0 if current == 1 else 1
-    await db.execute(
-        "UPDATE users SET notify_lottery = ? WHERE user_id = ?", (new_val, user_id)
-    )
-    await db.commit()
-
-  status_str = "отключены 🔕" if new_val == 0 else "включены 🔔"
-  await callback.answer(
-      f"Уведомления о крупных лотереях {status_str}!", show_alert=True
-  )
-
-  try:
-    text, kb = await build_lottery_view(user_id)
-    await callback.message.edit_text(text, reply_markup=kb)
-  except Exception:
-    pass
+  join_row = [
+      InlineKeyboardButton(
+          text=(
+              "🎟 Участвовать (бесплатно)"
+              if cost == 0
+              else f"🎟 Участвовать ({cost} токен.)"
+          ),
+          callback_data=f"lottery_join_{round_id}_{cost}",
+      )
+  ]
+  return text, InlineKeyboardMarkup(inline_keyboard=[join_row, toggle_row])
 
 
 async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
+    # Сначала помечаем раунд завершённым, чтобы не выдать приз дважды
     await db.execute(
         "UPDATE lottery_rounds SET finished = 1 WHERE id = ?", (round_id,)
     )
@@ -3847,8 +1979,18 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
     players = [r[0] for r in part_rows]
     paid_map = {r[0]: (r[1] if r[1] is not None else cost) for r in part_rows}
 
+    notify_map = {}
+    for uid in players:
+      async with db.execute(
+          "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+          (uid,),
+      ) as c:
+        urow = await c.fetchone()
+      notify_map[uid] = urow[0] if urow else 1
+
     min_players = lottery_min_players(prize)
     if players and len(players) < min_players:
+      # Мало участников: приз не разыгрывается, токены за участие возвращаем
       for uid in players:
         await db.execute(
             "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE user_id = ?",
@@ -3856,44 +1998,37 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
         )
       await db.commit()
       for uid in players:
-        async with aiosqlite.connect(DB_NAME) as udb:
-          async with udb.execute(
-              "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
-              (uid,),
-          ) as c:
-            urow = await c.fetchone()
-            unotify = urow[0] if urow else 1
-        try:
-          await bot.send_message(
-              uid,
-              "😔 В розыгрыше не набралось нужное число участников"
-              f" ({len(players)} из {min_players}). Приз не разыгран."
-              + (
-                  f" Тебе вернули <b>{paid_map[uid]} токен(ов)</b>."
-                  if paid_map[uid]
-                  else ""
-              )
-              + "\n\nХотите ещё попытать удачу?",
-              reply_markup=lottery_again_keyboard(unotify),
-          )
-        except Exception:
-          pass
+        await safe_send(
+            bot,
+            uid,
+            "😔 В розыгрыше не набралось нужное число участников"
+            f" ({len(players)} из {min_players}). Приз не разыгран."
+            + (
+                f" Тебе вернули <b>{paid_map[uid]} токен(ов)</b>."
+                if paid_map[uid]
+                else ""
+            )
+            + "\n\nХотите ещё попытать удачу?",
+            reply_markup=lottery_again_keyboard(notify_map[uid]),
+        )
         await asyncio.sleep(0.05)
       return
 
-    prize = prize + sum(fee_to_prize(v) for v in paid_map.values())
+  # Половина каждого взноса участника добавляется к призу
+  prize = prize + sum(fee_to_prize(v) for v in paid_map.values())
 
-    weights = []
-    for uid in players:
-      weight = 1.0
-      aura = await get_user_aura(uid)
-      if aura and aura["type"] == "lottery":
-        weight += aura["percent"] / 100.0
-      weights.append(weight)
+  # Шансы: аура lottery увеличивает вес участника
+  weights = []
+  for uid in players:
+    weight = 1.0
+    aura = await get_user_aura(uid)
+    if aura and aura["type"] == "lottery":
+      weight += aura["percent"] / 100.0
+    weights.append(weight)
 
-    winner = random.choices(players, weights=weights, k=1)[0] if players else None
-
-    if winner is not None:
+  winner = random.choices(players, weights=weights, k=1)[0] if players else None
+  if winner is not None:
+    async with connect() as db:
       await db.execute(
           "UPDATE users SET tokens = COALESCE(tokens, 0) + ?,"
           " lottery_wins = COALESCE(lottery_wins, 0) + 1 WHERE user_id = ?",
@@ -3902,30 +2037,19 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
       await db.commit()
 
   for uid in players:
-    async with aiosqlite.connect(DB_NAME) as udb:
-      async with udb.execute(
-          "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
-          (uid,),
-      ) as c:
-        urow = await c.fetchone()
-        unotify = urow[0] if urow else 1
-    try:
-      if uid == winner:
-        await bot.send_message(
-            uid,
-            f"🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено:"
-            f" <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?",
-            reply_markup=lottery_again_keyboard(unotify),
-        )
-      else:
-        await bot.send_message(
-            uid,
-            "😔 В этот раз удача была не на твоей стороне. Победитель уже"
-            " получил приз.\n\nХотите ещё попытать удачу?",
-            reply_markup=lottery_again_keyboard(unotify),
-        )
-    except Exception:
-      pass
+    if uid == winner:
+      text = (
+          "🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено:"
+          f" <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?"
+      )
+    else:
+      text = (
+          "😔 В этот раз удача была не на твоей стороне. Победитель уже"
+          " получил приз.\n\nХотите ещё попытать удачу?"
+      )
+    await safe_send(
+        bot, uid, text, reply_markup=lottery_again_keyboard(notify_map[uid])
+    )
     await asyncio.sleep(0.05)
 
 
@@ -3937,16 +2061,114 @@ async def lottery_loop(bot: Bot):
         await create_lottery_round(bot)
         rnd = await get_current_round()
 
-      round_id, cost, prize, ends_at_str, _fixed = rnd
-      ends_at = datetime.datetime.strptime(ends_at_str, DT_FORMAT)
+      round_id, _cost, prize, ends_at_str, _fixed = rnd
+      ends_at = parse_dt(ends_at_str) or datetime.datetime.now()
       delay = (ends_at - datetime.datetime.now()).total_seconds()
       if delay > 0:
+        # спим короткими кусками: админ может изменить время тиража
         await asyncio.sleep(min(delay, 15))
         continue
       await finish_lottery_round(bot, round_id, prize)
     except Exception:
       logging.exception("Ошибка в цикле лотереи")
       await asyncio.sleep(30)
+
+
+@router.message(Command("lottery"))
+async def cmd_lottery(message: Message, command: CommandObject):
+  if await deny(message):
+    return
+
+  usage = (
+      "ℹ️ Управление текущей лотереей:\n"
+      "<code>/lottery prize [токены]</code> — главный приз (можно 0)\n"
+      "<code>/lottery cost [токены]</code> — цена участия, фиксированная"
+      " (можно 0)\n"
+      "<code>/lottery cost auto</code> — вернуть автоцену\n"
+      "<code>/lottery time [часы]</code> — сколько часов до конца, считая с"
+      " сейчас (можно <code>30m</code> — минуты)\n"
+      "<code>/lottery</code> — показать текущие настройки\n\n"
+      "<i>Участники не сбрасываются. Изменения действуют на текущий тираж.</i>"
+  )
+
+  rnd = await get_current_round()
+  if not rnd:
+    await message.answer("⏳ Сейчас нет активного тиража. Подожди секунду.")
+    return
+  round_id = rnd[0]
+
+  parts = (command.args or "").split()
+  if parts:
+    if len(parts) != 2:
+      await message.answer(usage)
+      return
+    field, raw = parts[0].lower(), parts[1].lower()
+    async with connect() as db:
+      if field == "prize":
+        if not raw.isdigit():
+          await message.answer(usage)
+          return
+        await db.execute(
+            "UPDATE lottery_rounds SET prize = ? WHERE id = ? AND finished = 0",
+            (int(raw), round_id),
+        )
+      elif field == "cost":
+        if raw == "auto":
+          await db.execute(
+              "UPDATE lottery_rounds SET cost_fixed = 0 WHERE id = ? AND"
+              " finished = 0",
+              (round_id,),
+          )
+        elif raw.isdigit():
+          await db.execute(
+              "UPDATE lottery_rounds SET entry_cost = ?, cost_fixed = 1"
+              " WHERE id = ? AND finished = 0",
+              (int(raw), round_id),
+          )
+        else:
+          await message.answer(usage)
+          return
+      elif field == "time":
+        unit_minutes = raw.endswith("m")
+        num = raw[:-1] if (unit_minutes or raw.endswith("h")) else raw
+        if not num.isdigit() or int(num) <= 0:
+          await message.answer(usage)
+          return
+        minutes = int(num) if unit_minutes else int(num) * 60
+        minutes = min(minutes, 24 * 60 * 14)
+        new_end = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
+        await db.execute(
+            "UPDATE lottery_rounds SET ends_at = ? WHERE id = ? AND finished = 0",
+            (new_end.strftime(DT_FORMAT), round_id),
+        )
+      else:
+        await message.answer(usage)
+        return
+      await db.commit()
+    rnd = await get_current_round()
+    if not rnd:
+      await message.answer("⏳ Тираж как раз закончился.")
+      return
+
+  round_id, _, prize, ends_at_str, fixed = rnd
+  ends_at = parse_dt(ends_at_str) or datetime.datetime.now()
+  left_min = max(
+      0, int((ends_at - datetime.datetime.now()).total_seconds() // 60)
+  )
+  async with connect() as db:
+    st = await lottery_stats(db, rnd)
+  await message.answer(
+      ("✅ Готово.\n\n" if parts else "")
+      + "🎰 <b>Текущая лотерея</b>\n"
+      f"🏆 Главный приз: <b>{prize}</b> токенов (+ {st['pool']} от взносов ="
+      f" {st['total']})\n"
+      f"🎟 Участие: <b>{cost_text(st['cost'])}</b>"
+      f" ({'фиксированная' if fixed else 'авто'})\n"
+      f"👥 Участников: <b>{st['players']}</b> (минимум:"
+      f" {lottery_min_players(prize)})\n"
+      f"⏱ До конца: <b>{left_min // 60} ч {left_min % 60} мин</b>"
+      + ("" if parts else "\n\n" + usage)
+  )
 
 
 @router.callback_query(F.data == "lottery_open")
@@ -3956,6 +2178,34 @@ async def lottery_open(callback: CallbackQuery):
   await callback.answer()
 
 
+@router.callback_query(F.data == "lottery_toggle_notify")
+async def lottery_toggle_notify(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  async with connect() as db:
+    await ensure_user(db, user_id)
+    async with db.execute(
+        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      row = await cur.fetchone()
+    new_val = 0 if (row[0] if row else 1) == 1 else 1
+    await db.execute(
+        "UPDATE users SET notify_lottery = ? WHERE user_id = ?",
+        (new_val, user_id),
+    )
+    await db.commit()
+
+  status_str = "отключены 🔕" if new_val == 0 else "включены 🔔"
+  await callback.answer(
+      f"Уведомления о крупных лотереях {status_str}!", show_alert=True
+  )
+  try:
+    text, kb = await build_lottery_view(user_id)
+    await callback.message.edit_text(text, reply_markup=kb)
+  except Exception:
+    pass
+
+
 @router.callback_query(F.data.startswith("lottery_join_"))
 async def lottery_join(callback: CallbackQuery):
   user_id = callback.from_user.id
@@ -3963,8 +2213,9 @@ async def lottery_join(callback: CallbackQuery):
   round_id = int(parts[2])
   shown_cost = int(parts[3]) if len(parts) > 3 else None
   price_changed = False
+  cost = 0
 
-  async with aiosqlite.connect(DB_NAME) as db:
+  async with connect() as db:
     async with db.execute(
         "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed, 0),"
         " finished FROM lottery_rounds WHERE id = ?",
@@ -3976,10 +2227,7 @@ async def lottery_join(callback: CallbackQuery):
       await callback.answer("⏳ Этот розыгрыш уже завершён.", show_alert=True)
       return
     rnd = row[:5]
-    try:
-      ends_at = datetime.datetime.strptime(rnd[3], DT_FORMAT)
-    except Exception:
-      ends_at = datetime.datetime.now()
+    ends_at = parse_dt(rnd[3]) or datetime.datetime.now()
     if ends_at <= datetime.datetime.now():
       await callback.answer("⏳ Розыгрыш уже заканчивается.", show_alert=True)
       return
@@ -3997,6 +2245,7 @@ async def lottery_join(callback: CallbackQuery):
     if shown_cost is not None and shown_cost != cost:
       price_changed = True
     else:
+      # Списание токенов одним запросом: сработает, только если хватает токенов
       if cost > 0:
         cur = await db.execute(
             "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
@@ -4037,108 +2286,2345 @@ async def lottery_join(callback: CallbackQuery):
   await callback.message.answer(
       "🎟 Ты участвуешь в лотерее!"
       + (f" Списано: <b>{cost} токен(ов)</b>." if cost else " Участие бесплатное.")
-      + "\n"
-      "Результат придёт сюда, когда закончится розыгрыш."
+      + "\nРезультат придёт сюда, когда закончится розыгрыш."
   )
 
 
-async def weekly_reset_loop(bot: Bot):
-  while True:
-    await asyncio.sleep(1209600)
+# --- МАГАЗИН ---
+
+
+async def shop_price(user_id: int, base_price: int, buyers_count: int) -> int:
+  price = max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
+  aura = await get_user_aura(user_id)
+  if aura and aura["type"] == "shop":
+    price = max(1, int(round(price * (1 - aura["percent"] / 100.0))))
+  return price
+
+
+def parse_price(price_raw) -> int:
+  try:
+    return int("".join(filter(str.isdigit, str(price_raw))))
+  except ValueError:
+    return 0
+
+
+async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
+  """Покупка за обычные токены. True, если покупка прошла."""
+  user_id = callback.from_user.id
+
+  async with connect() as db:
+    async with db.execute(
+        "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
+        (p_id,),
+    ) as cursor:
+      product = await cursor.fetchone()
+    if not product:
+      await callback.answer("❌ Этот товар был удален.", show_alert=True)
+      return False
+    title, price_raw, link, buyers_count = product
+    final_price = await shop_price(user_id, parse_price(price_raw), buyers_count)
+
+    async with db.execute(
+        "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
+    ) as cursor:
+      urow = await cursor.fetchone()
+    referrer_id = urow[0] if urow else 0
+
+    cur = await db.execute(
+        "UPDATE users SET tokens = tokens - ?, bought_folders ="
+        " COALESCE(bought_folders, 0) + 1 WHERE user_id = ? AND"
+        " COALESCE(tokens, 0) >= ?",
+        (final_price, user_id, final_price),
+    )
+    if cur.rowcount == 0:
+      await db.rollback()
+      async with db.execute(
+          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+      ) as c:
+        brow = await c.fetchone()
+      await callback.answer(
+          f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
+          f" {brow[0] if brow else 0}.",
+          show_alert=True,
+      )
+      return False
+
+    await db.execute(
+        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
+        (p_id,),
+    )
+
+    ref_bonus = 0
+    if referrer_id and referrer_id != user_id:
+      ref_bonus = round(final_price * 0.15)
+      if ref_bonus > 0:
+        await db.execute(
+            "UPDATE users SET tokens = COALESCE(tokens, 0) + ? WHERE"
+            " user_id = ?",
+            (ref_bonus, referrer_id),
+        )
+        await db.execute(
+            "UPDATE users SET ref_income = COALESCE(ref_income, 0) + ? WHERE"
+            " user_id = ?",
+            (ref_bonus, user_id),
+        )
+    async with db.execute(
+        "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+    ) as c:
+      new_tokens = (await c.fetchone())[0]
+    await db.commit()
+
+  if ref_bonus > 0:
+    await safe_send(
+        bot,
+        referrer_id,
+        "💰 Реферальный бонус!\nВаш реферал совершил покупку.\n🎁 Вам"
+        f" начислено {ref_bonus} токенов (15% от покупки).",
+    )
+
+  if buyers_count == 0:
+    text = (
+        f"🎉 Поздравляем! Ты первый покупатель фулла {esc(title)}!\n🔥"
+        f" Применилась скидка 80%!\nСписано: {final_price} токенов.\n💲 Ваш"
+        f" остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание"
+        f" (нажми, чтобы показать):\n{hidden_link(link)}"
+    )
+  else:
+    text = (
+        f"✅ Спасибо за покупку фула {esc(title)}!\n💰 Списано:"
+        f" {final_price} токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя"
+        f" ссылка на скачивание (нажми, чтобы показать):\n{hidden_link(link)}"
+    )
+  await callback.message.answer(text, disable_web_page_preview=True)
+  await callback.answer()
+  return True
+
+
+@router.callback_query(F.data.startswith("buy_"))
+async def process_buy(callback: CallbackQuery, bot: Bot):
+  user_id = callback.from_user.id
+  if await get_restriction(user_id):
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    return
+  p_id = int(callback.data.split("_")[1])
+
+  async with connect() as db:
+    async with db.execute(
+        "SELECT title, price, link, buyers_count FROM products WHERE id = ?",
+        (p_id,),
+    ) as cursor:
+      product = await cursor.fetchone()
+    if not product:
+      await callback.answer("❌ Этот товар был удален.", show_alert=True)
+      return
+    title, price_raw, link, buyers_count = product
+
+    async with db.execute(
+        "SELECT is_premium, premium_expires, COALESCE(full_tokens, 0)"
+        " FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+      u_data = await cursor.fetchone()
+    is_prem = u_data[0] if u_data else 0
+    prem_expires = u_data[1] if u_data else None
+    full_tokens = u_data[2] if u_data else 0
+
+    if is_prem == 1 and not premium_active(is_prem, prem_expires):
+      await db.execute(
+          "UPDATE users SET is_premium = 0, premium_expires = NULL WHERE"
+          " user_id = ?",
+          (user_id,),
+      )
+      await db.commit()
+      is_prem = 0
+
+    if is_prem == 1:
+      await db.execute(
+          "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
+          (p_id,),
+      )
+      await db.execute(
+          "UPDATE users SET bought_folders = COALESCE(bought_folders, 0) + 1"
+          " WHERE user_id = ?",
+          (user_id,),
+      )
+      await db.commit()
+      await callback.message.answer(
+          f"👑 Премиум-доступ применен!\n\n✅ Вы получили фулл"
+          f" {esc(title)} бесплатно по подписке!\n\n🔗 Ссылка (нажми, чтобы"
+          f" показать):\n{hidden_link(link)}",
+          disable_web_page_preview=True,
+      )
+      await callback.answer()
+      return
+
+  if full_tokens > 0:
+    final_price = await shop_price(user_id, parse_price(price_raw), buyers_count)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📦 Использовать Фулловый токен",
+                    callback_data=f"usefull_{p_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🪙 Обычными ({final_price} токенов)",
+                    callback_data=f"usenorm_{p_id}",
+                )
+            ],
+        ]
+    )
+    await callback.message.answer(
+        "❓ У вас есть фулловый токен. Использовать его или заплатить обычными"
+        f" токенами ({final_price} шт.)?",
+        reply_markup=kb,
+    )
+    await callback.answer()
+    return
+
+  await pay_with_tokens(callback, bot, p_id)
+
+
+@router.callback_query(F.data.startswith("usenorm_"))
+async def process_buy_norm(callback: CallbackQuery, bot: Bot):
+  if await get_restriction(callback.from_user.id):
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    return
+  p_id = int(callback.data.split("_")[1])
+  if await pay_with_tokens(callback, bot, p_id):
     try:
-      async with aiosqlite.connect(DB_NAME) as db:
-        async def reward_winner(w_id: int, top_name: str):
-          kb = InlineKeyboardMarkup(
-              inline_keyboard=[
-                  [
-                      InlineKeyboardButton(
-                          text="👑 Премиум на 7 дней",
-                          callback_data=f"top_reward_{w_id}_prem",
-                      )
-                  ],
-                  [
-                      InlineKeyboardButton(
-                          text="💎 2 уникальных токена",
-                          callback_data=f"top_reward_{w_id}_ytoken",
-                      )
-                  ],
-              ]
-          )
-          try:
-            await bot.send_message(
-                w_id,
-                f"🏆 <b>Поздравляем! Вы заняли 1 место в {top_name}!</b>\n\n"
-                "Выберите вашу награду:",
-                reply_markup=kb,
+      await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+      pass
+
+
+@router.callback_query(F.data.startswith("usefull_"))
+async def process_buy_full(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  if await get_restriction(user_id):
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    return
+  p_id = int(callback.data.split("_")[1])
+
+  async with connect() as db:
+    async with db.execute(
+        "SELECT title, link FROM products WHERE id = ?", (p_id,)
+    ) as cur:
+      prod = await cur.fetchone()
+    if not prod:
+      await callback.answer("❌ Товар не найден.", show_alert=True)
+      return
+    title, link = prod
+
+    cur = await db.execute(
+        "UPDATE users SET full_tokens = full_tokens - 1, bought_folders ="
+        " COALESCE(bought_folders, 0) + 1 WHERE user_id = ? AND"
+        " COALESCE(full_tokens, 0) > 0",
+        (user_id,),
+    )
+    if cur.rowcount == 0:
+      await db.rollback()
+      await callback.answer(
+          "❌ У вас больше нет фулловых токенов.", show_alert=True
+      )
+      return
+    await db.execute(
+        "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
+        (p_id,),
+    )
+    await db.commit()
+
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+  await callback.message.answer(
+      f"✅ Успешная покупка фулла {esc(title)} за фулловый токен!\n\n🔗 Ссылка"
+      f" (нажми, чтобы показать):\n{hidden_link(link)}",
+      disable_web_page_preview=True,
+  )
+  await callback.answer()
+
+
+# --- УНИКАЛЬНЫЙ МАГАЗИН ---
+
+
+def parse_unique_command(cmd: str):
+  """Разбирает команду товара. Возвращает (action, args) или None.
+
+  Форматы: 'ftoken 1', 'ytoken 5', 'token 10', 'p 30',
+  'aura shop 15 30 Название'. Старый формат с 'add {user_id}' тоже работает.
+  """
+  parts = [
+      p
+      for p in (cmd or "").replace("{user_id}", " ").split()
+      if p.lower() != "add"
+  ]
+  if not parts:
+    return None
+  action = parts[0].lstrip("/").lower()
+  args = parts[1:]
+  if action in ("token", "tokens", "t"):
+    action = "token"
+  elif action in ("p", "premium"):
+    action = "premium"
+
+  if action in ("ftoken", "ytoken", "token"):
+    if not args:
+      return action, [1]
+    if len(args) == 1 and args[0].isdigit() and int(args[0]) > 0:
+      return action, [int(args[0])]
+    return None
+  if action == "premium":
+    if len(args) == 1 and args[0].isdigit() and int(args[0]) > 0:
+      return action, [int(args[0])]
+    return None
+  if action == "aura":
+    if (
+        len(args) >= 3
+        and args[0].lower() in ("lottery", "roulette", "shop")
+        and args[1].isdigit()
+        and args[2].isdigit()
+    ):
+      name = " ".join(args[3:]) or None
+      return action, [args[0].lower(), int(args[1]), int(args[2]), name]
+    return None
+  return None
+
+
+async def apply_unique_command(user_id: int, title: str, parsed) -> None:
+  action, args = parsed
+  if action == "ftoken":
+    await grant_full_tokens(user_id, args[0])
+  elif action == "ytoken":
+    await grant_y_tokens(user_id, args[0])
+  elif action == "token":
+    await grant_tokens(user_id, args[0])
+  elif action == "premium":
+    await grant_premium(user_id, args[0])
+  elif action == "aura":
+    aura_type, percent, days, name = args
+    expires = datetime.datetime.now() + datetime.timedelta(days=days)
+    async with connect() as db:
+      await ensure_user(db, user_id)
+      await db.execute(
+          "UPDATE users SET aura_type = ?, aura_name = ?, aura_percent = ?,"
+          " aura_expires = ? WHERE user_id = ?",
+          (
+              aura_type,
+              name or title,
+              percent,
+              expires.strftime(DT_FORMAT),
+              user_id,
+          ),
+      )
+      await db.commit()
+
+
+@router.callback_query(F.data.startswith("ubuy_"))
+async def process_ubuy(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  up_id = int(callback.data.split("_")[1])
+
+  async with connect() as db:
+    async with db.execute(
+        "SELECT title, price, amount, command FROM unique_products WHERE id = ?",
+        (up_id,),
+    ) as cur:
+      prod = await cur.fetchone()
+    if not prod or prod[2] <= 0:
+      await callback.answer("❌ Товар закончился или удален.", show_alert=True)
+      return
+    title, price, _amount, command_str = prod
+
+    parsed = parse_unique_command(command_str)
+    if parsed is None:
+      await callback.answer(
+          "❌ У товара неверно настроена команда. Напиши админу.",
+          show_alert=True,
+      )
+      return
+
+    # Товар списываем первым и только если он ещё есть
+    cur = await db.execute(
+        "UPDATE unique_products SET amount = amount - 1"
+        " WHERE id = ? AND amount > 0",
+        (up_id,),
+    )
+    if cur.rowcount == 0:
+      await db.rollback()
+      await callback.answer("❌ Товар закончился.", show_alert=True)
+      return
+
+    await ensure_user(db, user_id)
+    cur = await db.execute(
+        "UPDATE users SET y_tokens = y_tokens - ? WHERE user_id = ?"
+        " AND COALESCE(y_tokens, 0) >= ?",
+        (price, user_id, price),
+    )
+    if cur.rowcount == 0:
+      await db.rollback()
+      await callback.answer(
+          f"❌ Недостаточно уникальных токенов! Нужно: {price}.",
+          show_alert=True,
+      )
+      return
+    await db.commit()
+
+  try:
+    await apply_unique_command(user_id, title, parsed)
+  except Exception:
+    logging.exception("Ошибка выдачи товара уник. магазина")
+    await callback.message.answer(
+        "⚠️ Произошла ошибка при выдаче товара. Напиши админу."
+    )
+    await callback.answer()
+    return
+
+  await callback.message.answer(
+      f"💎 <b>Успешная покупка!</b>\nВы приобрели: <b>{esc(title)}</b> за"
+      f" {price} уникальных токенов.\nВсё уже начислено в профиль."
+  )
+  await callback.answer()
+
+
+# --- ГЛАВНОЕ МЕНЮ ---
+
+
+@router.message(
+    F.text.in_(
+        {
+            "👤 Мой Профиль",
+            "🛒 Магазин",
+            "🛍 Магазин",
+            "💎 Уникальный магазин",
+            "👥 Реферальная система",
+            "🏆 Топ игроков",
+            "🪙 Как получить токены?",
+            "👑 Премиум-подписка",
+            "🎰 Лотерея",
+            "🔄 Обмены",
+            "🎲 Рулетка",
+            "⚙️ Админ-панель",
+        }
+    )
+)
+async def menu_router(message: Message, bot: Bot, state: FSMContext):
+  await state.clear()
+  user_id = message.from_user.id
+  text = message.text
+
+  if text == "👤 Мой Профиль":
+    async with connect() as db:
+      await ensure_user(db, user_id)
+      await db.commit()
+      async with db.execute(
+          "SELECT COALESCE(tokens, 0), COALESCE(y_tokens, 0),"
+          " COALESCE(full_tokens, 0), is_premium, COALESCE(bought_folders, 0),"
+          " premium_expires, COALESCE(warns, 0), COALESCE(exchanges, 0)"
+          " FROM users WHERE user_id = ?",
+          (user_id,),
+      ) as cursor:
+        (tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns,
+         exchanges) = await cursor.fetchone()
+
+    prem_status = "❌ Не активна"
+    if is_prem == 1:
+      if premium_active(is_prem, prem_expires):
+        exp_date = parse_dt(prem_expires)
+        if exp_date:
+          days_left = (exp_date - datetime.datetime.now()).days
+          prem_status = f"✅ До {exp_date.strftime('%d.%m.%Y')} ({days_left} дн.)"
+        else:
+          prem_status = "✅ Активна"
+      else:
+        await remove_premium(user_id)
+        prem_status = "❌ Не активна (истекла)"
+
+    aura = await get_user_aura(user_id)
+    if aura:
+      aura_days = (aura["expires"] - datetime.datetime.now()).days
+      aura_status = (
+          f"✨ <b>{esc(aura['name'])}</b> ({aura['percent']}% бонусов, ещё"
+          f" {aura_days} дн.)"
+      )
+    else:
+      aura_status = "❌ Нет"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎟 Ввести промокод", callback_data="enter_promocode"
+                )
+            ]
+        ]
+    )
+    await message.answer(
+        f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
+        f"💲 Баланс токенов: {tokens}\n"
+        f"💎 Уникальные токены: {y_tokens}\n"
+        f"📦 Фулловые токены: {full_tokens}\n"
+        f"👑 Премиум-подписка: {prem_status}\n"
+        f"✨ Активная аура: {aura_status}\n"
+        f"📦 Собрано фулов: {bought} шт.\n"
+        f"⚠️ Предупреждения: {warns}/{MAX_WARNS}\n"
+        f"🔄 Обменов проведено: {exchanges}",
+        reply_markup=keyboard,
+    )
+
+  elif text in ("🛒 Магазин", "🛍 Магазин"):
+    async with connect() as db:
+      async with db.execute(
+          "SELECT id, title, price, buyers_count FROM products"
+      ) as cursor:
+        products = await cursor.fetchall()
+
+    if not products:
+      await message.answer("📭 В магазине пока пусто. Либо же вы все раскупили!")
+      return
+
+    keyboard_buttons = []
+    for p_id, title, price, buyers_count in products:
+      if buyers_count == 0:
+        btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+      else:
+        btn_text = f"📁 {title} — {price} токенов"
+      keyboard_buttons.append(
+          [InlineKeyboardButton(text=btn_text, callback_data=f"buy_{p_id}")]
+      )
+    await message.answer(
+        "🛍 <b>Доступные фулы:</b>\n<i>(Нажми на нужный, чтобы забрать"
+        " ссылку)</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
+    )
+
+  elif text == "💎 Уникальный магазин":
+    async with connect() as db:
+      async with db.execute(
+          "SELECT id, title, price, amount FROM unique_products WHERE amount > 0"
+      ) as cursor:
+        u_products = await cursor.fetchall()
+
+    if not u_products:
+      await message.answer("📭 Уникальный магазин пуст.")
+      return
+
+    kb_buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"💎 {title} — {price} уник. ток. (осталось: {amount})",
+                callback_data=f"ubuy_{up_id}",
             )
-          except Exception:
-            pass
+        ]
+        for up_id, title, price, amount in u_products
+    ]
+    await message.answer(
+        "💎 <b>Уникальный магазин</b>\nПокупайте уникальные предметы за"
+        " уникальные токены:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
+    )
 
-        async with db.execute(REF_TOP_SQL, (1,)) as cursor:
-          ref_winner = await cursor.fetchone()
-        if ref_winner:
-          await reward_winner(ref_winner[0], "топе по рефералам")
+  elif text == "👥 Реферальная система":
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    await message.answer(
+        "👥 <b>Реферальная система</b>\n\nПриглашай друзей по своей ссылке:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"🎁 За каждого приглашенного (после подписки на канал) —"
+        f" <b>{REF_BONUS} токенов</b>!\n"
+        "💰 А также вы получаете <b>15% дохода</b> от трат ваших рефералов"
+        " токенами в обычном магазине!"
+    )
 
+  elif text == "🏆 Топ игроков":
+    await message.answer(
+        "🏆 <b>Выберите категорию топа:</b>", reply_markup=tops_menu_keyboard()
+    )
+
+  elif text == "🪙 Как получить токены?":
+    tokens_text = (
+        "<b>Как получить токены?</b>\n\n"
+        "1. Возьмите фото. https://t.me/JmcDeveloper/11\n\n"
+        "2. Оставляйте в комментариях под постами/ответами другим людям.\n\n"
+        "3. Отправляйте доказательства (скриншоты) в директ канала."
+        " https://t.me/JmcDeveloper?direct\n\n"
+        "<b>ГЛАВНОЕ:</b> тема видео должна касаться по типу сестры и брата и"
+        " т.д.\n\n"
+        "💰 1 отправка фото в комментариях = 1 токен!\n\n"
+        "📖 <b>ДЕТАЛЬНО РАСПИСАЛ ТУТ:</b> https://t.me/JmcDeveloper/18\n"
+        "<i>(и могу не выдать некоторые токены если не посмотрите 👆)</i>\n\n"
+        "-----------------------------------\n\n"
+        "💎 <b>Как получить УНИКАЛЬНЫЕ токены?</b>\n"
+        "Их можно только купить, <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
+        "<b>Как купить?</b> Кинуть любой подарок со стоимостью 15 звёзд на"
+        " аккаунт @ucu52\n\n"
+        "<b>Преимущества:</b>\n"
+        "1. Там выходят фулы на 1 день позже, чем в стандартный магазин.\n"
+        "2. Там уникальные товары по типу ауры и так далее\n\n"
+        "-----------------------------------\n\n"
+        "📦 <b>Как получить ФУЛЛОВЫЕ токены?</b>\n"
+        "Их можно купить в <b>Уникальном магазине</b> за уникальные токены"
+        " (или получить от администратора).\n\n"
+        "<b>Преимущество:</b>\n"
+        "Позволяет забрать абсолютно любой фулл в обычном магазине бесплатно"
+        " (без траты обычных токенов), просто используя фулловый токен при"
+        " покупке!"
+    )
+    await message.answer(tokens_text, disable_web_page_preview=True)
+
+  elif text == "👑 Премиум-подписка":
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐ Отправить Подарок 50 Stars",
+                    url="https://t.me/ucu52",
+                )
+            ]
+        ]
+    )
+    prem_text = (
+        "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n"
+        "<b>Преимущества:</b>\n"
+        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно c обычного"
+        " магазина!\n\n"
+        "💳 <b>Способ 1:</b> Купить | Заплатить 50 Звезд\n"
+        "(любым подарком на профиль @ucu52)\n\n"
+        "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 Фото в коментарии в тт\n"
+        "подробнее про фото: https://t.me/JmcDeveloper/18\n\n"
+        "Вы можете получить премиум бесплатно за 100 фото в коменты!\n"
+        "<i>Если была хотя бы одна фото дублирована или уже принята как Токен"
+        " — подписка не выдается.</i>\n"
+        "Если вы сделали все хорошо, отправляйте сюда:"
+        " https://t.me/JmcDeveloper?direct\n"
+        "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
+    )
+    await message.answer(
+        prem_text, reply_markup=keyboard, disable_web_page_preview=True
+    )
+
+  elif text == "🎰 Лотерея":
+    lottery_text, lottery_kb = await build_lottery_view(user_id)
+    await message.answer(lottery_text, reply_markup=lottery_kb)
+
+  elif text == "🔄 Обмены":
+    await message.answer(await ex_menu_text(), reply_markup=exchange_menu_kb())
+
+  elif text == "🎲 Рулетка":
+    await state.set_state(RouletteState.bet)
+    await message.answer(await roulette_intro_text(user_id))
+
+  elif text == "⚙️ Админ-панель":
+    if user_id != ADMIN_ID:
+      await message.answer("⛔️ У тебя нет доступа!")
+      return
+
+    def btn(label, data):
+      return [InlineKeyboardButton(text=label, callback_data=data)]
+
+    admin_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            btn("➕ Добавить фулл", "add_product"),
+            btn("💎 Добавить в уник. магазин", "add_unique_product"),
+            btn("✏️ Редактировать товар", "ed_list"),
+            btn("🗑 Удалить товар", "del_list"),
+            btn("✏️ Ред. уник. товар", "ued_list"),
+            btn("🗑 Уд. уник. товар", "udel_list"),
+            btn("🎟 Создать промокод", "admin_create_promo"),
+            btn("🪙 Выдать токены", "admin_give_tokens"),
+            btn("💎 Выдать уник. токены", "admin_give_ytokens"),
+            btn("📦 Выдать фулл. токены", "admin_give_ftokens"),
+            btn("👑 Выдать Премиум", "admin_give_premium"),
+            btn("📢 Сделать рассылку", "start_broadcast"),
+            btn("💾 Скачать бэкап БД", "admin_backup_db"),
+        ]
+    )
+    await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
+
+
+# --- ПРОМОКОД: ВВОД ПОЛЬЗОВАТЕЛЕМ ---
+
+
+@router.message(StateFilter(PromocodeState.code))
+async def promo_check(message: Message, state: FSMContext):
+  user_id = message.from_user.id
+  code_text = txt(message)
+  await state.clear()
+  reply = await apply_promocode(user_id, code_text)
+  await message.answer(reply, reply_markup=get_main_keyboard(user_id))
+
+
+@router.callback_query(F.data == "enter_promocode")
+async def promo_prompt(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  await state.set_state(PromocodeState.code)
+  await callback.message.answer("🎟 Введите промокод:")
+  await callback.answer()
+
+
+# --- АДМИНКА: ВЫДАЧА ТОКЕНОВ И ПРЕМИУМА ---
+
+GIVE_KINDS = {
+    "tokens": ("🪙", "токенов", grant_tokens),
+    "y": ("💎", "уникальных токенов", grant_y_tokens),
+    "full": ("📦", "фулловых токенов", grant_full_tokens),
+}
+
+
+async def _start_give(callback: CallbackQuery, state: FSMContext, kind: str):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await state.set_state(GiveState.user_id)
+  await state.update_data(kind=kind)
+  icon, label, _ = GIVE_KINDS[kind]
+  await callback.message.answer(
+      f"{icon} Введи <b>Telegram ID</b> пользователя для начисления {label}:"
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data == "admin_give_tokens")
+async def start_give_tokens(callback: CallbackQuery, state: FSMContext):
+  await _start_give(callback, state, "tokens")
+
+
+@router.callback_query(F.data == "admin_give_ytokens")
+async def start_give_ytokens(callback: CallbackQuery, state: FSMContext):
+  await _start_give(callback, state, "y")
+
+
+@router.callback_query(F.data == "admin_give_ftokens")
+async def start_give_ftokens(callback: CallbackQuery, state: FSMContext):
+  await _start_give(callback, state, "full")
+
+
+@router.message(StateFilter(GiveState.user_id))
+async def process_give_id(message: Message, state: FSMContext):
+  if not txt(message).isdigit():
+    await message.answer("❌ Ошибка! ID должен состоять только из цифр.")
+    return
+  await state.update_data(target_id=int(txt(message)))
+  await state.set_state(GiveState.amount)
+  data = await state.get_data()
+  icon, label, _ = GIVE_KINDS[data["kind"]]
+  await message.answer(f"{icon} Сколько {label} начислить? (целое число)")
+
+
+@router.message(StateFilter(GiveState.amount))
+async def process_give_amount(message: Message, state: FSMContext, bot: Bot):
+  if not txt(message).isdigit() or int(txt(message)) <= 0:
+    await message.answer("❌ Введите число больше нуля.")
+    return
+  amount = int(txt(message))
+  data = await state.get_data()
+  target_id, kind = data["target_id"], data["kind"]
+  await state.clear()
+  icon, label, grant = GIVE_KINDS[kind]
+  try:
+    await grant(target_id, amount)
+  except Exception as e:
+    logging.exception("Ошибка выдачи через админ-панель")
+    await message.answer(f"❌ Ошибка выдачи: {esc(e)}")
+    return
+  await message.answer(
+      f"✅ <code>{target_id}</code>: начислено <b>+{amount}</b> {label}.",
+      reply_markup=get_main_keyboard(message.from_user.id),
+  )
+  await safe_send(
+      bot,
+      target_id,
+      f"🎁 <b>Администратор начислил вам {amount} {label}!</b> Проверьте"
+      " профиль.",
+  )
+
+
+@router.callback_query(F.data == "admin_give_premium")
+async def start_give_premium(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await state.set_state(GivePremiumState.user_id)
+  await callback.message.answer(
+      "👑 Введи <b>Telegram ID</b> пользователя для выдачи Премиума:"
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(GivePremiumState.user_id))
+async def process_give_premium_id(message: Message, state: FSMContext):
+  if not txt(message).isdigit():
+    await message.answer("❌ Только цифры.")
+    return
+  await state.update_data(target_id=int(txt(message)))
+  await state.set_state(GivePremiumState.days)
+  await message.answer("⏳ На сколько <b>дней</b> выдать Премиум?")
+
+
+@router.message(StateFilter(GivePremiumState.days))
+async def process_give_premium_days(
+    message: Message, state: FSMContext, bot: Bot
+):
+  if not txt(message).isdigit() or int(txt(message)) <= 0:
+    await message.answer("❌ Введите число дней цифрами.")
+    return
+  days = int(txt(message))
+  target_id = (await state.get_data())["target_id"]
+  await state.clear()
+  try:
+    new_expire = await grant_premium(target_id, days)
+  except Exception as e:
+    logging.exception("Ошибка выдачи премиума")
+    await message.answer(f"❌ Ошибка выдачи премиума: {esc(e)}")
+    return
+  formatted = new_expire.strftime("%d.%m.%Y")
+  await message.answer(
+      f"✅ Премиум выдан <code>{target_id}</code> на {days} дн. (до"
+      f" {formatted}).",
+      reply_markup=get_main_keyboard(message.from_user.id),
+  )
+  await safe_send(
+      bot,
+      target_id,
+      f"🎉 <b>Вам активирована Премиум-подписка на {days} дней!</b>\n📅 До"
+      f" <b>{formatted}</b>.",
+  )
+
+
+# --- АДМИНКА: ПРОМОКОДЫ ---
+
+
+@router.callback_query(F.data == "admin_create_promo")
+async def start_create_promo(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await state.set_state(CreatePromoState.code)
+  await callback.message.answer(
+      "🎟 Введите текст промокода (например: <code>START100</code>):"
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(CreatePromoState.code))
+async def process_promo_code(message: Message, state: FSMContext):
+  code = txt(message)
+  if not code or " " in code:
+    await message.answer("❌ Промокод — одно слово без пробелов.")
+    return
+  await state.update_data(code=code)
+  await state.set_state(CreatePromoState.type)
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(text="🪙 Токены", callback_data="promo_type_tokens"),
+              InlineKeyboardButton(text="👑 Премиум", callback_data="promo_type_premium"),
+          ]
+      ]
+  )
+  await message.answer("🎁 Выберите, что будет давать промокод:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("promo_type_"))
+async def process_promo_type(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  p_type = callback.data.split("_")[2]
+  if p_type not in ("tokens", "premium"):
+    await callback.answer()
+    return
+  await state.update_data(type=p_type)
+  await state.set_state(CreatePromoState.value)
+  if p_type == "tokens":
+    await callback.message.answer("💰 Введите количество токенов (число):")
+  else:
+    await callback.message.answer("⏳ Введите количество дней Премиума (число):")
+  await callback.answer()
+
+
+@router.message(StateFilter(CreatePromoState.value))
+async def process_promo_value(message: Message, state: FSMContext):
+  if not txt(message).isdigit() or int(txt(message)) <= 0:
+    await message.answer("❌ Ошибка! Введите целое число больше нуля.")
+    return
+  await state.update_data(value=txt(message))
+  await state.set_state(CreatePromoState.uses)
+  await message.answer(
+      "🔢 Введите <b>количество использований</b> (например: 10 или"
+      " 100):\n<i>(Введите 0 для безлимита)</i>"
+  )
+
+
+@router.message(StateFilter(CreatePromoState.uses))
+async def process_promo_uses(message: Message, state: FSMContext, bot: Bot):
+  if not txt(message).isdigit():
+    await message.answer("❌ Введите число использований цифрами.")
+    return
+  max_uses = int(txt(message))
+  data = await state.get_data()
+  code, reward_type, reward_value = (
+      str(data["code"]),
+      str(data["type"]),
+      str(data["value"]),
+  )
+  await state.clear()
+
+  async with connect() as db:
+    await db.execute(
+        """
+        INSERT INTO promocodes (code, reward_type, reward_value, max_uses, used_count)
+        VALUES (?, ?, ?, ?, 0)
+        ON CONFLICT(code) DO UPDATE SET reward_type = ?, reward_value = ?, max_uses = ?
+        """,
+        (code, reward_type, reward_value, max_uses,
+         reward_type, reward_value, max_uses),
+    )
+    await db.commit()
+
+  uses_text = f"{max_uses} раз" if max_uses > 0 else "Безлимитно"
+  reward_desc = (
+      f"{reward_value} токенов"
+      if reward_type == "tokens"
+      else f"Премиум на {reward_value} дней"
+  )
+  await message.answer(
+      f"✅ <b>Промокод создан!</b>\n\n🎟 Промокод: <code>{esc(code)}</code>\n"
+      f"🎁 Награда: {reward_desc}\n👥 Использований: {uses_text}",
+      reply_markup=get_main_keyboard(message.from_user.id),
+  )
+
+  # Готовый пост для канала
+  try:
+    username = (await bot.get_me()).username
+  except Exception:
+    username = "ygolokbomja_bot"
+  if reward_type == "tokens":
+    reward_line = ru_plural(int(reward_value), "токен", "токена", "токенов")
+  else:
+    reward_line = "Премиум на " + ru_plural(
+        int(reward_value), "день", "дня", "дней"
+    )
+  if max_uses > 0:
+    uses_line = ru_plural(
+        max_uses, "Использование", "Использования", "Использований"
+    )
+  else:
+    uses_line = "Безлимит использований"
+  await message.answer(
+      "📋 <b>Готовый пост для канала:</b>\n\n"
+      f"<code>/promocode {esc(code)}</code>\n"
+      f"{reward_line}\n{uses_line}\n"
+      f"<i>Вписывать промокод в бота @{esc(username)}</i>"
+  )
+
+
+# --- АДМИНКА: ТОВАРЫ ---
+
+
+@router.callback_query(F.data == "add_product")
+async def start_add_product(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await callback.message.answer("📝 Введи название фула (например: Казань, Пантера):")
+  await state.set_state(AddProduct.title)
+  await callback.answer()
+
+
+@router.message(StateFilter(AddProduct.title))
+async def process_product_title(message: Message, state: FSMContext):
+  if not txt(message):
+    await message.answer("❌ Введи название текстом.")
+    return
+  await state.update_data(title=txt(message))
+  await message.answer("💰 Введи цену в токенах (число, например: 15):")
+  await state.set_state(AddProduct.price)
+
+
+@router.message(StateFilter(AddProduct.price))
+async def process_product_price(message: Message, state: FSMContext):
+  if not txt(message).isdigit():
+    await message.answer("❌ Цена — целое число.")
+    return
+  await state.update_data(price=txt(message))
+  await message.answer(
+      "🔗 Отправь ссылку на скачивание (Mega / облако):\n\n<i>(⚠️"
+      " Напоминание: у первого покупателя этого товара будет скидка"
+      " 80%)</i>"
+  )
+  await state.set_state(AddProduct.link)
+
+
+@router.message(StateFilter(AddProduct.link))
+async def process_product_link(message: Message, state: FSMContext):
+  link = txt(message)
+  if not link:
+    await message.answer("❌ Отправь ссылку текстом.")
+    return
+  data = await state.get_data()
+  await state.clear()
+  async with connect() as db:
+    await db.execute(
+        "INSERT INTO products (title, price, link, buyers_count) VALUES (?, ?,"
+        " ?, 0)",
+        (data["title"], data["price"], link),
+    )
+    await db.commit()
+  await message.answer(
+      f"✅ Фулл добавлен в магазин!\n\n📌 Название: {esc(data['title'])}\n"
+      f"💰 Цена: {esc(data['price'])} токенов\n🔗 Ссылка: {esc(link)}\n🎁"
+      " Активирована скидка 80% для первого покупателя!"
+  )
+
+
+@router.callback_query(F.data == "ed_list")
+async def show_edit_products_list(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  async with connect() as db:
+    async with db.execute("SELECT id, title FROM products") as cur:
+      products = await cur.fetchall()
+  if not products:
+    await callback.message.answer("📭 В магазине нет товаров для редактирования.")
+    await callback.answer()
+    return
+  kb = [
+      [InlineKeyboardButton(text=f"✏️ {p[1]}", callback_data=f"ep_{p[0]}")]
+      for p in products
+  ]
+  await callback.message.answer(
+      "✏️ Выберите товар для редактирования:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ep_"))
+async def process_edit_product_select(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  p_id = int(callback.data.split("_")[1])
+  await state.update_data(product_id=p_id)
+  async with connect() as db:
+    async with db.execute(
+        "SELECT title, price, link FROM products WHERE id = ?", (p_id,)
+    ) as cur:
+      product = await cur.fetchone()
+  if not product:
+    await callback.answer("❌ Товар не найден.", show_alert=True)
+    return
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="📝 Название", callback_data="ef_title")],
+          [InlineKeyboardButton(text="💰 Цена", callback_data="ef_price")],
+          [InlineKeyboardButton(text="🔗 Ссылка", callback_data="ef_link")],
+      ]
+  )
+  await callback.message.answer(
+      f"✏️ <b>Редактирование:</b> {esc(product[0])}\n💰 Цена:"
+      f" {esc(product[1])} токенов\n🔗 Ссылка: {esc(product[2])}\n\nЧто"
+      " изменить?",
+      reply_markup=kb,
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.in_({"ef_title", "ef_price", "ef_link"}))
+async def process_edit_product_field(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  field = callback.data.split("_")[1]
+  await state.update_data(field=field)
+  await state.set_state(EditProduct.new_value)
+  await callback.message.answer(f"✍️ Введи новое значение для поля <b>{field}</b>:")
+  await callback.answer()
+
+
+@router.message(StateFilter(EditProduct.new_value))
+async def process_edit_product_save(message: Message, state: FSMContext):
+  if message.from_user.id != ADMIN_ID:
+    return
+  data = await state.get_data()
+  p_id, field = data["product_id"], data["field"]
+  new_val = txt(message)
+  if field not in ("title", "price", "link") or not new_val:
+    await message.answer("❌ Неверное значение.")
+    return
+  if field == "price" and not new_val.isdigit():
+    await message.answer("❌ Цена — целое число.")
+    return
+  await state.clear()
+  async with connect() as db:
+    await db.execute(
+        f"UPDATE products SET {field} = ? WHERE id = ?", (new_val, p_id)
+    )
+    await db.commit()
+  await message.answer("✅ Товар успешно обновлен!")
+
+
+@router.callback_query(F.data == "del_list")
+async def show_delete_products_list(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  async with connect() as db:
+    async with db.execute("SELECT id, title FROM products") as cur:
+      products = await cur.fetchall()
+  if not products:
+    await callback.message.answer("📭 Нет товаров для удаления.")
+    await callback.answer()
+    return
+  kb = [
+      [InlineKeyboardButton(text=f"🗑 {p[1]}", callback_data=f"dp_{p[0]}")]
+      for p in products
+  ]
+  await callback.message.answer(
+      "🗑 Выберите товар для удаления:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dp_"))
+async def process_delete_product(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  p_id = int(callback.data.split("_")[1])
+  async with connect() as db:
+    await db.execute("DELETE FROM products WHERE id = ?", (p_id,))
+    await db.commit()
+  await callback.message.answer("✅ Товар удален из магазина.")
+  await callback.answer()
+
+
+# --- АДМИНКА: УНИКАЛЬНЫЕ ТОВАРЫ ---
+
+UNIQUE_COMMAND_HELP = (
+    "⚙️ Что выдавать при покупке? Примеры:\n"
+    "<code>ftoken 1</code> — фулловый токен\n"
+    "<code>ytoken 5</code> — уникальные токены\n"
+    "<code>token 10</code> — обычные токены\n"
+    "<code>p 30</code> — премиум на 30 дней\n"
+    "<code>aura shop 15 30 Оптовик</code> — аура (тип, %, дни, название)\n\n"
+    "ID вводить не нужно, получит тот, кто купил."
+)
+
+
+@router.callback_query(F.data == "add_unique_product")
+async def start_add_unique_product(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await callback.message.answer(
+      "💎 Введите название товара (например: Фулловый токен х1):"
+  )
+  await state.set_state(AddUniqueProduct.title)
+  await callback.answer()
+
+
+@router.message(StateFilter(AddUniqueProduct.title))
+async def process_u_title(message: Message, state: FSMContext):
+  if not txt(message):
+    await message.answer("❌ Введи название текстом.")
+    return
+  await state.update_data(title=txt(message))
+  await message.answer("💰 Введите цену в <b>уникальных токенах</b> (например: 10):")
+  await state.set_state(AddUniqueProduct.price)
+
+
+@router.message(StateFilter(AddUniqueProduct.price))
+async def process_u_price(message: Message, state: FSMContext):
+  if not txt(message).isdigit():
+    await message.answer("❌ Введите число!")
+    return
+  await state.update_data(price=int(txt(message)))
+  await message.answer("📦 Введите количество (штук в наличии, например: 5):")
+  await state.set_state(AddUniqueProduct.amount)
+
+
+@router.message(StateFilter(AddUniqueProduct.amount))
+async def process_u_amount(message: Message, state: FSMContext):
+  if not txt(message).isdigit():
+    await message.answer("❌ Введите число!")
+    return
+  await state.update_data(amount=int(txt(message)))
+  await message.answer(UNIQUE_COMMAND_HELP)
+  await state.set_state(AddUniqueProduct.command)
+
+
+@router.message(StateFilter(AddUniqueProduct.command))
+async def process_u_command(message: Message, state: FSMContext):
+  cmd = txt(message)
+  if parse_unique_command(cmd) is None:
+    await message.answer(
+        "❌ Не понял команду.\n\n" + UNIQUE_COMMAND_HELP
+    )
+    return
+  data = await state.get_data()
+  await state.clear()
+  async with connect() as db:
+    await db.execute(
+        "INSERT INTO unique_products (title, price, amount, command) VALUES (?,"
+        " ?, ?, ?)",
+        (data["title"], data["price"], data["amount"], cmd),
+    )
+    await db.commit()
+  await message.answer("✅ Товар добавлен в уникальный магазин!")
+
+
+@router.callback_query(F.data == "ued_list")
+async def show_edit_unique_products_list(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  async with connect() as db:
+    async with db.execute("SELECT id, title FROM unique_products") as cur:
+      products = await cur.fetchall()
+  if not products:
+    await callback.message.answer("📭 Уникальный магазин пуст.")
+    await callback.answer()
+    return
+  kb = [
+      [InlineKeyboardButton(text=f"✏️ {p[1]}", callback_data=f"uep_{p[0]}")]
+      for p in products
+  ]
+  await callback.message.answer(
+      "✏️ Выберите уникальный товар для редактирования:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("uep_"))
+async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  p_id = int(callback.data.split("_")[1])
+  await state.update_data(product_id=p_id)
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="Название", callback_data="uef_title")],
+          [InlineKeyboardButton(text="Цена", callback_data="uef_price")],
+          [InlineKeyboardButton(text="Количество", callback_data="uef_amount")],
+          [InlineKeyboardButton(text="Команда", callback_data="uef_command")],
+      ]
+  )
+  await callback.message.answer("Что изменить в уникальном товаре?", reply_markup=kb)
+  await callback.answer()
+
+
+@router.callback_query(
+    F.data.in_({"uef_title", "uef_price", "uef_amount", "uef_command"})
+)
+async def process_edit_unique_field(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  field = callback.data.split("_")[1]
+  await state.update_data(field=field)
+  await state.set_state(EditUniqueProduct.new_value)
+  hint = "\n\n" + UNIQUE_COMMAND_HELP if field == "command" else ""
+  await callback.message.answer(
+      f"✍️ Введите новое значение для поля <b>{field}</b>:{hint}"
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(EditUniqueProduct.new_value))
+async def process_edit_unique_save(message: Message, state: FSMContext):
+  if message.from_user.id != ADMIN_ID:
+    return
+  data = await state.get_data()
+  p_id, field = data["product_id"], data["field"]
+  new_val = txt(message)
+  if field not in ("title", "price", "amount", "command") or not new_val:
+    await message.answer("❌ Неверное значение.")
+    return
+  if field in ("price", "amount"):
+    if not new_val.isdigit():
+      await message.answer("❌ Это поле должно быть числом.")
+      return
+    value = int(new_val)
+  else:
+    value = new_val
+  if field == "command" and parse_unique_command(new_val) is None:
+    await message.answer("❌ Не понял команду.\n\n" + UNIQUE_COMMAND_HELP)
+    return
+  await state.clear()
+  async with connect() as db:
+    await db.execute(
+        f"UPDATE unique_products SET {field} = ? WHERE id = ?", (value, p_id)
+    )
+    await db.commit()
+  await message.answer("✅ Уникальный товар обновлен!")
+
+
+@router.callback_query(F.data == "udel_list")
+async def show_delete_unique_products_list(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  async with connect() as db:
+    async with db.execute("SELECT id, title FROM unique_products") as cur:
+      products = await cur.fetchall()
+  if not products:
+    await callback.message.answer("📭 Уникальный магазин пуст.")
+    await callback.answer()
+    return
+  kb = [
+      [InlineKeyboardButton(text=f"🗑 {p[1]}", callback_data=f"udp_{p[0]}")]
+      for p in products
+  ]
+  await callback.message.answer(
+      "🗑 Выберите уникальный товар для удаления:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("udp_"))
+async def process_delete_unique(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  p_id = int(callback.data.split("_")[1])
+  async with connect() as db:
+    await db.execute("DELETE FROM unique_products WHERE id = ?", (p_id,))
+    await db.commit()
+  await callback.message.answer("✅ Уникальный товар удален.")
+  await callback.answer()
+
+
+# --- АДМИНКА: РАССЫЛКА И БЭКАП ---
+
+
+@router.callback_query(F.data == "start_broadcast")
+async def start_broadcast(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  await state.clear()
+  await callback.message.answer(
+      "📢 Отправь текст, картинку или видео для рассылки всем пользователям"
+      " бота (/cancel — отмена):"
+  )
+  await state.set_state(BroadcastState.message)
+  await callback.answer()
+
+
+@router.message(StateFilter(BroadcastState.message))
+async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    return
+  await state.clear()
+  async with connect() as db:
+    async with db.execute("SELECT user_id FROM users") as cursor:
+      users = await cursor.fetchall()
+
+  success, fail = 0, 0
+  status_msg = await message.answer("⏳ Рассылка началась...")
+  for (uid,) in users:
+    try:
+      await bot.copy_message(
+          chat_id=uid,
+          from_chat_id=message.chat.id,
+          message_id=message.message_id,
+      )
+      success += 1
+    except Exception:
+      fail += 1
+    await asyncio.sleep(0.05)
+
+  await status_msg.edit_text(
+      f"✅ Рассылка завершена!\n\n📤 Доставлено: {success}\n❌ Не доставлено"
+      f" (заблокировали бота): {fail}"
+  )
+
+
+@router.callback_query(F.data == "admin_backup_db")
+async def backup_database_manual(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer("⛔️ У тебя нет доступа!", show_alert=True)
+    return
+  if os.path.exists(DB_NAME):
+    await callback.message.answer_document(
+        FSInputFile(DB_NAME),
+        caption=(
+            "💾 Ручной бэкап БД:"
+            f" {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+        ),
+    )
+    await callback.answer()
+  else:
+    await callback.answer("❌ База данных не найдена!", show_alert=True)
+
+
+# --- ОБМЕНЫ ССЫЛКАМИ ---
+
+EXCHANGE_COST = 1  # сколько токенов платит тот, кто берёт обмен
+RESTRICT_HOURS = 72  # на сколько часов ограничивается обвиняемый
+MAX_OPEN_OFFERS = 5  # сколько открытых обменов может держать один человек
+EX_PAGE_SIZE = 5
+EX_SEARCH = {}  # user_id -> строка поиска
+LINK_RE = re.compile(
+    r"^(https://mega\.nz/(file|folder)/\S+|https://cloud\.mail\.ru/\S+)$", re.I
+)
+LINK_RULE = "⚠️ Ссылка должна быть с mega.nz или cloud.mail.ru"
+LINK_ERROR = "❌ Неверная ссылка. " + LINK_RULE
+
+
+async def ex_exec(sql, args=()):
+  async with connect() as db:
+    cur = await db.execute(sql, args)
+    await db.commit()
+    return cur.rowcount, cur.lastrowid
+
+
+async def ex_one(sql, args=()):
+  async with connect() as db:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(sql, args) as cur:
+      return await cur.fetchone()
+
+
+async def ex_all(sql, args=()):
+  async with connect() as db:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(sql, args) as cur:
+      return await cur.fetchall()
+
+
+async def get_restriction(user_id: int):
+  """datetime окончания ограничения обменов/покупок или None."""
+  row = await ex_one(
+      "SELECT restricted_until FROM users WHERE user_id = ?", (user_id,)
+  )
+  if not row or not row["restricted_until"]:
+    return None
+  until = parse_dt(row["restricted_until"])
+  if until is None:
+    return None
+  if until <= datetime.datetime.now():
+    await ex_exec(
+        "UPDATE users SET restricted_until = NULL WHERE user_id = ?",
+        (user_id,),
+    )
+    return None
+  return until
+
+
+RESTRICTED_TEXT = (
+    "🔒 На вас подана жалоба. Обмены и покупки в магазине временно"
+    " ограничены до решения администратора.\n\n" + APPEAL_TEXT
+)
+RESTRICTED_ALERT = (
+    "🔒 Вы ограничены от обменов и покупок. Если это незаслуженно — напишите"
+    " @ucu52"
+)
+
+
+def ex_kb(rows) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
+          for row in rows
+      ]
+  )
+
+
+async def ex_show(event, text, kb=None):
+  """Callback -> редактирует сообщение, Message -> отправляет новое."""
+  if isinstance(event, CallbackQuery):
+    try:
+      await event.message.edit_text(
+          text, reply_markup=kb, disable_web_page_preview=True
+      )
+      return
+    except TelegramBadRequest as e:
+      if "not modified" in str(e).lower():
+        return
+    await event.message.answer(
+        text, reply_markup=kb, disable_web_page_preview=True
+    )
+  else:
+    await event.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+def exchange_menu_kb() -> InlineKeyboardMarkup:
+  return ex_kb([
+      [("➕ Выставить обмен", "ex:new"), ("📋 Все обмены", "ex:all")],
+      [("🔍 Поиск", "ex:search"), ("📦 Мои обмены", "ex:my")],
+  ])
+
+
+async def ex_menu_text() -> str:
+  return (
+      "🔄 <b>Обмены ссылками</b>\nВыставляй свой обмен или бери чужой."
+      f" Чтобы провести обмен, нужно заплатить {EXCHANGE_COST} токен."
+  )
+
+
+@router.callback_query(F.data == "ex:menu")
+async def ex_menu_cb(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  await ex_show(callback, await ex_menu_text(), exchange_menu_kb())
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:cancel")
+async def ex_cancel(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  await ex_show(callback, "Отменено.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:noop")
+async def ex_noop(callback: CallbackQuery):
+  await callback.answer()
+
+
+# --- создание обмена ---
+
+
+@router.callback_query(F.data == "ex:new")
+async def ex_new(callback: CallbackQuery, state: FSMContext):
+  uid = callback.from_user.id
+  if await get_restriction(uid):
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    return
+  cnt = await ex_one(
+      "SELECT COUNT(*) n FROM ex_offers WHERE owner_id = ? AND status = 'open'",
+      (uid,),
+  )
+  if cnt["n"] >= MAX_OPEN_OFFERS:
+    await callback.answer(
+        f"У тебя уже {MAX_OPEN_OFFERS} открытых обменов. Удали лишний.",
+        show_alert=True,
+    )
+    return
+  await state.set_state(NewOfferState.give)
+  await ex_show(
+      callback,
+      "Что ты <b>отдаёшь</b>? (например: Пантера)",
+      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(NewOfferState.give))
+async def ex_new_give(message: Message, state: FSMContext):
+  text = txt(message)[:60]
+  if not text:
+    await message.answer("Напиши текстом, что ты отдаёшь.")
+    return
+  await state.update_data(give=text)
+  await state.set_state(NewOfferState.want)
+  await message.answer(
+      "Что хочешь <b>получить</b>? (например: Сердцеед)",
+      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+
+
+@router.message(StateFilter(NewOfferState.want))
+async def ex_new_want(message: Message, state: FSMContext):
+  text = txt(message)[:60]
+  if not text:
+    await message.answer("Напиши текстом, что хочешь получить.")
+    return
+  await state.update_data(want=text)
+  await state.set_state(NewOfferState.link)
+  await message.answer(
+      f"Отправь <b>свою ссылку</b> для обмена.\n{LINK_RULE}",
+      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+
+
+@router.message(StateFilter(NewOfferState.link))
+async def ex_new_link(message: Message, state: FSMContext):
+  link = txt(message)
+  if not LINK_RE.match(link):
+    await message.answer(LINK_ERROR)
+    return
+  data = await state.get_data()
+  await state.clear()
+  _, offer_id = await ex_exec(
+      "INSERT INTO ex_offers (owner_id, give, want, owner_link, search,"
+      " created) VALUES (?, ?, ?, ?, ?, ?)",
+      (
+          message.from_user.id,
+          data["give"],
+          data["want"],
+          link,
+          (data["give"] + " " + data["want"]).lower(),
+          int(datetime.datetime.now().timestamp()),
+      ),
+  )
+  await message.answer(
+      f"✅ Обмен #{offer_id} выставлен: <b>{esc(data['give'])}</b> →"
+      f" <b>{esc(data['want'])}</b>.\nТебе придёт уведомление, когда кто-то"
+      " возьмётся за него.",
+      reply_markup=ex_kb([[("🔄 Обмены", "ex:menu")]]),
+  )
+
+
+# --- список и поиск ---
+
+
+async def ex_render_list(event, user_id: int, page: int):
+  q = EX_SEARCH.get(user_id)
+  admin = user_id == ADMIN_ID
+  where = "status IN ('open', 'taken')" if admin else "status = 'open'"
+  args = []
+  if q:
+    if q.isdigit():
+      where += " AND (owner_id = ? OR id = ?)"
+      args += [int(q), int(q)]
+    else:
+      for w in q.lower().split()[:3]:
+        where += " AND search LIKE ?"
+        args.append(f"%{w}%")
+  total = (
+      await ex_one(f"SELECT COUNT(*) n FROM ex_offers WHERE {where}", args)
+  )["n"]
+  pages = max(1, -(-total // EX_PAGE_SIZE))
+  page = max(0, min(page, pages - 1))
+  rows = await ex_all(
+      f"SELECT * FROM ex_offers WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+      args + [EX_PAGE_SIZE, page * EX_PAGE_SIZE],
+  )
+  head = "📋 <b>Открытые обмены</b>" if not admin else "📋 <b>Обмены (админ)</b>"
+  if q:
+    head += f"\n🔍 Поиск: <i>{esc(q)}</i>"
+  head += f"\nНайдено: {total} · стр. {page + 1}/{pages}"
+  if not rows:
+    head += "\n\nПока пусто."
+  buttons = [
+      [
+          (
+              f"{'✅ ' if r['status'] == 'taken' else ''}#{r['id']}"
+              f" {r['give']} → {r['want']}"
+          )[:60],
+          f"ex:view:{r['id']}",
+      ]
+      for r in rows
+  ]
+  buttons = [[(t, d)] for t, d in buttons]
+  nav = []
+  if page > 0:
+    nav.append(("⬅️", f"ex:list:{page - 1}"))
+  nav.append((f"{page + 1}/{pages}", "ex:noop"))
+  if page < pages - 1:
+    nav.append(("➡️", f"ex:list:{page + 1}"))
+  buttons.append(nav)
+  buttons.append([("🔍 Поиск", "ex:search"), ("🧹 Сбросить", "ex:all")])
+  buttons.append([("⬅️ В обмены", "ex:menu")])
+  await ex_show(event, head, ex_kb(buttons))
+
+
+@router.callback_query(F.data == "ex:all")
+async def ex_all_cb(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  EX_SEARCH.pop(callback.from_user.id, None)
+  await ex_render_list(callback, callback.from_user.id, 0)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ex:list:"))
+async def ex_list_cb(callback: CallbackQuery):
+  await ex_render_list(
+      callback, callback.from_user.id, int(callback.data.split(":")[2])
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:search")
+async def ex_search(callback: CallbackQuery, state: FSMContext):
+  await state.set_state(ExSearchState.query)
+  await ex_show(
+      callback,
+      "Напиши слово (или два): <b>Пантера</b>, <b>Сердцеед</b>\n"
+      "Или ID человека / номер обмена — только цифры.",
+      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(ExSearchState.query))
+async def ex_search_do(message: Message, state: FSMContext):
+  await state.clear()
+  EX_SEARCH[message.from_user.id] = txt(message)[:60]
+  await ex_render_list(message, message.from_user.id, 0)
+
+
+# --- просмотр, удаление, мои обмены ---
+
+
+@router.callback_query(F.data.startswith("ex:view:"))
+async def ex_view(callback: CallbackQuery):
+  offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
+  admin = uid == ADMIN_ID
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if not o or o["status"] not in ("open", "taken"):
+    await callback.answer("Этот обмен уже недоступен.", show_alert=True)
+    return
+
+  report_kb = ex_kb([
+      [("🚨 Пожаловаться", f"ex:confirm_rep:{offer_id}")],
+      [("⬅️ Назад", "ex:menu")],
+  ])
+
+  if o["status"] == "open":
+    text = (
+        f"🔄 <b>Обмен #{o['id']}</b>\nОтдаёт: <b>{esc(o['give'])}</b>\nХочет:"
+        f" <b>{esc(o['want'])}</b>\nСтоимость обмена: {EXCHANGE_COST} токен"
+    )
+    if admin:
+      text += (
+          "\n\n🛠 <b>Админ:</b>\n"
+          f"🆔 Обменщик: <code>{o['owner_id']}</code>\n"
+          f"🔗 Ссылка:\n{esc(o['owner_link'])}"
+      )
+    if o["owner_id"] == uid or admin:
+      kb = ex_kb(
+          [[("🗑 Удалить", f"ex:del:{offer_id}")], [("⬅️ Назад", "ex:list:0")]]
+      )
+    else:
+      kb = ex_kb([
+          [("🤝 Провести обмен", f"ex:take:{offer_id}")],
+          [("⬅️ Назад", "ex:list:0")],
+      ])
+  elif uid == o["owner_id"]:
+    text = (
+        f"✅ <b>Обмен #{o['id']} завершен!</b>\n"
+        f"🆔 ID обменщика: <code>{o['taker_id']}</code>\n"
+        f"🔗 Ссылка взявшегося:\n{esc(o['taker_link'])}"
+    )
+    kb = report_kb
+  elif uid == o["taker_id"]:
+    text = (
+        f"✅ <b>Обмен #{o['id']} завершен!</b>\n"
+        f"🆔 ID владельца: <code>{o['owner_id']}</code>\n"
+        f"🔗 Ссылка владельца:\n{esc(o['owner_link'])}"
+    )
+    kb = report_kb
+  elif admin:
+    text = (
+        f"✅ <b>Обмен #{o['id']} (завершён)</b>\n"
+        f"{esc(o['give'])} → {esc(o['want'])}\n\n"
+        f"👤 Владелец: <code>{o['owner_id']}</code>\n{esc(o['owner_link'])}\n\n"
+        f"🤝 Взял: <code>{o['taker_id']}</code>\n{esc(o['taker_link'])}"
+    )
+    kb = ex_kb([[("⬅️ Назад", "ex:list:0")]])
+  else:
+    await callback.answer("Этот обмен уже недоступен.", show_alert=True)
+    return
+
+  await ex_show(callback, text, kb)
+  await callback.answer()
+
+
+@router.callback_query(F.data == "ex:my")
+async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
+  await state.clear()
+  uid = callback.from_user.id
+  rows = await ex_all(
+      "SELECT * FROM ex_offers WHERE (owner_id = ? OR taker_id = ?) AND status"
+      " IN ('open', 'taken') ORDER BY id DESC LIMIT 10",
+      (uid, uid),
+  )
+  if not rows:
+    await ex_show(
+        callback,
+        "📦 У вас нет активных обменов.",
+        ex_kb([[("⬅️ В обмены", "ex:menu")]]),
+    )
+    await callback.answer()
+    return
+  icon = {"open": "🟢", "taken": "✅"}
+  buttons = [
+      [(f"{icon[r['status']]} #{r['id']} {r['give']} → {r['want']}"[:60],
+        f"ex:view:{r['id']}")]
+      for r in rows
+  ]
+  buttons.append([("⬅️ В обмены", "ex:menu")])
+  await ex_show(callback, "📦 <b>Ваши обмены:</b>", ex_kb(buttons))
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ex:del:"))
+async def ex_delete_offer(callback: CallbackQuery):
+  offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
+  rc, _ = await ex_exec(
+      "UPDATE ex_offers SET status = 'deleted' WHERE id = ? AND status ="
+      " 'open' AND (owner_id = ? OR ? = ?)",
+      (offer_id, uid, uid, ADMIN_ID),
+  )
+  if not rc:
+    await callback.answer("Нельзя удалить этот обмен.", show_alert=True)
+    return
+  await ex_show(callback, "🗑 Обмен удален.", ex_kb([[("🔄 Обмены", "ex:menu")]]))
+  await callback.answer()
+
+
+# --- взять обмен ---
+
+
+@router.callback_query(F.data.startswith("ex:take:"))
+async def ex_take(callback: CallbackQuery, state: FSMContext):
+  offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if not o or o["status"] != "open":
+    await callback.answer("Этот обмен уже забрали или удалили.", show_alert=True)
+    return
+  if o["owner_id"] == uid:
+    await callback.answer("Это твой обмен.", show_alert=True)
+    return
+  if await get_restriction(uid):
+    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    return
+  bal = await ex_one(
+      "SELECT COALESCE(tokens, 0) t FROM users WHERE user_id = ?", (uid,)
+  )
+  if not bal or bal["t"] < EXCHANGE_COST:
+    await callback.answer(
+        f"Нужно {EXCHANGE_COST} токен для обмена.", show_alert=True
+    )
+    return
+  await state.set_state(ExTakeState.link)
+  await state.update_data(offer_id=offer_id)
+  await ex_show(
+      callback,
+      f"Обмен #{offer_id}: <b>{esc(o['give'])}</b> → <b>{esc(o['want'])}</b>\n\n"
+      "Отправь <b>свою ссылку</b>. После этого спишется"
+      f" {EXCHANGE_COST} токен и ты получишь ссылку обменщика.\n{LINK_RULE}",
+      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(ExTakeState.link))
+async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
+  link = txt(message)
+  if not LINK_RE.match(link):
+    await message.answer(LINK_ERROR)
+    return
+  uid = message.from_user.id
+  offer_id = (await state.get_data())["offer_id"]
+  await state.clear()
+  if await get_restriction(uid):
+    await message.answer(RESTRICTED_TEXT)
+    return
+
+  now_ts = int(datetime.datetime.now().timestamp())
+  rc, _ = await ex_exec(
+      "UPDATE ex_offers SET status = 'taken', taker_id = ?, taker_link = ?,"
+      " taken = ? WHERE id = ? AND status = 'open' AND owner_id != ?",
+      (uid, link, now_ts, offer_id, uid),
+  )
+  if not rc:
+    await message.answer("Не успел — этот обмен уже забрали.")
+    return
+  # Списание токена: только если хватает
+  rc, _ = await ex_exec(
+      "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+      " COALESCE(tokens, 0) >= ?",
+      (EXCHANGE_COST, uid, EXCHANGE_COST),
+  )
+  if not rc:
+    await ex_exec(
+        "UPDATE ex_offers SET status = 'open', taker_id = NULL,"
+        " taker_link = NULL, taken = NULL WHERE id = ?",
+        (offer_id,),
+    )
+    await message.answer(f"Не хватает токенов (нужно {EXCHANGE_COST}).")
+    return
+
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  await ex_exec(
+      "UPDATE users SET exchanges = COALESCE(exchanges, 0) + 1"
+      " WHERE user_id IN (?, ?)",
+      (o["owner_id"], uid),
+  )
+  report_kb = ex_kb([[("🚨 Пожаловаться", f"ex:confirm_rep:{offer_id}")]])
+  await message.answer(
+      f"🤝 <b>Обмен #{offer_id}</b>: {esc(o['give'])} → {esc(o['want'])}\n"
+      f"Ссылка обменщика (ID <code>{o['owner_id']}</code>):\n"
+      f"{esc(o['owner_link'])}\n\nСписано {EXCHANGE_COST} токен.",
+      reply_markup=report_kb,
+      disable_web_page_preview=True,
+  )
+  await safe_send(
+      bot,
+      o["owner_id"],
+      f"🔔 ID <code>{uid}</code> взялся за твой обмен #{offer_id}:"
+      f" {esc(o['give'])} → {esc(o['want'])}\nЕго ссылка:\n{esc(link)}",
+      reply_markup=report_kb,
+      disable_web_page_preview=True,
+  )
+
+
+# --- жалобы ---
+
+
+@router.callback_query(F.data.startswith("ex:confirm_rep:"))
+async def ex_confirm_report(callback: CallbackQuery):
+  offer_id = int(callback.data.split(":")[2])
+  text = (
+      "⚠️ <b>Вы уверены, что хотите подать жалобу на этого пользователя?</b>"
+      "\n\n• При ложной жалобе вы получите <b>1 предупреждение</b>.\n• Если"
+      " вас реально обманули (ссылка неверная или закрыта ключом) — смело"
+      " отправляйте жалобу."
+  )
+  kb = ex_kb([
+      [("✅ Да, отправить жалобу", f"ex:rep:{offer_id}")],
+      [("❌ Отмена", f"ex:view:{offer_id}")],
+  ])
+  await ex_show(callback, text, kb)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ex:rep:"))
+async def ex_report(callback: CallbackQuery, bot: Bot):
+  offer_id = int(callback.data.split(":")[2])
+  uid = callback.from_user.id
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if not o or o["status"] != "taken":
+    await callback.answer("Жалоба недоступна.", show_alert=True)
+    return
+  if uid == o["owner_id"]:
+    accused = o["taker_id"]
+  elif uid == o["taker_id"]:
+    accused = o["owner_id"]
+  else:
+    await callback.answer("Ошибка доступа.", show_alert=True)
+    return
+
+  try:
+    _, report_id = await ex_exec(
+        "INSERT INTO ex_reports (offer_id, complainer_id, accused_id, created)"
+        " VALUES (?, ?, ?, ?)",
+        (offer_id, uid, accused, int(datetime.datetime.now().timestamp())),
+    )
+  except aiosqlite.IntegrityError:
+    await callback.answer(
+        "Ты уже отправил жалобу по этому обмену.", show_alert=True
+    )
+    return
+
+  until = datetime.datetime.now() + datetime.timedelta(hours=RESTRICT_HOURS)
+  await ex_exec(
+      "UPDATE users SET restricted_until = ? WHERE user_id = ?",
+      (until.strftime(DT_FORMAT), accused),
+  )
+  await callback.answer("🚨 Жалоба отправлена админу.", show_alert=True)
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+
+  await safe_send(
+      bot,
+      accused,
+      f"🚨 На вас подана жалоба по обмену #{offer_id}. Обмены и покупки в"
+      " магазине временно ограничены до решения администратора.",
+  )
+  sent = await safe_send(
+      bot,
+      ADMIN_ID,
+      f"🚨 <b>Жалоба #{report_id}</b>\nОт ID <code>{uid}</code> на ID"
+      f" <code>{accused}</code>\n"
+      f"Обмен #{offer_id}: {esc(o['give'])} → {esc(o['want'])}\n"
+      f"Владелец: <code>{o['owner_id']}</code>\n{esc(o['owner_link'])}\n"
+      f"Взявший: <code>{o['taker_id']}</code>\n{esc(o['taker_link'])}\n\n"
+      f"Ограничения на ID {accused}: {RESTRICT_HOURS} ч или до твоего"
+      " решения.",
+      reply_markup=ex_kb([
+          [("✅ Ложная жалоба: снять ограничения", f"ex:ok:{report_id}")],
+          [
+              ("✉️ Жалобщику", f"ex:msg:{report_id}:c"),
+              ("✉️ Обвиняемому", f"ex:msg:{report_id}:a"),
+          ],
+      ]),
+      disable_web_page_preview=True,
+  )
+  if not sent:
+    logging.error("Не удалось отправить жалобу админу")
+
+
+@router.callback_query(F.data.startswith("ex:ok:"))
+async def ex_admin_ok(callback: CallbackQuery, bot: Bot):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  report_id = int(callback.data.split(":")[2])
+  r = await ex_one("SELECT * FROM ex_reports WHERE id = ?", (report_id,))
+  if not r or r["status"] != "new":
+    await callback.answer("Уже обработано.", show_alert=True)
+    return
+  await ex_exec(
+      "UPDATE ex_reports SET status = 'released' WHERE id = ?", (report_id,)
+  )
+  await ex_exec(
+      "UPDATE users SET restricted_until = NULL WHERE user_id = ?",
+      (r["accused_id"],),
+  )
+  await safe_send(bot, r["accused_id"], "✅ Ограничения сняты администратором.")
+
+  warns, banned = await add_warn(r["complainer_id"], "Ложная жалоба на обмен")
+  await send_warn_notice(bot, r["complainer_id"], warns, banned)
+  await callback.answer("Готово.")
+  try:
+    await callback.message.edit_reply_markup(
+        reply_markup=ex_kb([
+            [
+                ("✉️ Жалобщику", f"ex:msg:{report_id}:c"),
+                ("✉️ Обвиняемому", f"ex:msg:{report_id}:a"),
+            ]
+        ])
+    )
+  except Exception:
+    pass
+  await callback.message.answer(
+      f"✅ Жалоба #{report_id}: ограничения с ID <code>{r['accused_id']}</code>"
+      f" сняты, жалобщику ID <code>{r['complainer_id']}</code> выдано"
+      f" предупреждение ({warns}/{MAX_WARNS})."
+  )
+
+
+@router.callback_query(F.data.startswith("ex:msg:"))
+async def ex_admin_msg(callback: CallbackQuery, state: FSMContext):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  parts = callback.data.split(":")
+  report_id = int(parts[2])
+  who = parts[3] if len(parts) > 3 else "c"
+  r = await ex_one("SELECT * FROM ex_reports WHERE id = ?", (report_id,))
+  if not r:
+    await callback.answer("Жалоба не найдена.", show_alert=True)
+    return
+  target = r["complainer_id"] if who == "c" else r["accused_id"]
+  await state.set_state(ExAdminMsgState.text)
+  await state.update_data(target_id=target, report_id=report_id)
+  await callback.message.answer(
+      f"Напиши сообщение для ID <code>{target}</code> по жалобе"
+      f" #{report_id} (/cancel — отмена):"
+  )
+  await callback.answer()
+
+
+@router.message(StateFilter(ExAdminMsgState.text))
+async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
+  if message.from_user.id != ADMIN_ID:
+    return
+  if not txt(message):
+    await message.answer("Напиши текстом.")
+    return
+  data = await state.get_data()
+  await state.clear()
+  ok = await safe_send(
+      bot,
+      data["target_id"],
+      f"✉️ <b>Сообщение от администрации:</b>\n{esc(txt(message))}",
+  )
+  await message.answer("Отправлено." if ok else "Не доставлено (бот заблокирован).")
+
+
+# --- РУЛЕТКА 50/50 ---
+
+ROULETTE_MIN = 2
+ROULETTE_MAX = 10
+_roulette_locks = {}
+
+
+def roulette_decide(current_tokens: int, roll_win: bool, aura_percent: int) -> bool:
+  if aura_percent > 0:
+    roll_win = random.random() < (0.50 + (aura_percent / 100.0))
+  if current_tokens >= 30:
+    return random.random() < 0.30
+  return roll_win
+
+
+async def roulette_play(user_id: int, bet: int) -> dict:
+  """Один раунд. {'error': 'balance', 'balance': N} или {'win': bool, 'balance': N}."""
+  # Аура читается ДО открытия транзакции (get_user_aura может писать в БД)
+  aura = await get_user_aura(user_id)
+  aura_percent = aura["percent"] if (aura and aura["type"] == "roulette") else 0
+
+  lock = _roulette_locks.setdefault(user_id, asyncio.Lock())
+  async with lock:
+    async with connect() as db:
+      cur = await db.execute(
+          "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
+          " COALESCE(tokens, 0) >= ?",
+          (bet, user_id, bet),
+      )
+      if cur.rowcount == 0:
         async with db.execute(
-            "SELECT user_id FROM users WHERE COALESCE(lottery_wins, 0) > 0"
-            " ORDER BY lottery_wins DESC LIMIT 1"
-        ) as cursor:
-          lot_winner = await cursor.fetchone()
-        if lot_winner:
-          await reward_winner(lot_winner[0], "топе по лотерее")
+            "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?",
+            (user_id,),
+        ) as c:
+          row = await c.fetchone()
+        return {"error": "balance", "balance": row[0] if row else 0}
 
-        async with db.execute(
-            "SELECT user_id FROM roulette_state WHERE COALESCE(wins, 0) > 0"
-            " ORDER BY wins DESC LIMIT 1"
-        ) as cursor:
-          rl_winner = await cursor.fetchone()
-        if rl_winner:
-          await reward_winner(rl_winner[0], "топе по рулетке")
+      async with db.execute(
+          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+      ) as c:
+        current_bal = (await c.fetchone())[0]
 
+      win = roulette_decide(current_bal, random.random() < 0.5, aura_percent)
+
+      await db.execute(
+          "INSERT OR IGNORE INTO roulette_state (user_id) VALUES (?)", (user_id,)
+      )
+      await db.execute(
+          "UPDATE roulette_state SET games = COALESCE(games, 0) + 1, wins ="
+          " COALESCE(wins, 0) + ? WHERE user_id = ?",
+          (1 if win else 0, user_id),
+      )
+      if win:
         await db.execute(
-            "UPDATE users SET referrer_id = 0, ref_income = 0 WHERE"
-            " ref_activated = 1"
+            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+            (bet * 2, user_id),
         )
-        await db.execute("UPDATE users SET ref_extra = 0")
-        await db.execute("UPDATE users SET lottery_wins = 0")
-        await db.execute("DELETE FROM roulette_state")
+      async with db.execute(
+          "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+      ) as c:
+        balance = (await c.fetchone())[0]
+      await db.commit()
+  return {"win": win, "balance": balance}
 
-        new_next_reset = datetime.datetime.now() + datetime.timedelta(days=14)
-        await db.execute(
-            "INSERT OR REPLACE INTO top_reset (id, next_reset) VALUES (1, ?)",
-            (new_next_reset.strftime(DT_FORMAT),),
-        )
-        await db.commit()
 
-      try:
-        await bot.send_message(
-            ADMIN_ID,
-            "🔄 Автоматический сброс всех трех топов (каждые 14 дней) выполнен,"
-            " победителям отправлен выбор награды!",
-        )
-      except Exception:
-        pass
+def roulette_result_kb(bet: int) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=f"🔁 Сыграть снова ({bet} токен.)",
+                  callback_data=f"rl_again_{bet}",
+              )
+          ],
+          [InlineKeyboardButton(text="💰 Другая ставка", callback_data="rl_new")],
+      ]
+  )
 
+
+async def roulette_intro_text(user_id: int) -> str:
+  async with connect() as db:
+    async with db.execute(
+        "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      row = await cur.fetchone()
+  balance = row[0] if row else 0
+  return (
+      "🎲 <b>Рулетка 50/50</b>\n\n"
+      "Ставишь токены — и либо удваиваешь их, либо теряешь.\n"
+      "Выиграл: получаешь ставку ×2 (ставка 4 → на баланс вернётся 8).\n"
+      "Проиграл: ставка сгорает.\n\n"
+      f"💰 Ставка: от <b>{ROULETTE_MIN}</b> до <b>{ROULETTE_MAX}</b> токенов.\n"
+      f"Твой баланс: <b>{balance}</b> токенов.\n\n"
+      "✍️ Напиши в чат, сколько токенов ставишь:"
+  )
+
+
+def roulette_result_text(bet: int, res: dict) -> str:
+  if res["win"]:
+    return (
+        f"🎉 <b>Победа!</b> Ставка {bet} → <b>+{bet}</b> токенов.\n"
+        f"Баланс: <b>{res['balance']}</b>"
+    )
+  return (
+      f"💥 <b>Проигрыш.</b> Ставка {bet} токенов сгорела.\n"
+      f"Баланс: <b>{res['balance']}</b>"
+  )
+
+
+@router.message(StateFilter(RouletteState.bet))
+async def roulette_bet(message: Message, state: FSMContext):
+  raw = txt(message)
+  if not raw.isdigit() or not ROULETTE_MIN <= int(raw) <= ROULETTE_MAX:
+    await message.answer(
+        f"Напиши число от {ROULETTE_MIN} до {ROULETTE_MAX} — сколько токенов"
+        " ставишь."
+    )
+    return
+  bet = int(raw)
+  res = await roulette_play(message.from_user.id, bet)
+  if "error" in res:
+    await message.answer(
+        f"❌ Не хватает токенов. Баланс: <b>{res['balance']}</b>. Напиши"
+        " ставку поменьше или нажми другую кнопку меню."
+    )
+    return
+  await state.clear()
+  await message.answer(
+      roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
+  )
+
+
+@router.callback_query(F.data.startswith("rl_again_"))
+async def roulette_again(callback: CallbackQuery):
+  bet = int(callback.data.split("_")[2])
+  if not ROULETTE_MIN <= bet <= ROULETTE_MAX:
+    await callback.answer()
+    return
+  res = await roulette_play(callback.from_user.id, bet)
+  if "error" in res:
+    await callback.answer(
+        f"❌ Не хватает токенов. Баланс: {res['balance']}", show_alert=True
+    )
+    return
+  await callback.answer()
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+  await callback.message.answer(
+      roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
+  )
+
+
+@router.callback_query(F.data == "rl_new")
+async def roulette_new(callback: CallbackQuery, state: FSMContext):
+  await state.set_state(RouletteState.bet)
+  await callback.answer()
+  await callback.message.answer(await roulette_intro_text(callback.from_user.id))
+
+
+# --- ГЛОБАЛЬНЫЙ ЛОВЕЦ ОШИБОК ---
+
+
+@router.errors()
+async def global_error_handler(event: ErrorEvent):
+  logging.exception("Необработанная ошибка: %s", event.exception)
+
+
+# --- ФОНОВЫЕ ЗАДАЧИ ---
+
+
+async def send_top_reward(bot: Bot, w_id: int, top_name: str) -> None:
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=f"👑 Премиум на {TOP_REWARD_PREMIUM_DAYS} дней",
+                  callback_data=f"top_reward_{w_id}_prem",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text=f"💎 {TOP_REWARD_YTOKENS} уникальных токена",
+                  callback_data=f"top_reward_{w_id}_ytoken",
+              )
+          ],
+      ]
+  )
+  await safe_send(
+      bot,
+      w_id,
+      f"🏆 <b>Поздравляем! Вы заняли 1 место в {top_name}!</b>\n\n"
+      "Выберите вашу награду:",
+      reply_markup=kb,
+  )
+
+
+async def run_top_reset(bot: Bot) -> None:
+  async with connect() as db:
+    async with db.execute(REF_TOP_SQL, (1,)) as cursor:
+      ref_winner = await cursor.fetchone()
+    async with db.execute(
+        "SELECT user_id FROM users WHERE COALESCE(lottery_wins, 0) > 0"
+        " ORDER BY lottery_wins DESC LIMIT 1"
+    ) as cursor:
+      lot_winner = await cursor.fetchone()
+    async with db.execute(
+        "SELECT user_id FROM roulette_state WHERE COALESCE(wins, 0) > 0"
+        " ORDER BY wins DESC LIMIT 1"
+    ) as cursor:
+      rl_winner = await cursor.fetchone()
+
+    # Сброс: неподписавшиеся рефералы сохраняются (ref_activated = 0)
+    await db.execute(
+        "UPDATE users SET referrer_id = 0, ref_income = 0 WHERE"
+        " ref_activated = 1"
+    )
+    await db.execute("UPDATE users SET ref_extra = 0, lottery_wins = 0")
+    await db.execute("UPDATE roulette_state SET games = 0, wins = 0")
+    new_next = datetime.datetime.now() + datetime.timedelta(days=TOP_RESET_DAYS)
+    await db.execute(
+        "INSERT OR REPLACE INTO top_reset (id, next_reset) VALUES (1, ?)",
+        (new_next.strftime(DT_FORMAT),),
+    )
+    await db.commit()
+
+  if ref_winner:
+    await send_top_reward(bot, ref_winner[0], "топе по рефералам")
+  if lot_winner:
+    await send_top_reward(bot, lot_winner[0], "топе по лотерее")
+  if rl_winner:
+    await send_top_reward(bot, rl_winner[0], "топе по рулетке")
+  await safe_send(
+      bot,
+      ADMIN_ID,
+      f"🔄 Автосброс всех топов (каждые {TOP_RESET_DAYS} дней) выполнен,"
+      " победителям отправлен выбор награды!",
+  )
+
+
+async def top_reset_loop(bot: Bot):
+  """Проверяет срок сброса из БД: переживает перезапуски хостинга."""
+  while True:
+    try:
+      async with connect() as db:
+        next_reset = await get_next_reset(db)
+      if datetime.datetime.now() >= next_reset:
+        await run_top_reset(bot)
     except Exception:
       logging.exception("Ошибка при автосбросе топов")
+    await asyncio.sleep(300)
 
 
 async def auto_backup_loop(bot: Bot):
+  backup_message_ids = []
   while True:
     await asyncio.sleep(300)
     try:
       if os.path.exists(DB_NAME):
-        document = FSInputFile(DB_NAME)
-        await bot.send_document(
+        sent_msg = await bot.send_document(
             ADMIN_ID,
-            document,
+            FSInputFile(DB_NAME),
             caption=(
-                "⏱ Авто-бэкап БД:"
-                f" {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                "⏱ Авто-бэкап БД:\n"
+                f"📅 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
             ),
         )
+        backup_message_ids.append(sent_msg.message_id)
+        # Храним только 5 последних бэкапов в чате
+        if len(backup_message_ids) > 5:
+          old_msg_id = backup_message_ids.pop(0)
+          try:
+            await bot.delete_message(chat_id=ADMIN_ID, message_id=old_msg_id)
+          except Exception:
+            pass
     except Exception:
-      pass
+      logging.exception("Ошибка при отправке авто-бэкапа")
 
 
 async def handle_ping(request):
@@ -4166,16 +4652,18 @@ async def main():
   dp = Dispatcher(storage=MemoryStorage())
   dp.include_router(router)
 
-  _bg_tasks.add(asyncio.create_task(auto_backup_loop(bot)))
-  _bg_tasks.add(asyncio.create_task(weekly_reset_loop(bot)))
-  _bg_tasks.add(asyncio.create_task(lottery_loop(bot)))
+  tasks = [
+      asyncio.create_task(auto_backup_loop(bot)),
+      asyncio.create_task(top_reset_loop(bot)),
+      asyncio.create_task(lottery_loop(bot)),
+  ]
 
   await bot.delete_webhook(drop_pending_updates=True)
-  print(f"Бот успешно запущен на порту {PORT}!")
+  print(f"Бот успешно запущен, веб-сервер слушает порт {PORT}!")
   try:
     await dp.start_polling(bot)
   finally:
-    for task in _bg_tasks:
+    for task in tasks:
       task.cancel()
 
 
