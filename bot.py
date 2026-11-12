@@ -49,7 +49,8 @@ if not TOKEN:
   sys.exit("Не задана переменная окружения TOKEN")
 
 PORT = int(os.getenv("PORT", 10000))
-DB_NAME = "bot.db"
+# Путь к базе: на хостинге укажи путь на постоянном диске, например /data/bot.db
+DB_NAME = os.getenv("DB_PATH", "bot.db")
 
 ADMIN_ID = 5681420389
 
@@ -1633,6 +1634,27 @@ async def cmd_check(message: Message, command: CommandObject):
   )
 
 
+@router.message(F.document, F.caption.startswith("/restore"), F.from_user.id == ADMIN_ID)
+async def cmd_restore(message: Message, bot: Bot):
+  """Админ шлёт файл bot.db с подписью /restore, и база заменяется."""
+  tmp = DB_NAME + ".restore"
+  try:
+    await bot.download(message.document, destination=tmp)
+    with open(tmp, "rb") as f:
+      is_sqlite = f.read(16).startswith(b"SQLite format 3")
+    if not is_sqlite:
+      os.remove(tmp)
+      await message.answer("❌ Это не файл базы SQLite.")
+      return
+    os.replace(tmp, DB_NAME)
+    await init_db()  # докатываем недостающие колонки
+  except Exception as e:
+    logging.exception("Ошибка восстановления БД")
+    await message.answer(f"❌ Не удалось восстановить: {esc(e)}")
+    return
+  await message.answer("✅ База восстановлена из файла.")
+
+
 # --- ТОПЫ ---
 
 
@@ -2858,16 +2880,17 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         "<i>(и могу не выдать некоторые токены если не посмотрите 👆)</i>\n\n"
         "-----------------------------------\n\n"
         "💎 <b>Как получить УНИКАЛЬНЫЕ токены?</b>\n"
-        " КАК ПОЛУЧИТЬ?: Их можно только купить, но либо можно написать админу @ucu52 и за 20 токенов выдаст уникал. токен. <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
+        "Их можно только купить, <b>15 звёзд = 1 Уникальный токен.</b>\n\n"
         "<b>Как купить?</b> Кинуть любой подарок со стоимостью 15 звёзд на"
         " аккаунт @ucu52\n\n"
-        "<b>ЧТО ДЕЛАЕТ ЭТОТ ТОКЕН/МАГАЗИ?:</b>\n"
-        "1. В уникальном мазаине выходят фулы на 1 день позже, чем в стандартный магазин.\n"
-        "2. Там уникальные товары по типу ауры и так далее, за уникальный токен можно расплатиться в уникальном магазине.\n\n"
+        "<b>Преимущества:</b>\n"
+        "1. Там выходят фулы на 1 день позже, чем в стандартный магазин.\n"
+        "2. Там уникальные товары по типу ауры и так далее\n\n"
         "-----------------------------------\n\n"
         "📦 <b>Как получить ФУЛЛОВЫЕ токены?</b>\n"
-        "    КАК ПОЛУЧИТЬ?: Их можно купить в <b>Уникальном магазине</b> за уникальные токены"
-        "<b>ЧТО ДЕЛАЕТ ЭТОТ ТОКЕН?:</b>\n"
+        "Их можно купить в <b>Уникальном магазине</b> за уникальные токены"
+        " (или получить от администратора).\n\n"
+        "<b>Преимущество:</b>\n"
         "Позволяет забрать абсолютно любой фулл в обычном магазине бесплатно"
         " (без траты обычных токенов), просто используя фулловый токен при"
         " покупке!"
@@ -2899,7 +2922,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         " — подписка не выдается.</i>\n"
         "Если вы сделали все хорошо, отправляйте сюда:"
         " https://t.me/JmcDeveloper?direct\n"
-        "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ, кто выбирает 2 способ)</b>"
+        "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
     )
     await message.answer(
         prem_text, reply_markup=keyboard, disable_web_page_preview=True
