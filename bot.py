@@ -5203,8 +5203,7 @@ async def main():
     await dp.start_polling(bot)
   finally:
     for task in tasks:
-      task.cancel()
-
+            task.cancel()
 
 if __name__ == "__main__":
-  asyncio.run(main())
+    asyncio.run(main())
