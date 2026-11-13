@@ -77,29 +77,25 @@ LOTTERY_HOURS = 3
 LOTTERY_NORMAL_CHANCE = 0.80  # обычный приз 4-10 токенов
 LOTTERY_BIG_LOW_CHANCE = 0.15  # крупный приз 11-14 токенов
 # остаток (5%) — самый крупный приз 15-20 токенов
-LOTTERY_NOTIFY_PRIZE = 11
+# Уведомление уходит, когда ОБЩИЙ приз (свой + взносы) достигает этого числа.
+LOTTERY_NOTIFY_TOTAL = 15
 LOTTERY_MIN_PLAYERS = 2
 LOTTERY_BIG_PRIZE = 15
 LOTTERY_BIG_MIN_PLAYERS = 4
 
-
 # --- ОБЩИЕ ХЕЛПЕРЫ ---
-
 
 def connect():
   """Подключение к БД с увеличенным ожиданием (против 'database is locked')."""
   return aiosqlite.connect(DB_NAME, timeout=30)
 
-
 def esc(value) -> str:
   """Экранирует текст для HTML-разметки Telegram."""
   return html.escape(str(value), quote=False)
 
-
 def hidden_link(link) -> str:
   """Ссылка под спойлером: скрыта, пока человек не нажмёт на неё."""
   return f"<tg-spoiler>{esc(link)}</tg-spoiler>"
-
 
 def ru_plural(n: int, one: str, few: str, many: str) -> str:
   """'1 токен', '2 токена', '5 токенов'."""
@@ -112,11 +108,9 @@ def ru_plural(n: int, one: str, few: str, many: str) -> str:
     word = many
   return f"{n} {word}"
 
-
 def now_local() -> datetime.datetime:
   """Текущее время по Киеву (naive) - нужно только для ночного режима."""
   return datetime.datetime.now(LOCAL_TZ).replace(tzinfo=None)
-
 
 def parse_dt(value):
   try:
@@ -124,10 +118,8 @@ def parse_dt(value):
   except Exception:
     return None
 
-
 def txt(message: Message) -> str:
   return (message.text or "").strip()
-
 
 async def safe_send(bot: Bot, uid: int, text: str, **kwargs) -> bool:
   try:
@@ -136,14 +128,12 @@ async def safe_send(bot: Bot, uid: int, text: str, **kwargs) -> bool:
   except Exception:
     return False
 
-
 async def deny(message: Message) -> bool:
   """True, если пользователь не админ (и ему уже ответили)."""
   if message.from_user.id != ADMIN_ID:
     await message.answer("⛔️ У тебя нет доступа!")
     return True
   return False
-
 
 def parse_args(command: CommandObject, count: int):
   """Ровно count целых чисел или None."""
@@ -152,29 +142,23 @@ def parse_args(command: CommandObject, count: int):
     return None
   return [int(p) for p in parts]
 
-
 def lottery_cost_for_total(total: int) -> int:
   """Каждые 5 токенов приза = +1 токен к цене участия (минимум 1)."""
   return max(1, total // 5)
-
 
 def fee_to_prize(paid: int) -> int:
   """В приз уходит 50% потраченных на участие токенов (вверх)."""
   return (paid + 1) // 2
 
-
 def cost_text(cost: int) -> str:
   return "бесплатно" if cost == 0 else f"{cost} токен(ов)"
-
 
 def lottery_min_players(prize: int) -> int:
   return (
       LOTTERY_BIG_MIN_PLAYERS if prize >= LOTTERY_BIG_PRIZE else LOTTERY_MIN_PLAYERS
   )
 
-
 # --- БАЗА ДАННЫХ ---
-
 
 async def init_db():
   async with connect() as db:
@@ -214,7 +198,9 @@ async def init_db():
             title TEXT,
             price TEXT,
             link TEXT,
-            buyers_count INTEGER DEFAULT 0
+            buyers_count INTEGER DEFAULT 0,
+            description TEXT DEFAULT '',
+            photo_id TEXT DEFAULT ''
         );
     """
     )
@@ -225,7 +211,11 @@ async def init_db():
             title TEXT,
             price INTEGER,
             amount INTEGER,
-            command TEXT
+            command TEXT,
+            token_price INTEGER DEFAULT 0,
+            content TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            photo_id TEXT DEFAULT ''
         );
     """
     )
@@ -257,7 +247,8 @@ async def init_db():
             prize INTEGER,
             ends_at TEXT,
             finished INTEGER DEFAULT 0,
-            cost_fixed INTEGER DEFAULT 0
+            cost_fixed INTEGER DEFAULT 0,
+            notified INTEGER DEFAULT 0
         );
     """
     )
@@ -308,6 +299,18 @@ async def init_db():
         );
     """
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_purchases (
+            user_id INTEGER,
+            shop TEXT,
+            product_id INTEGER,
+            display TEXT,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, shop, product_id)
+        );
+    """
+    )
 
     # Миграция: добавляем недостающие колонки в таблицы старой базы
     migrations = {
@@ -335,9 +338,22 @@ async def init_db():
             "aura_expires": "TEXT DEFAULT NULL",
             "lottery_wins": "INTEGER DEFAULT 0",
         },
-        "products": {"buyers_count": "INTEGER DEFAULT 0"},
+        "products": {
+            "buyers_count": "INTEGER DEFAULT 0",
+            "description": "TEXT DEFAULT ''",
+            "photo_id": "TEXT DEFAULT ''",
+        },
+        "unique_products": {
+            "token_price": "INTEGER DEFAULT 0",
+            "content": "TEXT DEFAULT ''",
+            "description": "TEXT DEFAULT ''",
+            "photo_id": "TEXT DEFAULT ''",
+        },
         "lottery_participants": {"paid": "INTEGER DEFAULT NULL"},
-        "lottery_rounds": {"cost_fixed": "INTEGER DEFAULT 0"},
+        "lottery_rounds": {
+            "cost_fixed": "INTEGER DEFAULT 0",
+            "notified": "INTEGER DEFAULT 0",
+        },
         "promocodes": {
             "max_uses": "INTEGER DEFAULT 0",
             "used_count": "INTEGER DEFAULT 0",
@@ -347,6 +363,7 @@ async def init_db():
             "wins": "INTEGER DEFAULT 0",
         },
     }
+    notified_added = False
     for table, columns in migrations.items():
       async with db.execute(f"PRAGMA table_info({table})") as cur:
         existing = {row[1] for row in await cur.fetchall()}
@@ -354,41 +371,50 @@ async def init_db():
         if col not in existing:
           await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
           logging.info("Миграция: добавлена колонка %s.%s", table, col)
+          if table == "lottery_rounds" and col == "notified":
+            notified_added = True
+
+    # Старые тиражи с крупным СВОИМ призом уже рассылались. Не шлём их ещё раз.
+    if notified_added:
+      await db.execute(
+          "UPDATE lottery_rounds SET notified = 1 WHERE finished = 0"
+          " AND COALESCE(prize, 0) >= 11"
+      )
 
     await db.commit()
 
-
 # --- СОСТОЯНИЯ (FSM) ---
-
 
 class AddProduct(StatesGroup):
   title = State()
   price = State()
   link = State()
-
+  description = State()
+  photo = State()
 
 class AddUniqueProduct(StatesGroup):
   title = State()
   price = State()
+  token_price = State()
   amount = State()
+  content = State()
   command = State()
-
+  description = State()
+  photo = State()
 
 class EditProduct(StatesGroup):
   new_value = State()
-
+  photo = State()
 
 class EditUniqueProduct(StatesGroup):
   new_value = State()
-
+  photo = State()
 
 class BroadcastState(StatesGroup):
   message = State()
 
-
 class PromocodeState(StatesGroup):
   code = State()
-
 
 class CreatePromoState(StatesGroup):
   code = State()
@@ -396,44 +422,34 @@ class CreatePromoState(StatesGroup):
   value = State()
   uses = State()
 
-
 class GivePremiumState(StatesGroup):
   user_id = State()
   days = State()
 
-
 class GiveState(StatesGroup):
   user_id = State()
   amount = State()
-
 
 class NewOfferState(StatesGroup):
   give = State()
   want = State()
   link = State()
 
-
 class ExSearchState(StatesGroup):
   query = State()
-
 
 class ExTakeState(StatesGroup):
   link = State()
 
-
 class ExAdminMsgState(StatesGroup):
   text = State()
-
 
 class RouletteState(StatesGroup):
   bet = State()
 
-
 router = Router()
 
-
 # --- АУРА, БАНЫ, ПРЕДУПРЕЖДЕНИЯ ---
-
 
 async def get_user_aura(user_id: int):
   async with connect() as db:
@@ -463,7 +479,6 @@ async def get_user_aura(user_id: int):
         "expires": exp,
     }
 
-
 async def get_active_ban_info(user_id: int):
   async with connect() as db:
     async with db.execute(
@@ -486,12 +501,10 @@ async def get_active_ban_info(user_id: int):
       return None, None
     return until, row[1]
 
-
 APPEAL_TEXT = (
     "Если вы ограничены от бота или заблокированы, напишите @ucu52, если вы"
     " получили наказание незаслуженно."
 )
-
 
 def ban_text(until: datetime.datetime, reason: str = None) -> str:
   if until.year >= 2900:
@@ -501,7 +514,6 @@ def ban_text(until: datetime.datetime, reason: str = None) -> str:
   reason_str = f"\n📝 Причина: <b>{esc(reason)}</b>" if reason else ""
   return f"{base}{reason_str}\n\n{APPEAL_TEXT}"
 
-
 async def ensure_user(db, user_id: int) -> None:
   await db.execute(
       "INSERT OR IGNORE INTO users (user_id, tokens, y_tokens, full_tokens,"
@@ -509,7 +521,6 @@ async def ensure_user(db, user_id: int) -> None:
       " VALUES (?, 0, 0, 0, 0, 0, 0, 0)",
       (user_id,),
   )
-
 
 async def ban_user(target_id: int, days: int, reason: str = None) -> str:
   """Банит на days дней (0 = навсегда). Возвращает текст срока."""
@@ -529,7 +540,6 @@ async def ban_user(target_id: int, days: int, reason: str = None) -> str:
     await db.commit()
   return text
 
-
 async def unban_user(target_id: int) -> None:
   async with connect() as db:
     await db.execute(
@@ -538,7 +548,6 @@ async def unban_user(target_id: int) -> None:
         (target_id,),
     )
     await db.commit()
-
 
 async def add_warn(target_id: int, reason: str = None):
   """Добавляет предупреждение. Возвращает (кол-во варнов, забанен ли)."""
@@ -568,7 +577,6 @@ async def add_warn(target_id: int, reason: str = None):
     await db.commit()
   return warns, banned
 
-
 async def remove_warn(target_id: int) -> int:
   async with connect() as db:
     await ensure_user(db, target_id)
@@ -584,7 +592,6 @@ async def remove_warn(target_id: int) -> int:
     await db.commit()
   return row[0] if row and row[0] is not None else 0
 
-
 async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool):
   if banned:
     text = (
@@ -599,7 +606,6 @@ async def send_warn_notice(bot: Bot, target_id: int, warns: int, banned: bool):
     )
   await safe_send(bot, target_id, text)
 
-
 async def remove_premium(target_id: int) -> None:
   async with connect() as db:
     await db.execute(
@@ -608,7 +614,6 @@ async def remove_premium(target_id: int) -> None:
         (target_id,),
     )
     await db.commit()
-
 
 async def remove_tokens(target_id: int, amount: int) -> int:
   """Забирает токены (не уходит ниже 0). Возвращает новый баланс."""
@@ -626,9 +631,7 @@ async def remove_tokens(target_id: int, amount: int) -> int:
     await db.commit()
   return row[0] if row and row[0] is not None else 0
 
-
 # --- ОБЯЗАТЕЛЬНАЯ ПОДПИСКА И РЕФЕРАЛЫ ---
-
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
   try:
@@ -647,7 +650,6 @@ async def is_subscribed(bot: Bot, user_id: int) -> bool:
   if member.status == ChatMemberStatus.RESTRICTED:
     return bool(getattr(member, "is_member", False))
   return False
-
 
 async def activate_referral(bot: Bot, user_id: int) -> None:
   """Бонус пригласившему: один раз и только после подписки."""
@@ -679,7 +681,6 @@ async def activate_referral(bot: Bot, user_id: int) -> None:
       f"❤️ Вам начислено {REF_BONUS} токенов!",
   )
 
-
 def sub_keyboard() -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
@@ -692,12 +693,10 @@ def sub_keyboard() -> InlineKeyboardMarkup:
       ]
   )
 
-
 SUB_TEXT = (
     "🔒 Чтобы пользоваться ботом, подпишись на наш канал и нажми «Я"
     " подписался»."
 )
-
 
 class SubscribeMiddleware(BaseMiddleware):
 
@@ -740,10 +739,8 @@ class SubscribeMiddleware(BaseMiddleware):
       await event.answer(SUB_TEXT, reply_markup=sub_keyboard())
     return None
 
-
 router.message.outer_middleware(SubscribeMiddleware())
 router.callback_query.outer_middleware(SubscribeMiddleware())
-
 
 def get_main_keyboard(user_id):
   kb = [
@@ -764,9 +761,7 @@ def get_main_keyboard(user_id):
     kb.append([KeyboardButton(text="⚙️ Админ-панель")])
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-
 # --- ВЫДАЧА ТОКЕНОВ, ПРЕМИУМА, ПРОМОКОДЫ ---
-
 
 async def _add_balance(target_id: int, column: str, amount: int) -> None:
   if column not in ("tokens", "y_tokens", "full_tokens"):
@@ -780,25 +775,20 @@ async def _add_balance(target_id: int, column: str, amount: int) -> None:
     )
     await db.commit()
 
-
 async def grant_tokens(target_id: int, amount: int) -> None:
   await _add_balance(target_id, "tokens", amount)
-
 
 async def grant_y_tokens(target_id: int, amount: int) -> None:
   await _add_balance(target_id, "y_tokens", amount)
 
-
 async def grant_full_tokens(target_id: int, amount: int) -> None:
   await _add_balance(target_id, "full_tokens", amount)
-
 
 def premium_active(is_prem, expires_str) -> bool:
   if is_prem != 1:
     return False
   exp = parse_dt(expires_str)
   return exp is None or exp > datetime.datetime.now()
-
 
 async def apply_premium(db, user_id: int, days: int) -> datetime.datetime:
   """Выдаёт/продлевает премиум в уже открытом соединении (без commit)."""
@@ -821,13 +811,11 @@ async def apply_premium(db, user_id: int, days: int) -> datetime.datetime:
   )
   return new_expire
 
-
 async def grant_premium(target_id: int, days: int) -> datetime.datetime:
   async with connect() as db:
     new_expire = await apply_premium(db, target_id, days)
     await db.commit()
   return new_expire
-
 
 async def apply_promocode(user_id: int, code_text: str) -> str:
   code_text = (code_text or "").strip()
@@ -892,9 +880,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
     logging.exception("Ошибка промокода")
     return f"❌ Ошибка обработки: {esc(e)}"
 
-
 # --- СТАРТ, ПРОМОКОД, ОТМЕНА ---
-
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot, state: FSMContext):
@@ -940,14 +926,12 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
       reply_markup=get_main_keyboard(user_id),
   )
 
-
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
   await state.clear()
   await message.answer(
       "Отменено.", reply_markup=get_main_keyboard(message.from_user.id)
   )
-
 
 @router.message(Command("promocode"))
 async def cmd_promocode(
@@ -962,7 +946,6 @@ async def cmd_promocode(
     return
   await message.answer("🎟 Введите промокод:")
   await state.set_state(PromocodeState.code)
-
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(callback: CallbackQuery, bot: Bot):
@@ -980,9 +963,7 @@ async def check_sub(callback: CallbackQuery, bot: Bot):
   else:
     await callback.answer("❌ Ты ещё не подписан на канал!", show_alert=True)
 
-
 # --- АДМИН-КОМАНДЫ: ВЫДАЧА, БАНЫ, ПРЕДУПРЕЖДЕНИЯ ---
-
 
 @router.message(Command("premium", "p"))
 async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
@@ -1014,7 +995,6 @@ async def cmd_premium(message: Message, command: CommandObject, bot: Bot):
       f" <b>{formatted}</b>.\n\nТеперь любые фулы в магазине бесплатны!",
   )
 
-
 @router.message(Command("token", "tokens", "t"))
 async def cmd_token(message: Message, command: CommandObject, bot: Bot):
   if await deny(message):
@@ -1042,7 +1022,6 @@ async def cmd_token(message: Message, command: CommandObject, bot: Bot):
       target_id,
       f"🎁 <b>Администратор начислил вам {amount} токенов!</b>",
   )
-
 
 async def _special_token_cmd(
     message: Message, command: CommandObject, bot: Bot, column: str, label: str
@@ -1092,16 +1071,13 @@ async def _special_token_cmd(
         f"✅ У <code>{target_id}</code> списано <b>{amount}</b> {label}."
     )
 
-
 @router.message(Command("ytoken"))
 async def cmd_ytoken(message: Message, command: CommandObject, bot: Bot):
   await _special_token_cmd(message, command, bot, "y_tokens", "уникальных токенов")
 
-
 @router.message(Command("ftoken"))
 async def cmd_ftoken(message: Message, command: CommandObject, bot: Bot):
   await _special_token_cmd(message, command, bot, "full_tokens", "фулловых токенов")
-
 
 @router.message(Command("untoken"))
 async def cmd_untoken(message: Message, command: CommandObject):
@@ -1120,7 +1096,6 @@ async def cmd_untoken(message: Message, command: CommandObject):
       f" Баланс: <b>{new_balance}</b>."
   )
 
-
 @router.message(Command("unpremium"))
 async def cmd_unpremium(message: Message, command: CommandObject):
   if await deny(message):
@@ -1131,7 +1106,6 @@ async def cmd_unpremium(message: Message, command: CommandObject):
     return
   await remove_premium(args[0])
   await message.answer(f"✅ Премиум у <code>{args[0]}</code> снят.")
-
 
 @router.message(Command("ban"))
 async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
@@ -1162,7 +1136,6 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
       + f"\n\n{APPEAL_TEXT}",
   )
 
-
 @router.message(Command("unban"))
 async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
   if await deny(message):
@@ -1174,7 +1147,6 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
   await unban_user(args[0])
   await message.answer(f"✅ Пользователь <code>{args[0]}</code> разблокирован.")
   await safe_send(bot, args[0], "✅ Ваш профиль разблокирован.")
-
 
 @router.message(Command("warn"))
 async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
@@ -1205,7 +1177,6 @@ async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
     )
   await send_warn_notice(bot, target_id, warns, banned)
 
-
 @router.message(Command("unwarn"))
 async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
   if await deny(message):
@@ -1224,7 +1195,6 @@ async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
       args[0],
       f"✅ С вас снято предупреждение (осталось {warns}/{MAX_WARNS}).",
   )
-
 
 @router.message(Command("aura"))
 async def cmd_aura(message: Message, command: CommandObject, bot: Bot):
@@ -1301,7 +1271,6 @@ async def cmd_aura(message: Message, command: CommandObject, bot: Bot):
       "Удалить:\n<code>/aura del [ID]</code>"
   )
 
-
 @router.message(Command("all"))
 async def cmd_all(message: Message, command: CommandObject, bot: Bot):
   if await deny(message):
@@ -1351,7 +1320,6 @@ async def cmd_all(message: Message, command: CommandObject, bot: Bot):
   _bg_tasks.add(task)
   task.add_done_callback(_bg_tasks.discard)
 
-
 # --- РЕФЕРАЛЫ: /uref и /check ---
 
 REF_TOP_SQL = """
@@ -1366,7 +1334,6 @@ REF_TOP_SQL = """
     ORDER BY ref_count DESC
     LIMIT ?
 """
-
 
 async def ref_summary(db, uid: int):
   """(подписавшиеся, не подписавшиеся, добавлено админом, общий доход)."""
@@ -1385,7 +1352,6 @@ async def ref_summary(db, uid: int):
   extra = row[0] if row else 0
   return active, pending, extra, income + extra * REF_BONUS
 
-
 async def uref_add(target_id: int, count: int) -> None:
   async with connect() as db:
     await ensure_user(db, target_id)
@@ -1395,7 +1361,6 @@ async def uref_add(target_id: int, count: int) -> None:
         (count, count * REF_BONUS, target_id),
     )
     await db.commit()
-
 
 async def uref_remove(target_id: int, count):
   """Убирает count рефералов (None = всех) и забирает их доход.
@@ -1458,7 +1423,6 @@ async def uref_remove(target_id: int, count):
       balance = (await c.fetchone())[0]
     await db.commit()
   return removed, taken, balance
-
 
 @router.message(Command("uref"))
 async def cmd_uref(message: Message, command: CommandObject):
@@ -1532,7 +1496,6 @@ async def cmd_uref(message: Message, command: CommandObject):
     return
 
   await message.answer(usage)
-
 
 @router.message(Command("check"))
 async def cmd_check(message: Message, command: CommandObject):
@@ -1633,7 +1596,6 @@ async def cmd_check(message: Message, command: CommandObject):
       f" {rl_games - rl_wins})"
   )
 
-
 @router.message(F.document, F.caption.startswith("/restore"), F.from_user.id == ADMIN_ID)
 async def cmd_restore(message: Message, bot: Bot):
   """Админ шлёт файл bot.db с подписью /restore, и база заменяется."""
@@ -1654,9 +1616,7 @@ async def cmd_restore(message: Message, bot: Bot):
     return
   await message.answer("✅ База восстановлена из файла.")
 
-
 # --- ТОПЫ ---
-
 
 def tops_menu_keyboard() -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
@@ -1666,7 +1626,6 @@ def tops_menu_keyboard() -> InlineKeyboardMarkup:
           [InlineKeyboardButton(text="🎲 Топ по рулетке", callback_data="top_roulette")],
       ]
   )
-
 
 async def get_next_reset(db) -> datetime.datetime:
   async with db.execute("SELECT next_reset FROM top_reset WHERE id = 1") as cur:
@@ -1680,7 +1639,6 @@ async def get_next_reset(db) -> datetime.datetime:
     )
     await db.commit()
   return nxt
-
 
 @router.callback_query(F.data.startswith("top_reward_"))
 async def process_top_reward(callback: CallbackQuery):
@@ -1716,7 +1674,6 @@ async def process_top_reward(callback: CallbackQuery):
   except Exception:
     pass
   await callback.answer()
-
 
 @router.callback_query(F.data.in_({"top_refs", "top_lottery", "top_roulette"}))
 async def show_specific_top(callback: CallbackQuery):
@@ -1781,7 +1738,6 @@ async def show_specific_top(callback: CallbackQuery):
     pass
   await callback.answer()
 
-
 @router.callback_query(F.data == "back_to_tops")
 async def back_to_tops(callback: CallbackQuery):
   try:
@@ -1792,9 +1748,7 @@ async def back_to_tops(callback: CallbackQuery):
     pass
   await callback.answer()
 
-
 # --- ЛОТЕРЕЯ ---
-
 
 def roll_lottery_params():
   """(приз, цена_фиксирована). Ночью 1:00-8:00 (Киев): приз 4, участие 1."""
@@ -1807,7 +1761,6 @@ def roll_lottery_params():
   if r < LOTTERY_NORMAL_CHANCE + LOTTERY_BIG_LOW_CHANCE:
     return random.randint(11, 14), 0
   return random.randint(15, 20), 0
-
 
 async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
   text = (
@@ -1843,7 +1796,6 @@ async def notify_big_lottery(bot: Bot, cost: int, prize: int) -> None:
     await safe_send(bot, uid, text, reply_markup=kb)
     await asyncio.sleep(0.05)
 
-
 async def create_lottery_round(bot: Bot = None) -> None:
   prize, fixed = roll_lottery_params()
   cost = 1 if fixed else lottery_cost_for_total(prize)
@@ -1860,7 +1812,6 @@ async def create_lottery_round(bot: Bot = None) -> None:
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
-
 async def get_current_round():
   """(id, entry_cost, prize, ends_at, cost_fixed) или None."""
   async with connect() as db:
@@ -1869,7 +1820,6 @@ async def get_current_round():
         " FROM lottery_rounds WHERE finished = 0 ORDER BY id DESC LIMIT 1"
     ) as cur:
       return await cur.fetchone()
-
 
 async def lottery_stats(db, rnd) -> dict:
   round_id, entry_cost, prize, _, fixed = rnd
@@ -1882,7 +1832,6 @@ async def lottery_stats(db, rnd) -> dict:
   total = prize + pool
   cost = entry_cost if fixed else lottery_cost_for_total(total)
   return {"players": players, "pool": pool, "total": total, "cost": cost}
-
 
 def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
   toggle_text = (
@@ -1904,7 +1853,6 @@ def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
           ],
       ]
   )
-
 
 async def build_lottery_view(user_id: int):
   """Возвращает (текст, клавиатура) для экрана лотереи."""
@@ -1978,7 +1926,6 @@ async def build_lottery_view(user_id: int):
       )
   ]
   return text, InlineKeyboardMarkup(inline_keyboard=[join_row, toggle_row])
-
 
 async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
   async with connect() as db:
@@ -2074,7 +2021,6 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
     )
     await asyncio.sleep(0.05)
 
-
 async def lottery_loop(bot: Bot):
   while True:
     try:
@@ -2094,7 +2040,6 @@ async def lottery_loop(bot: Bot):
     except Exception:
       logging.exception("Ошибка в цикле лотереи")
       await asyncio.sleep(30)
-
 
 @router.message(Command("lottery"))
 async def cmd_lottery(message: Message, command: CommandObject):
@@ -2192,13 +2137,11 @@ async def cmd_lottery(message: Message, command: CommandObject):
       + ("" if parts else "\n\n" + usage)
   )
 
-
 @router.callback_query(F.data == "lottery_open")
 async def lottery_open(callback: CallbackQuery):
   text, keyboard = await build_lottery_view(callback.from_user.id)
   await callback.message.answer(text, reply_markup=keyboard)
   await callback.answer()
-
 
 @router.callback_query(F.data == "lottery_toggle_notify")
 async def lottery_toggle_notify(callback: CallbackQuery):
@@ -2226,7 +2169,6 @@ async def lottery_toggle_notify(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=kb)
   except Exception:
     pass
-
 
 @router.callback_query(F.data.startswith("lottery_join_"))
 async def lottery_join(callback: CallbackQuery):
@@ -2311,9 +2253,7 @@ async def lottery_join(callback: CallbackQuery):
       + "\nРезультат придёт сюда, когда закончится розыгрыш."
   )
 
-
 # --- МАГАЗИН ---
-
 
 async def shop_price(user_id: int, base_price: int, buyers_count: int) -> int:
   price = max(1, int(base_price * 0.2)) if buyers_count == 0 else base_price
@@ -2322,13 +2262,11 @@ async def shop_price(user_id: int, base_price: int, buyers_count: int) -> int:
     price = max(1, int(round(price * (1 - aura["percent"] / 100.0))))
   return price
 
-
 def parse_price(price_raw) -> int:
   try:
     return int("".join(filter(str.isdigit, str(price_raw))))
   except ValueError:
     return 0
-
 
 async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
   """Покупка за обычные токены. True, если покупка прошла."""
@@ -2421,7 +2359,6 @@ async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
   await callback.answer()
   return True
 
-
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
@@ -2508,7 +2445,6 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
 
   await pay_with_tokens(callback, bot, p_id)
 
-
 @router.callback_query(F.data.startswith("usenorm_"))
 async def process_buy_norm(callback: CallbackQuery, bot: Bot):
   if await get_restriction(callback.from_user.id):
@@ -2520,7 +2456,6 @@ async def process_buy_norm(callback: CallbackQuery, bot: Bot):
       await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
       pass
-
 
 @router.callback_query(F.data.startswith("usefull_"))
 async def process_buy_full(callback: CallbackQuery):
@@ -2569,9 +2504,7 @@ async def process_buy_full(callback: CallbackQuery):
   )
   await callback.answer()
 
-
 # --- УНИКАЛЬНЫЙ МАГАЗИН ---
-
 
 def parse_unique_command(cmd: str):
   """Разбирает команду товара. Возвращает (action, args) или None.
@@ -2615,7 +2548,6 @@ def parse_unique_command(cmd: str):
     return None
   return None
 
-
 async def apply_unique_command(user_id: int, title: str, parsed) -> None:
   action, args = parsed
   if action == "ftoken":
@@ -2643,7 +2575,6 @@ async def apply_unique_command(user_id: int, title: str, parsed) -> None:
           ),
       )
       await db.commit()
-
 
 @router.callback_query(F.data.startswith("ubuy_"))
 async def process_ubuy(callback: CallbackQuery):
@@ -2711,9 +2642,7 @@ async def process_ubuy(callback: CallbackQuery):
   )
   await callback.answer()
 
-
 # --- ГЛАВНОЕ МЕНЮ ---
-
 
 @router.message(
     F.text.in_(
@@ -2966,9 +2895,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     )
     await message.answer("⚙️ Панель администратора:", reply_markup=admin_keyboard)
 
-
 # --- ПРОМОКОД: ВВОД ПОЛЬЗОВАТЕЛЕМ ---
-
 
 @router.message(StateFilter(PromocodeState.code))
 async def promo_check(message: Message, state: FSMContext):
@@ -2978,14 +2905,12 @@ async def promo_check(message: Message, state: FSMContext):
   reply = await apply_promocode(user_id, code_text)
   await message.answer(reply, reply_markup=get_main_keyboard(user_id))
 
-
 @router.callback_query(F.data == "enter_promocode")
 async def promo_prompt(callback: CallbackQuery, state: FSMContext):
   await state.clear()
   await state.set_state(PromocodeState.code)
   await callback.message.answer("🎟 Введите промокод:")
   await callback.answer()
-
 
 # --- АДМИНКА: ВЫДАЧА ТОКЕНОВ И ПРЕМИУМА ---
 
@@ -2994,7 +2919,6 @@ GIVE_KINDS = {
     "y": ("💎", "уникальных токенов", grant_y_tokens),
     "full": ("📦", "фулловых токенов", grant_full_tokens),
 }
-
 
 async def _start_give(callback: CallbackQuery, state: FSMContext, kind: str):
   if callback.from_user.id != ADMIN_ID:
@@ -3009,21 +2933,17 @@ async def _start_give(callback: CallbackQuery, state: FSMContext, kind: str):
   )
   await callback.answer()
 
-
 @router.callback_query(F.data == "admin_give_tokens")
 async def start_give_tokens(callback: CallbackQuery, state: FSMContext):
   await _start_give(callback, state, "tokens")
-
 
 @router.callback_query(F.data == "admin_give_ytokens")
 async def start_give_ytokens(callback: CallbackQuery, state: FSMContext):
   await _start_give(callback, state, "y")
 
-
 @router.callback_query(F.data == "admin_give_ftokens")
 async def start_give_ftokens(callback: CallbackQuery, state: FSMContext):
   await _start_give(callback, state, "full")
-
 
 @router.message(StateFilter(GiveState.user_id))
 async def process_give_id(message: Message, state: FSMContext):
@@ -3035,7 +2955,6 @@ async def process_give_id(message: Message, state: FSMContext):
   data = await state.get_data()
   icon, label, _ = GIVE_KINDS[data["kind"]]
   await message.answer(f"{icon} Сколько {label} начислить? (целое число)")
-
 
 @router.message(StateFilter(GiveState.amount))
 async def process_give_amount(message: Message, state: FSMContext, bot: Bot):
@@ -3064,7 +2983,6 @@ async def process_give_amount(message: Message, state: FSMContext, bot: Bot):
       " профиль.",
   )
 
-
 @router.callback_query(F.data == "admin_give_premium")
 async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -3077,7 +2995,6 @@ async def start_give_premium(callback: CallbackQuery, state: FSMContext):
   )
   await callback.answer()
 
-
 @router.message(StateFilter(GivePremiumState.user_id))
 async def process_give_premium_id(message: Message, state: FSMContext):
   if not txt(message).isdigit():
@@ -3086,7 +3003,6 @@ async def process_give_premium_id(message: Message, state: FSMContext):
   await state.update_data(target_id=int(txt(message)))
   await state.set_state(GivePremiumState.days)
   await message.answer("⏳ На сколько <b>дней</b> выдать Премиум?")
-
 
 @router.message(StateFilter(GivePremiumState.days))
 async def process_give_premium_days(
@@ -3117,9 +3033,7 @@ async def process_give_premium_days(
       f" <b>{formatted}</b>.",
   )
 
-
 # --- АДМИНКА: ПРОМОКОДЫ ---
-
 
 @router.callback_query(F.data == "admin_create_promo")
 async def start_create_promo(callback: CallbackQuery, state: FSMContext):
@@ -3132,7 +3046,6 @@ async def start_create_promo(callback: CallbackQuery, state: FSMContext):
       "🎟 Введите текст промокода (например: <code>START100</code>):"
   )
   await callback.answer()
-
 
 @router.message(StateFilter(CreatePromoState.code))
 async def process_promo_code(message: Message, state: FSMContext):
@@ -3152,7 +3065,6 @@ async def process_promo_code(message: Message, state: FSMContext):
   )
   await message.answer("🎁 Выберите, что будет давать промокод:", reply_markup=kb)
 
-
 @router.callback_query(F.data.startswith("promo_type_"))
 async def process_promo_type(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -3170,7 +3082,6 @@ async def process_promo_type(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("⏳ Введите количество дней Премиума (число):")
   await callback.answer()
 
-
 @router.message(StateFilter(CreatePromoState.value))
 async def process_promo_value(message: Message, state: FSMContext):
   if not txt(message).isdigit() or int(txt(message)) <= 0:
@@ -3182,7 +3093,6 @@ async def process_promo_value(message: Message, state: FSMContext):
       "🔢 Введите <b>количество использований</b> (например: 10 или"
       " 100):\n<i>(Введите 0 для безлимита)</i>"
   )
-
 
 @router.message(StateFilter(CreatePromoState.uses))
 async def process_promo_uses(message: Message, state: FSMContext, bot: Bot):
@@ -3246,9 +3156,7 @@ async def process_promo_uses(message: Message, state: FSMContext, bot: Bot):
       f"<i>Вписывать промокод в бота @{esc(username)}</i>"
   )
 
-
 # --- АДМИНКА: ТОВАРЫ ---
-
 
 @router.callback_query(F.data == "add_product")
 async def start_add_product(callback: CallbackQuery, state: FSMContext):
@@ -3260,7 +3168,6 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
   await state.set_state(AddProduct.title)
   await callback.answer()
 
-
 @router.message(StateFilter(AddProduct.title))
 async def process_product_title(message: Message, state: FSMContext):
   if not txt(message):
@@ -3269,7 +3176,6 @@ async def process_product_title(message: Message, state: FSMContext):
   await state.update_data(title=txt(message))
   await message.answer("💰 Введи цену в токенах (число, например: 15):")
   await state.set_state(AddProduct.price)
-
 
 @router.message(StateFilter(AddProduct.price))
 async def process_product_price(message: Message, state: FSMContext):
@@ -3283,7 +3189,6 @@ async def process_product_price(message: Message, state: FSMContext):
       " 80%)</i>"
   )
   await state.set_state(AddProduct.link)
-
 
 @router.message(StateFilter(AddProduct.link))
 async def process_product_link(message: Message, state: FSMContext):
@@ -3306,7 +3211,6 @@ async def process_product_link(message: Message, state: FSMContext):
       " Активирована скидка 80% для первого покупателя!"
   )
 
-
 @router.callback_query(F.data == "ed_list")
 async def show_edit_products_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
@@ -3328,7 +3232,6 @@ async def show_edit_products_list(callback: CallbackQuery):
       reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
   )
   await callback.answer()
-
 
 @router.callback_query(F.data.startswith("ep_"))
 async def process_edit_product_select(callback: CallbackQuery, state: FSMContext):
@@ -3360,7 +3263,6 @@ async def process_edit_product_select(callback: CallbackQuery, state: FSMContext
   )
   await callback.answer()
 
-
 @router.callback_query(F.data.in_({"ef_title", "ef_price", "ef_link"}))
 async def process_edit_product_field(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -3371,7 +3273,6 @@ async def process_edit_product_field(callback: CallbackQuery, state: FSMContext)
   await state.set_state(EditProduct.new_value)
   await callback.message.answer(f"✍️ Введи новое значение для поля <b>{field}</b>:")
   await callback.answer()
-
 
 @router.message(StateFilter(EditProduct.new_value))
 async def process_edit_product_save(message: Message, state: FSMContext):
@@ -3393,7 +3294,6 @@ async def process_edit_product_save(message: Message, state: FSMContext):
     )
     await db.commit()
   await message.answer("✅ Товар успешно обновлен!")
-
 
 @router.callback_query(F.data == "del_list")
 async def show_delete_products_list(callback: CallbackQuery):
@@ -3417,7 +3317,6 @@ async def show_delete_products_list(callback: CallbackQuery):
   )
   await callback.answer()
 
-
 @router.callback_query(F.data.startswith("dp_"))
 async def process_delete_product(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
@@ -3429,7 +3328,6 @@ async def process_delete_product(callback: CallbackQuery):
     await db.commit()
   await callback.message.answer("✅ Товар удален из магазина.")
   await callback.answer()
-
 
 # --- АДМИНКА: УНИКАЛЬНЫЕ ТОВАРЫ ---
 
@@ -3443,7 +3341,6 @@ UNIQUE_COMMAND_HELP = (
     "ID вводить не нужно, получит тот, кто купил."
 )
 
-
 @router.callback_query(F.data == "add_unique_product")
 async def start_add_unique_product(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -3456,7 +3353,6 @@ async def start_add_unique_product(callback: CallbackQuery, state: FSMContext):
   await state.set_state(AddUniqueProduct.title)
   await callback.answer()
 
-
 @router.message(StateFilter(AddUniqueProduct.title))
 async def process_u_title(message: Message, state: FSMContext):
   if not txt(message):
@@ -3465,7 +3361,6 @@ async def process_u_title(message: Message, state: FSMContext):
   await state.update_data(title=txt(message))
   await message.answer("💰 Введите цену в <b>уникальных токенах</b> (например: 10):")
   await state.set_state(AddUniqueProduct.price)
-
 
 @router.message(StateFilter(AddUniqueProduct.price))
 async def process_u_price(message: Message, state: FSMContext):
@@ -3476,7 +3371,6 @@ async def process_u_price(message: Message, state: FSMContext):
   await message.answer("📦 Введите количество (штук в наличии, например: 5):")
   await state.set_state(AddUniqueProduct.amount)
 
-
 @router.message(StateFilter(AddUniqueProduct.amount))
 async def process_u_amount(message: Message, state: FSMContext):
   if not txt(message).isdigit():
@@ -3485,7 +3379,6 @@ async def process_u_amount(message: Message, state: FSMContext):
   await state.update_data(amount=int(txt(message)))
   await message.answer(UNIQUE_COMMAND_HELP)
   await state.set_state(AddUniqueProduct.command)
-
 
 @router.message(StateFilter(AddUniqueProduct.command))
 async def process_u_command(message: Message, state: FSMContext):
@@ -3505,7 +3398,6 @@ async def process_u_command(message: Message, state: FSMContext):
     )
     await db.commit()
   await message.answer("✅ Товар добавлен в уникальный магазин!")
-
 
 @router.callback_query(F.data == "ued_list")
 async def show_edit_unique_products_list(callback: CallbackQuery):
@@ -3529,7 +3421,6 @@ async def show_edit_unique_products_list(callback: CallbackQuery):
   )
   await callback.answer()
 
-
 @router.callback_query(F.data.startswith("uep_"))
 async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -3548,7 +3439,6 @@ async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext)
   await callback.message.answer("Что изменить в уникальном товаре?", reply_markup=kb)
   await callback.answer()
 
-
 @router.callback_query(
     F.data.in_({"uef_title", "uef_price", "uef_amount", "uef_command"})
 )
@@ -3564,7 +3454,6 @@ async def process_edit_unique_field(callback: CallbackQuery, state: FSMContext):
       f"✍️ Введите новое значение для поля <b>{field}</b>:{hint}"
   )
   await callback.answer()
-
 
 @router.message(StateFilter(EditUniqueProduct.new_value))
 async def process_edit_unique_save(message: Message, state: FSMContext):
@@ -3594,7 +3483,6 @@ async def process_edit_unique_save(message: Message, state: FSMContext):
     await db.commit()
   await message.answer("✅ Уникальный товар обновлен!")
 
-
 @router.callback_query(F.data == "udel_list")
 async def show_delete_unique_products_list(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
@@ -3617,7 +3505,6 @@ async def show_delete_unique_products_list(callback: CallbackQuery):
   )
   await callback.answer()
 
-
 @router.callback_query(F.data.startswith("udp_"))
 async def process_delete_unique(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
@@ -3630,9 +3517,7 @@ async def process_delete_unique(callback: CallbackQuery):
   await callback.message.answer("✅ Уникальный товар удален.")
   await callback.answer()
 
-
 # --- АДМИНКА: РАССЫЛКА И БЭКАП ---
-
 
 @router.callback_query(F.data == "start_broadcast")
 async def start_broadcast(callback: CallbackQuery, state: FSMContext):
@@ -3646,7 +3531,6 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
   )
   await state.set_state(BroadcastState.message)
   await callback.answer()
-
 
 @router.message(StateFilter(BroadcastState.message))
 async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
@@ -3676,7 +3560,6 @@ async def send_broadcast(message: Message, state: FSMContext, bot: Bot):
       f" (заблокировали бота): {fail}"
   )
 
-
 @router.callback_query(F.data == "admin_backup_db")
 async def backup_database_manual(callback: CallbackQuery):
   if callback.from_user.id != ADMIN_ID:
@@ -3694,7 +3577,6 @@ async def backup_database_manual(callback: CallbackQuery):
   else:
     await callback.answer("❌ База данных не найдена!", show_alert=True)
 
-
 # --- ОБМЕНЫ ССЫЛКАМИ ---
 
 EXCHANGE_COST = 1  # сколько токенов платит тот, кто берёт обмен
@@ -3708,13 +3590,11 @@ LINK_RE = re.compile(
 LINK_RULE = "⚠️ Ссылка должна быть с mega.nz или cloud.mail.ru"
 LINK_ERROR = "❌ Неверная ссылка. " + LINK_RULE
 
-
 async def ex_exec(sql, args=()):
   async with connect() as db:
     cur = await db.execute(sql, args)
     await db.commit()
     return cur.rowcount, cur.lastrowid
-
 
 async def ex_one(sql, args=()):
   async with connect() as db:
@@ -3722,13 +3602,11 @@ async def ex_one(sql, args=()):
     async with db.execute(sql, args) as cur:
       return await cur.fetchone()
 
-
 async def ex_all(sql, args=()):
   async with connect() as db:
     db.row_factory = aiosqlite.Row
     async with db.execute(sql, args) as cur:
       return await cur.fetchall()
-
 
 async def get_restriction(user_id: int):
   """datetime окончания ограничения обменов/покупок или None."""
@@ -3748,7 +3626,6 @@ async def get_restriction(user_id: int):
     return None
   return until
 
-
 RESTRICTED_TEXT = (
     "🔒 На вас подана жалоба. Обмены и покупки в магазине временно"
     " ограничены до решения администратора.\n\n" + APPEAL_TEXT
@@ -3758,7 +3635,6 @@ RESTRICTED_ALERT = (
     " @ucu52"
 )
 
-
 def ex_kb(rows) -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
@@ -3766,7 +3642,6 @@ def ex_kb(rows) -> InlineKeyboardMarkup:
           for row in rows
       ]
   )
-
 
 async def ex_show(event, text, kb=None):
   """Callback -> редактирует сообщение, Message -> отправляет новое."""
@@ -3785,13 +3660,11 @@ async def ex_show(event, text, kb=None):
   else:
     await event.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
-
 def exchange_menu_kb() -> InlineKeyboardMarkup:
   return ex_kb([
       [("➕ Выставить обмен", "ex:new"), ("📋 Все обмены", "ex:all")],
       [("🔍 Поиск", "ex:search"), ("📦 Мои обмены", "ex:my")],
   ])
-
 
 async def ex_menu_text() -> str:
   return (
@@ -3799,13 +3672,11 @@ async def ex_menu_text() -> str:
       f" Чтобы провести обмен, нужно заплатить {EXCHANGE_COST} токен."
   )
 
-
 @router.callback_query(F.data == "ex:menu")
 async def ex_menu_cb(callback: CallbackQuery, state: FSMContext):
   await state.clear()
   await ex_show(callback, await ex_menu_text(), exchange_menu_kb())
   await callback.answer()
-
 
 @router.callback_query(F.data == "ex:cancel")
 async def ex_cancel(callback: CallbackQuery, state: FSMContext):
@@ -3813,14 +3684,11 @@ async def ex_cancel(callback: CallbackQuery, state: FSMContext):
   await ex_show(callback, "Отменено.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
   await callback.answer()
 
-
 @router.callback_query(F.data == "ex:noop")
 async def ex_noop(callback: CallbackQuery):
   await callback.answer()
 
-
 # --- создание обмена ---
-
 
 @router.callback_query(F.data == "ex:new")
 async def ex_new(callback: CallbackQuery, state: FSMContext):
@@ -3846,7 +3714,6 @@ async def ex_new(callback: CallbackQuery, state: FSMContext):
   )
   await callback.answer()
 
-
 @router.message(StateFilter(NewOfferState.give))
 async def ex_new_give(message: Message, state: FSMContext):
   text = txt(message)[:60]
@@ -3860,7 +3727,6 @@ async def ex_new_give(message: Message, state: FSMContext):
       reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
   )
 
-
 @router.message(StateFilter(NewOfferState.want))
 async def ex_new_want(message: Message, state: FSMContext):
   text = txt(message)[:60]
@@ -3873,7 +3739,6 @@ async def ex_new_want(message: Message, state: FSMContext):
       f"Отправь <b>свою ссылку</b> для обмена.\n{LINK_RULE}",
       reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
   )
-
 
 @router.message(StateFilter(NewOfferState.link))
 async def ex_new_link(message: Message, state: FSMContext):
@@ -3902,9 +3767,7 @@ async def ex_new_link(message: Message, state: FSMContext):
       reply_markup=ex_kb([[("🔄 Обмены", "ex:menu")]]),
   )
 
-
 # --- список и поиск ---
-
 
 async def ex_render_list(event, user_id: int, page: int):
   q = EX_SEARCH.get(user_id)
@@ -3956,7 +3819,6 @@ async def ex_render_list(event, user_id: int, page: int):
   buttons.append([("⬅️ В обмены", "ex:menu")])
   await ex_show(event, head, ex_kb(buttons))
 
-
 @router.callback_query(F.data == "ex:all")
 async def ex_all_cb(callback: CallbackQuery, state: FSMContext):
   await state.clear()
@@ -3964,14 +3826,12 @@ async def ex_all_cb(callback: CallbackQuery, state: FSMContext):
   await ex_render_list(callback, callback.from_user.id, 0)
   await callback.answer()
 
-
 @router.callback_query(F.data.startswith("ex:list:"))
 async def ex_list_cb(callback: CallbackQuery):
   await ex_render_list(
       callback, callback.from_user.id, int(callback.data.split(":")[2])
   )
   await callback.answer()
-
 
 @router.callback_query(F.data == "ex:search")
 async def ex_search(callback: CallbackQuery, state: FSMContext):
@@ -3984,16 +3844,13 @@ async def ex_search(callback: CallbackQuery, state: FSMContext):
   )
   await callback.answer()
 
-
 @router.message(StateFilter(ExSearchState.query))
 async def ex_search_do(message: Message, state: FSMContext):
   await state.clear()
   EX_SEARCH[message.from_user.id] = txt(message)[:60]
   await ex_render_list(message, message.from_user.id, 0)
 
-
 # --- просмотр, удаление, мои обмены ---
-
 
 @router.callback_query(F.data.startswith("ex:view:"))
 async def ex_view(callback: CallbackQuery):
@@ -4059,7 +3916,6 @@ async def ex_view(callback: CallbackQuery):
   await ex_show(callback, text, kb)
   await callback.answer()
 
-
 @router.callback_query(F.data == "ex:my")
 async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
   await state.clear()
@@ -4087,7 +3943,6 @@ async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
   await ex_show(callback, "📦 <b>Ваши обмены:</b>", ex_kb(buttons))
   await callback.answer()
 
-
 @router.callback_query(F.data.startswith("ex:del:"))
 async def ex_delete_offer(callback: CallbackQuery):
   offer_id = int(callback.data.split(":")[2])
@@ -4103,9 +3958,7 @@ async def ex_delete_offer(callback: CallbackQuery):
   await ex_show(callback, "🗑 Обмен удален.", ex_kb([[("🔄 Обмены", "ex:menu")]]))
   await callback.answer()
 
-
 # --- взять обмен ---
-
 
 @router.callback_query(F.data.startswith("ex:take:"))
 async def ex_take(callback: CallbackQuery, state: FSMContext):
@@ -4139,7 +3992,6 @@ async def ex_take(callback: CallbackQuery, state: FSMContext):
       ex_kb([[("❌ Отмена", "ex:cancel")]]),
   )
   await callback.answer()
-
 
 @router.message(StateFilter(ExTakeState.link))
 async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
@@ -4201,9 +4053,7 @@ async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
       disable_web_page_preview=True,
   )
 
-
 # --- жалобы ---
-
 
 @router.callback_query(F.data.startswith("ex:confirm_rep:"))
 async def ex_confirm_report(callback: CallbackQuery):
@@ -4220,7 +4070,6 @@ async def ex_confirm_report(callback: CallbackQuery):
   ])
   await ex_show(callback, text, kb)
   await callback.answer()
-
 
 @router.callback_query(F.data.startswith("ex:rep:"))
 async def ex_report(callback: CallbackQuery, bot: Bot):
@@ -4289,7 +4138,6 @@ async def ex_report(callback: CallbackQuery, bot: Bot):
   if not sent:
     logging.error("Не удалось отправить жалобу админу")
 
-
 @router.callback_query(F.data.startswith("ex:ok:"))
 async def ex_admin_ok(callback: CallbackQuery, bot: Bot):
   if callback.from_user.id != ADMIN_ID:
@@ -4329,7 +4177,6 @@ async def ex_admin_ok(callback: CallbackQuery, bot: Bot):
       f" предупреждение ({warns}/{MAX_WARNS})."
   )
 
-
 @router.callback_query(F.data.startswith("ex:msg:"))
 async def ex_admin_msg(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
@@ -4351,7 +4198,6 @@ async def ex_admin_msg(callback: CallbackQuery, state: FSMContext):
   )
   await callback.answer()
 
-
 @router.message(StateFilter(ExAdminMsgState.text))
 async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
   if message.from_user.id != ADMIN_ID:
@@ -4368,13 +4214,11 @@ async def ex_admin_msg_send(message: Message, state: FSMContext, bot: Bot):
   )
   await message.answer("Отправлено." if ok else "Не доставлено (бот заблокирован).")
 
-
 # --- РУЛЕТКА 50/50 ---
 
 ROULETTE_MIN = 2
 ROULETTE_MAX = 10
 _roulette_locks = {}
-
 
 def roulette_decide(current_tokens: int, roll_win: bool, aura_percent: int) -> bool:
   if aura_percent > 0:
@@ -4382,7 +4226,6 @@ def roulette_decide(current_tokens: int, roll_win: bool, aura_percent: int) -> b
   if current_tokens >= 30:
     return random.random() < 0.30
   return roll_win
-
 
 async def roulette_play(user_id: int, bet: int) -> dict:
   """Один раунд. {'error': 'balance', 'balance': N} или {'win': bool, 'balance': N}."""
@@ -4433,7 +4276,6 @@ async def roulette_play(user_id: int, bet: int) -> dict:
       await db.commit()
   return {"win": win, "balance": balance}
 
-
 def roulette_result_kb(bet: int) -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
@@ -4446,7 +4288,6 @@ def roulette_result_kb(bet: int) -> InlineKeyboardMarkup:
           [InlineKeyboardButton(text="💰 Другая ставка", callback_data="rl_new")],
       ]
   )
-
 
 async def roulette_intro_text(user_id: int) -> str:
   async with connect() as db:
@@ -4465,7 +4306,6 @@ async def roulette_intro_text(user_id: int) -> str:
       "✍️ Напиши в чат, сколько токенов ставишь:"
   )
 
-
 def roulette_result_text(bet: int, res: dict) -> str:
   if res["win"]:
     return (
@@ -4476,7 +4316,6 @@ def roulette_result_text(bet: int, res: dict) -> str:
       f"💥 <b>Проигрыш.</b> Ставка {bet} токенов сгорела.\n"
       f"Баланс: <b>{res['balance']}</b>"
   )
-
 
 @router.message(StateFilter(RouletteState.bet))
 async def roulette_bet(message: Message, state: FSMContext):
@@ -4500,7 +4339,6 @@ async def roulette_bet(message: Message, state: FSMContext):
       roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
   )
 
-
 @router.callback_query(F.data.startswith("rl_again_"))
 async def roulette_again(callback: CallbackQuery):
   bet = int(callback.data.split("_")[2])
@@ -4522,24 +4360,19 @@ async def roulette_again(callback: CallbackQuery):
       roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
   )
 
-
 @router.callback_query(F.data == "rl_new")
 async def roulette_new(callback: CallbackQuery, state: FSMContext):
   await state.set_state(RouletteState.bet)
   await callback.answer()
   await callback.message.answer(await roulette_intro_text(callback.from_user.id))
 
-
 # --- ГЛОБАЛЬНЫЙ ЛОВЕЦ ОШИБОК ---
-
 
 @router.errors()
 async def global_error_handler(event: ErrorEvent):
   logging.exception("Необработанная ошибка: %s", event.exception)
 
-
 # --- ФОНОВЫЕ ЗАДАЧИ ---
-
 
 async def send_top_reward(bot: Bot, w_id: int, top_name: str) -> None:
   kb = InlineKeyboardMarkup(
@@ -4565,7 +4398,6 @@ async def send_top_reward(bot: Bot, w_id: int, top_name: str) -> None:
       "Выберите вашу награду:",
       reply_markup=kb,
   )
-
 
 async def run_top_reset(bot: Bot) -> None:
   async with connect() as db:
@@ -4609,7 +4441,6 @@ async def run_top_reset(bot: Bot) -> None:
       " победителям отправлен выбор награды!",
   )
 
-
 async def top_reset_loop(bot: Bot):
   """Проверяет срок сброса из БД: переживает перезапуски хостинга."""
   while True:
@@ -4621,7 +4452,6 @@ async def top_reset_loop(bot: Bot):
     except Exception:
       logging.exception("Ошибка при автосбросе топов")
     await asyncio.sleep(300)
-
 
 async def auto_backup_loop(bot: Bot):
   backup_message_ids = []
@@ -4648,10 +4478,8 @@ async def auto_backup_loop(bot: Bot):
     except Exception:
       logging.exception("Ошибка при отправке авто-бэкапа")
 
-
 async def handle_ping(request):
   return web.Response(text="Bot is running!")
-
 
 async def start_web_server():
   app = web.Application()
@@ -4660,7 +4488,6 @@ async def start_web_server():
   await runner.setup()
   site = web.TCPSite(runner, "0.0.0.0", PORT)
   await site.start()
-
 
 async def main():
   await init_db()
@@ -4688,6 +4515,6 @@ async def main():
     for task in tasks:
       task.cancel()
 
-
 if __name__ == "__main__":
   asyncio.run(main())
+
