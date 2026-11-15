@@ -87,6 +87,264 @@ LOTTERY_BIG_MIN_PLAYERS = 4
 # --- ОБЩИЕ ХЕЛПЕРЫ ---
 
 
+# ─── ПЕРЕВОДЫ ────────────────────────────────────────────────────────────────
+
+STRINGS: dict[str, dict[str, str]] = {
+    # ── общие ──────────────────────────────────────────────────────────────
+    "appeal": {
+        "ru": "Если вы ограничены от бота или заблокированы, напишите @ucu52, если вы получили наказание незаслуженно.",
+        "en": "If you are restricted or banned, write to @ucu52 if you believe the punishment is unfair.",
+    },
+    "sub_required": {
+        "ru": "🔒 Чтобы пользоваться ботом, подпишись на наш канал и нажми «Я подписался».",
+        "en": "🔒 To use the bot, subscribe to our channel and press \"I subscribed\".",
+    },
+    "sub_btn_subscribe": {"ru": "📢 Подписаться на канал", "en": "📢 Subscribe to channel"},
+    "sub_btn_check":     {"ru": "✅ Я подписался",         "en": "✅ I subscribed"},
+    "sub_thanks":        {"ru": "✅ Спасибо за подписку! Выбирай раздел в меню.", "en": "✅ Thanks for subscribing! Choose a section in the menu."},
+    "sub_not_yet":       {"ru": "❌ Ты ещё не подписан на канал!", "en": "❌ You haven't subscribed yet!"},
+    "cancelled":         {"ru": "Отменено.", "en": "Cancelled."},
+    "no_access":         {"ru": "⛔️ У тебя нет доступа!", "en": "⛔️ You don't have access!"},
+    "restricted_alert":  {
+        "ru": "🔒 Вы ограничены от обменов и покупок. Если это незаслуженно — напишите @ucu52",
+        "en": "🔒 You are restricted from exchanges and purchases. Write @ucu52 if unfair.",
+    },
+    "restricted_text": {
+        "ru": "🔒 На вас подана жалоба. Обмены и покупки в магазине временно ограничены до решения администратора.\n\n{appeal}",
+        "en": "🔒 A complaint has been filed against you. Exchanges and purchases are temporarily restricted pending admin review.\n\n{appeal}",
+    },
+    # ── старт / язык ───────────────────────────────────────────────────────
+    "choose_lang":   {"ru": "🌐 Выберите язык / Choose language:", "en": "🌐 Choose language / Выберите язык:"},
+    "lang_set_ru":   {"ru": "🇷🇺 Язык установлен: Русский", "en": "🇷🇺 Language set: Russian"},
+    "lang_set_en":   {"ru": "🇬🇧 Language set: English", "en": "🇬🇧 Language set: English"},
+    "welcome":       {"ru": "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре ниже:", "en": "👋 Hello! Welcome to the bot. Choose a section from the keyboard below:"},
+    # ── главное меню (кнопки) ──────────────────────────────────────────────
+    "btn_profile":   {"ru": "👤 Мой Профиль",          "en": "👤 My Profile"},
+    "btn_shop":      {"ru": "🛒 Магазин",               "en": "🛒 Shop"},
+    "btn_ushop":     {"ru": "💎 Уникальный магазин",    "en": "💎 Unique Shop"},
+    "btn_refs":      {"ru": "👥 Реферальная система",   "en": "👥 Referral System"},
+    "btn_top":       {"ru": "🏆 Топ игроков",           "en": "🏆 Top Players"},
+    "btn_howto":     {"ru": "🪙 Как получить токены?",  "en": "🪙 How to get tokens?"},
+    "btn_subs":      {"ru": "💳 Подписки",              "en": "💳 Subscriptions"},
+    "btn_exchange":  {"ru": "🔄 Обмены",                "en": "🔄 Exchanges"},
+    "btn_lottery":   {"ru": "🎰 Лотерея",               "en": "🎰 Lottery"},
+    "btn_roulette":  {"ru": "🎲 Рулетка",               "en": "🎲 Roulette"},
+    "btn_admin":     {"ru": "⚙️ Админ-панель",          "en": "⚙️ Admin Panel"},
+    # ── профиль ───────────────────────────────────────────────────────────
+    "profile_title":        {"ru": "👤 <b>Ваш Профиль</b>", "en": "👤 <b>Your Profile</b>"},
+    "profile_id":           {"ru": "🆔 Ваш ID",             "en": "🆔 Your ID"},
+    "profile_tokens":       {"ru": "💲 Баланс токенов",     "en": "💲 Token balance"},
+    "profile_ytokens":      {"ru": "💎 Уникальные токены",  "en": "💎 Unique tokens"},
+    "profile_ftokens":      {"ru": "📦 Фулловые токены",    "en": "📦 Full tokens"},
+    "profile_premium":      {"ru": "👑 Премиум-подписка",   "en": "👑 Premium subscription"},
+    "profile_upremium":     {"ru": "💎 Уникальная подписка","en": "💎 Unique subscription"},
+    "profile_aura":         {"ru": "✨ Активная аура",       "en": "✨ Active aura"},
+    "profile_bought":       {"ru": "📦 Собрано фулов",      "en": "📦 Purchased items"},
+    "profile_warns":        {"ru": "⚠️ Предупреждения",     "en": "⚠️ Warnings"},
+    "profile_exchanges":    {"ru": "🔄 Обменов проведено",  "en": "🔄 Exchanges completed"},
+    "profile_prem_active":  {"ru": "✅ До {date} ({days} дн.)", "en": "✅ Until {date} ({days} d.)"},
+    "profile_prem_no":      {"ru": "❌ Не активна",         "en": "❌ Not active"},
+    "profile_prem_expired": {"ru": "❌ Не активна (истекла)","en": "❌ Not active (expired)"},
+    "profile_aura_no":      {"ru": "❌ Нет",                "en": "❌ None"},
+    "profile_aura_active":  {"ru": "✨ <b>{name}</b> ({pct}% бонусов, ещё {days} дн.)", "en": "✨ <b>{name}</b> ({pct}% bonus, {days} d. left)"},
+    "btn_promo":            {"ru": "🎟 Ввести промокод",    "en": "🎟 Enter promo code"},
+    # ── магазин ───────────────────────────────────────────────────────────
+    "shop_empty":    {"ru": "📭 В магазине пока пусто. Либо же вы все раскупили!", "en": "📭 The shop is empty. Maybe you bought everything!"},
+    "shop_title":    {"ru": "🛍 <b>Доступные фулы:</b>\n<i>(Нажми на нужный, чтобы посмотреть описание)</i>", "en": "🛍 <b>Available items:</b>\n<i>(Tap one to see description)</i>"},
+    "shop_first_buy":{"ru": "🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)", "en": "🔥 {title} — {price} tokens (FIRST PURCHASE -80%!)"},
+    "shop_item":     {"ru": "📁 {title} — {price} токенов", "en": "📁 {title} — {price} tokens"},
+    "shop_desc_price_first": {"ru": "💰 Цена: <s>{price}</s> → <b>{final} токенов</b> (скидка 80%!)", "en": "💰 Price: <s>{price}</s> → <b>{final} tokens</b> (80% off!)"},
+    "shop_desc_price":       {"ru": "💰 Цена: <b>{price} токенов</b>", "en": "💰 Price: <b>{price} tokens</b>"},
+    "shop_desc_bought":      {"ru": "👥 Купили за токены: <b>{n}</b>", "en": "👥 Purchased with tokens: <b>{n}</b>"},
+    "shop_btn_buy":          {"ru": "🛒 Купить",   "en": "🛒 Buy"},
+    "shop_btn_back":         {"ru": "⬅️ Назад",   "en": "⬅️ Back"},
+    "shop_deleted":          {"ru": "❌ Этот товар был удален.", "en": "❌ This item has been deleted."},
+    "shop_no_tokens":        {"ru": "❌ Недостаточно токенов!\nЦена: {price} токенов, а у вас: {bal}.", "en": "❌ Not enough tokens!\nPrice: {price} tokens, you have: {bal}."},
+    "shop_bought_first":     {"ru": "🎉 Поздравляем! Ты первый покупатель фулла {title}!\n🔥 Применилась скидка 80%!\nСписано: {price} токенов.\n💲 Ваш остаток: {bal} токенов.\n\n🔗 Ссылка (нажми, чтобы показать):\n{link}", "en": "🎉 Congrats! You're the first buyer of {title}!\n🔥 80% discount applied!\nCharged: {price} tokens.\n💲 Your balance: {bal} tokens.\n\n🔗 Link (tap to reveal):\n{link}"},
+    "shop_bought":           {"ru": "✅ Спасибо за покупку фула {title}!\n💰 Списано: {price} токенов. Остаток: {bal} токенов.\n\n🔗 Ссылка (нажми, чтобы показать):\n{link}", "en": "✅ Thanks for purchasing {title}!\n💰 Charged: {price} tokens. Balance: {bal} tokens.\n\n🔗 Link (tap to reveal):\n{link}"},
+    "shop_prem_free":        {"ru": "👑 Премиум-доступ применен!\n\n✅ Вы получили фулл {title} бесплатно по подписке!\n\n🔗 Ссылка (нажми, чтобы показать):\n{link}", "en": "👑 Premium access applied!\n\n✅ You received {title} for free with your subscription!\n\n🔗 Link (tap to reveal):\n{link}"},
+    "shop_fulltoken_used":   {"ru": "✅ Успешная покупка фулла {title} за фулловый токен!\n\n🔗 Ссылка (нажми, чтобы показать):\n{link}", "en": "✅ Purchased {title} using a full token!\n\n🔗 Link (tap to reveal):\n{link}"},
+    "shop_fulltoken_ask":    {"ru": "❓ У вас есть фулловый токен. Использовать его или заплатить обычными токенами ({price} шт.)?", "en": "❓ You have a full token. Use it or pay with regular tokens ({price})?"},
+    "shop_btn_usefull":      {"ru": "📦 Использовать Фулловый токен", "en": "📦 Use Full Token"},
+    "shop_btn_usenorm":      {"ru": "🪙 Обычными ({price} токенов)",  "en": "🪙 Regular ({price} tokens)"},
+    "shop_fulltoken_gone":   {"ru": "❌ У вас больше нет фулловых токенов.", "en": "❌ You have no more full tokens."},
+    "ref_bonus_msg":         {"ru": "💰 Реферальный бонус!\nВаш реферал совершил покупку.\n🎁 Вам начислено {n} токенов (15% от покупки).", "en": "💰 Referral bonus!\nYour referral made a purchase.\n🎁 You received {n} tokens (15% of purchase)."},
+    # ── уникальный магазин ────────────────────────────────────────────────
+    "ushop_empty":           {"ru": "📭 Уникальный магазин пуст.", "en": "📭 Unique shop is empty."},
+    "ushop_title":           {"ru": "💎 <b>Уникальный магазин</b>\nНажми на товар для описания и покупки:", "en": "💎 <b>Unique Shop</b>\nTap an item to see description and purchase:"},
+    "ushop_no_sub":          {"ru": "🔒 <i>Недоступно по подписке — только за токены</i>", "en": "🔒 <i>Not available with subscription — tokens only</i>"},
+    "ushop_amount":          {"ru": "📦 Осталось: <b>{n}</b>", "en": "📦 In stock: <b>{n}</b>"},
+    "ushop_bought":          {"ru": "👥 Купили за токены: <b>{n}</b>", "en": "👥 Purchased with tokens: <b>{n}</b>"},
+    "ushop_btn_sub":         {"ru": "💎 Получить по подписке (бесплатно)", "en": "💎 Get with subscription (free)"},
+    "ushop_btn_ytokens":     {"ru": "💎 Купить за {n} уник. токенов", "en": "💎 Buy for {n} unique tokens"},
+    "ushop_btn_tokens":      {"ru": "🪙 Купить за {n} обычных токенов", "en": "🪙 Buy for {n} regular tokens"},
+    "ushop_no_tokens_y":     {"ru": "❌ Недостаточно уникальных токенов! Нужно: {n}.", "en": "❌ Not enough unique tokens! Required: {n}."},
+    "ushop_no_tokens_t":     {"ru": "❌ Недостаточно токенов! Нужно: {n}.", "en": "❌ Not enough tokens! Required: {n}."},
+    "ushop_bought_y":        {"ru": "💎 <b>Успешная покупка!</b>\nВы приобрели: <b>{title}</b> за {n} уникальных токенов.\nВсё уже начислено в профиль.", "en": "💎 <b>Purchase successful!</b>\nYou got: <b>{title}</b> for {n} unique tokens.\nEverything has been added to your profile."},
+    "ushop_bought_t":        {"ru": "🪙 <b>Успешная покупка!</b>\nВы приобрели: <b>{title}</b> за {n} обычных токенов.\nВсё уже начислено в профиль.", "en": "🪙 <b>Purchase successful!</b>\nYou got: <b>{title}</b> for {n} regular tokens.\nEverything has been added to your profile."},
+    "ushop_bought_sub":      {"ru": "💎 <b>Получено по подписке!</b>\nВы получили: <b>{title}</b> бесплатно по уникальной подписке.\nВсё уже начислено в профиль.", "en": "💎 <b>Received via subscription!</b>\nYou got: <b>{title}</b> for free with your unique subscription.\nEverything has been added to your profile."},
+    "ushop_no_sub_err":      {"ru": "❌ Этот товар недоступен по подписке — только за токены.", "en": "❌ This item is not available with subscription — tokens only."},
+    "ushop_gone":            {"ru": "❌ Товар закончился.", "en": "❌ Item is out of stock."},
+    "ushop_bad_cmd":         {"ru": "❌ Команда товара настроена неверно. Напиши админу.", "en": "❌ Item command is misconfigured. Contact admin."},
+    "ushop_error":           {"ru": "⚠️ Произошла ошибка при выдаче товара. Напиши админу.", "en": "⚠️ An error occurred while issuing the item. Contact admin."},
+    "ushop_no_uprem":        {"ru": "❌ У вас нет активной уникальной подписки.", "en": "❌ You don't have an active unique subscription."},
+    # ── рефералы ─────────────────────────────────────────────────────────
+    "ref_title":    {"ru": "👥 <b>Реферальная система</b>", "en": "👥 <b>Referral System</b>"},
+    "ref_link_txt": {"ru": "Приглашай друзей по своей ссылке:", "en": "Invite friends with your link:"},
+    "ref_bonus_txt":{"ru": "🎁 За каждого приглашенного (после подписки на канал) — <b>{n} токенов</b>!", "en": "🎁 For each invited friend (after subscribing to the channel) — <b>{n} tokens</b>!"},
+    "ref_income_txt":{"ru": "💰 А также вы получаете <b>15% дохода</b> от трат ваших рефералов токенами в обычном магазине!", "en": "💰 You also receive <b>15% income</b> from your referrals' token purchases in the regular shop!"},
+    "ref_new_user": {"ru": "🎉 По вашей рефке зарегистрировался новый пользователь!\n❤️ Вам начислено {n} токенов!", "en": "🎉 A new user registered with your referral link!\n❤️ You received {n} tokens!"},
+    # ── лотерея ───────────────────────────────────────────────────────────
+    "lottery_title":     {"ru": "🎰 <b>Лотерея</b>", "en": "🎰 <b>Lottery</b>"},
+    "lottery_prize":     {"ru": "🏆 Приз: <b>{total} токенов</b> ({base} + {pool} от взносов)", "en": "🏆 Prize: <b>{total} tokens</b> ({base} + {pool} from entries)"},
+    "lottery_cost":      {"ru": "🎟 Участие: <b>{cost}</b>", "en": "🎟 Entry: <b>{cost}</b>"},
+    "lottery_cost_auto": {"ru": " (растёт вместе с призом)", "en": " (grows with prize)"},
+    "lottery_players":   {"ru": "👥 Участников: <b>{n}</b> (минимум для розыгрыша: {min})", "en": "👥 Players: <b>{n}</b> (minimum to draw: {min})"},
+    "lottery_time":      {"ru": "⏱ До конца розыгрыша: <b>{h} ч {m} мин</b>", "en": "⏱ Time left: <b>{h}h {m}min</b>"},
+    "lottery_desc_paid": {"ru": "Половина токенов за участие добавляется к призу.", "en": "Half the entry tokens are added to the prize."},
+    "lottery_desc_free": {"ru": "Участие бесплатное.", "en": "Entry is free."},
+    "lottery_joined":    {"ru": "\n\n✅ Ты уже участвуешь в этом розыгрыше!", "en": "\n\n✅ You're already in this draw!"},
+    "lottery_btn_join":  {"ru": "🎟 Участвовать ({cost})", "en": "🎟 Join ({cost})"},
+    "lottery_btn_free":  {"ru": "🎟 Участвовать (бесплатно)", "en": "🎟 Join (free)"},
+    "lottery_btn_notif_off": {"ru": "🔕 Отключить уведомления", "en": "🔕 Disable notifications"},
+    "lottery_btn_notif_on":  {"ru": "🔔 Включить уведомления",  "en": "🔔 Enable notifications"},
+    "lottery_notif_off": {"ru": "Уведомления о крупных лотереях отключены 🔕!", "en": "Big lottery notifications disabled 🔕!"},
+    "lottery_notif_on":  {"ru": "Уведомления о крупных лотереях включены 🔔!", "en": "Big lottery notifications enabled 🔔!"},
+    "lottery_win":       {"ru": "🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено: <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?", "en": "🎉 <b>You won the lottery!</b>\n🏆 You received: <b>{prize} tokens</b>.\n\nWant to try again?"},
+    "lottery_lose":      {"ru": "😔 В этот раз удача была не на твоей стороне. Победитель уже получил приз.\n\nХотите ещё попытать удачу?", "en": "😔 Luck wasn't on your side this time. The winner has already received the prize.\n\nWant to try again?"},
+    "lottery_no_players":{"ru": "😔 В розыгрыше не набралось нужное число участников ({cur} из {min}). Приз не разыгран.{refund}\n\nХотите ещё попытать удачу?", "en": "😔 Not enough players ({cur} of {min}). No prize drawn.{refund}\n\nWant to try again?"},
+    "lottery_refund":    {"ru": " Тебе вернули <b>{n} токен(ов)</b>.", "en": " You were refunded <b>{n} token(s)</b>."},
+    "lottery_joined_msg":{"ru": "🎟 Ты участвуешь в лотерее!{charged}\nРезультат придёт сюда, когда закончится розыгрыш.", "en": "🎟 You're in the lottery!{charged}\nResults will arrive here when the draw ends."},
+    "lottery_charged":   {"ru": " Списано: <b>{n} токен(ов)</b>.", "en": " Charged: <b>{n} token(s)</b>."},
+    "lottery_free_entry":{"ru": " Участие бесплатное.", "en": " Entry is free."},
+    "lottery_already":   {"ru": "✅ Ты уже участвуешь!", "en": "✅ You're already in!"},
+    "lottery_ended":     {"ru": "⏳ Этот розыгрыш уже завершён.", "en": "⏳ This draw has already ended."},
+    "lottery_ending":    {"ru": "⏳ Розыгрыш уже заканчивается.", "en": "⏳ The draw is about to end."},
+    "lottery_no_tokens": {"ru": "❌ Недостаточно токенов! Участие стоит {n}.", "en": "❌ Not enough tokens! Entry costs {n}."},
+    "lottery_price_changed": {"ru": "💱 Цена участия изменилась: теперь {cost}. Проверь и нажми «Участвовать» ещё раз.", "en": "💱 Entry price changed: now {cost}. Check and tap join again."},
+    "lottery_soon":      {"ru": "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", "en": "⏳ A new draw will start soon. Check back later!"},
+    "lottery_btn_again": {"ru": "🎰 Попытать удачу ещё раз", "en": "🎰 Try again"},
+    # ── рулетка ───────────────────────────────────────────────────────────
+    "roulette_intro":    {"ru": "🎲 <b>Рулетка 50/50</b>\n\nСтавишь токены — и либо удваиваешь их, либо теряешь.\nВыиграл: получаешь ставку ×2 (ставка 4 → на баланс вернётся 8).\nПроиграл: ставка сгорает.\n\n💰 Ставка: от <b>{min}</b> до <b>{max}</b> токенов.\nТвой баланс: <b>{bal}</b> токенов.\n\n✍️ Напиши в чат, сколько токенов ставишь:", "en": "🎲 <b>Roulette 50/50</b>\n\nBet tokens — either double them or lose them.\nWin: get bet ×2 (bet 4 → receive 8).\nLose: bet is gone.\n\n💰 Bet: from <b>{min}</b> to <b>{max}</b> tokens.\nYour balance: <b>{bal}</b> tokens.\n\n✍️ Type how many tokens you want to bet:"},
+    "roulette_win":      {"ru": "🎉 <b>Победа!</b> Ставка {bet} → <b>+{bet}</b> токенов.\nБаланс: <b>{bal}</b>", "en": "🎉 <b>Win!</b> Bet {bet} → <b>+{bet}</b> tokens.\nBalance: <b>{bal}</b>"},
+    "roulette_lose":     {"ru": "💥 <b>Проигрыш.</b> Ставка {bet} токенов сгорела.\nБаланс: <b>{bal}</b>", "en": "💥 <b>Loss.</b> Bet of {bet} tokens burned.\nBalance: <b>{bal}</b>"},
+    "roulette_bad_bet":  {"ru": "Напиши число от {min} до {max} — сколько токенов ставишь.", "en": "Type a number from {min} to {max} — how many tokens to bet."},
+    "roulette_no_tokens":{"ru": "❌ Не хватает токенов. Баланс: <b>{bal}</b>. Напиши ставку поменьше или нажми другую кнопку меню.", "en": "❌ Not enough tokens. Balance: <b>{bal}</b>. Try a smaller bet or choose another menu option."},
+    "roulette_btn_again":{"ru": "🔁 Сыграть снова ({n} токен.)", "en": "🔁 Play again ({n} tok.)"},
+    "roulette_btn_new":  {"ru": "💰 Другая ставка", "en": "💰 Different bet"},
+    # ── обмены ────────────────────────────────────────────────────────────
+    "ex_menu_text":      {"ru": "🔄 <b>Обмены ссылками</b>\nВыставляй свой обмен или бери чужой. Чтобы провести обмен, нужно заплатить {n} токен.", "en": "🔄 <b>Link Exchanges</b>\nList your exchange or take someone else's. An exchange costs {n} token."},
+    "ex_btn_new":        {"ru": "➕ Выставить обмен",   "en": "➕ Create exchange"},
+    "ex_btn_all":        {"ru": "📋 Все обмены",         "en": "📋 All exchanges"},
+    "ex_btn_search":     {"ru": "🔍 Поиск",              "en": "🔍 Search"},
+    "ex_btn_my":         {"ru": "📦 Мои обмены",         "en": "📦 My exchanges"},
+    "ex_btn_cancel":     {"ru": "❌ Отмена",             "en": "❌ Cancel"},
+    "ex_btn_back":       {"ru": "⬅️ В обмены",           "en": "⬅️ Back to exchanges"},
+    "ex_btn_delete":     {"ru": "🗑 Удалить",            "en": "🗑 Delete"},
+    "ex_btn_take":       {"ru": "🤝 Провести обмен",     "en": "🤝 Make exchange"},
+    "ex_btn_complain":   {"ru": "🚨 Пожаловаться",       "en": "🚨 Complain"},
+    "ex_give_ask":       {"ru": "Что ты <b>отдаёшь</b>? (например: Пантера)", "en": "What are you <b>giving</b>? (e.g. Pantera)"},
+    "ex_want_ask":       {"ru": "Что хочешь <b>получить</b>? (например: Сердцеед)", "en": "What do you want to <b>receive</b>? (e.g. Heartthrob)"},
+    "ex_link_ask":       {"ru": "Отправь <b>свою ссылку</b> для обмена.\n{rule}", "en": "Send <b>your link</b> for the exchange.\n{rule}"},
+    "ex_created":        {"ru": "✅ Обмен #{id} выставлен: <b>{give}</b> → <b>{want}</b>.\nТебе придёт уведомление, когда кто-то возьмётся за него.", "en": "✅ Exchange #{id} created: <b>{give}</b> → <b>{want}</b>.\nYou'll be notified when someone takes it."},
+    "ex_too_many":       {"ru": "У тебя уже {n} открытых обменов. Удали лишний.", "en": "You already have {n} open exchanges. Delete one first."},
+    "ex_own":            {"ru": "Это твой обмен.", "en": "This is your exchange."},
+    "ex_taken":          {"ru": "Этот обмен уже забрали или удалили.", "en": "This exchange has already been taken or deleted."},
+    "ex_no_tokens":      {"ru": "Нужно {n} токен для обмена.", "en": "You need {n} token to make an exchange."},
+    "ex_too_late":       {"ru": "Не успел — этот обмен уже забрали.", "en": "Too late — this exchange has already been taken."},
+    "ex_no_balance":     {"ru": "Не хватает токенов (нужно {n}).", "en": "Not enough tokens (need {n})."},
+    "ex_done_taker":     {"ru": "🤝 <b>Обмен #{id}</b>: {give} → {want}\nСсылка обменщика (ID <code>{owner}</code>):\n{link}\n\nСписано {n} токен.", "en": "🤝 <b>Exchange #{id}</b>: {give} → {want}\nOwner's link (ID <code>{owner}</code>):\n{link}\n\nCharged {n} token."},
+    "ex_notif_owner":    {"ru": "🔔 ID <code>{uid}</code> взялся за твой обмен #{id}: {give} → {want}\nЕго ссылка:\n{link}", "en": "🔔 ID <code>{uid}</code> took your exchange #{id}: {give} → {want}\nTheir link:\n{link}"},
+    "ex_view_open":      {"ru": "🔄 <b>Обмен #{id}</b>\nОтдаёт: <b>{give}</b>\nХочет: <b>{want}</b>\nСтоимость обмена: {n} токен", "en": "🔄 <b>Exchange #{id}</b>\nGiving: <b>{give}</b>\nWants: <b>{want}</b>\nExchange cost: {n} token"},
+    "ex_view_done_own":  {"ru": "✅ <b>Обмен #{id} завершен!</b>\n🆔 ID обменщика: <code>{uid}</code>\n🔗 Ссылка взявшегося:\n{link}", "en": "✅ <b>Exchange #{id} completed!</b>\n🆔 Taker ID: <code>{uid}</code>\n🔗 Taker's link:\n{link}"},
+    "ex_view_done_take": {"ru": "✅ <b>Обмен #{id} завершен!</b>\n🆔 ID владельца: <code>{uid}</code>\n🔗 Ссылка владельца:\n{link}", "en": "✅ <b>Exchange #{id} completed!</b>\n🆔 Owner ID: <code>{uid}</code>\n🔗 Owner's link:\n{link}"},
+    "ex_search_ask":     {"ru": "Напиши слово (или два): <b>Пантера</b>, <b>Сердцеед</b>\nИли ID человека / номер обмена — только цифры.", "en": "Type a word (or two): <b>Pantera</b>, <b>Heartthrob</b>\nOr person ID / exchange number — digits only."},
+    "ex_my_empty":       {"ru": "📦 У вас нет активных обменов.", "en": "📦 You have no active exchanges."},
+    "ex_my_title":       {"ru": "📦 <b>Ваши обмены:</b>", "en": "📦 <b>Your exchanges:</b>"},
+    "ex_deleted":        {"ru": "🗑 Обмен удален.", "en": "🗑 Exchange deleted."},
+    "ex_unavail":        {"ru": "Этот обмен уже недоступен.", "en": "This exchange is no longer available."},
+    "ex_link_rule":      {"ru": "⚠️ Ссылка должна быть с mega.nz или cloud.mail.ru", "en": "⚠️ Link must be from mega.nz or cloud.mail.ru"},
+    "ex_link_error":     {"ru": "❌ Неверная ссылка. ⚠️ Ссылка должна быть с mega.nz или cloud.mail.ru", "en": "❌ Invalid link. ⚠️ Link must be from mega.nz or cloud.mail.ru"},
+    "ex_complain_confirm": {"ru": "⚠️ <b>Вы уверены, что хотите подать жалобу на этого пользователя?</b>\n\n• При ложной жалобе вы получите <b>1 предупреждение</b>.\n• Если вас реально обманули — смело отправляйте жалобу.", "en": "⚠️ <b>Are you sure you want to file a complaint against this user?</b>\n\n• A false complaint will give you <b>1 warning</b>.\n• If you were genuinely scammed — go ahead and complain."},
+    "ex_complain_sent":  {"ru": "🚨 Жалоба отправлена админу.", "en": "🚨 Complaint sent to admin."},
+    "ex_complain_dup":   {"ru": "Ты уже отправил жалобу по этому обмену.", "en": "You already filed a complaint for this exchange."},
+    "ex_restricted_notif": {"ru": "🚨 На вас подана жалоба по обмену #{id}. Обмены и покупки в магазине временно ограничены до решения администратора.", "en": "🚨 A complaint was filed against you for exchange #{id}. Exchanges and purchases are temporarily restricted."},
+    # ── промокод ──────────────────────────────────────────────────────────
+    "promo_ask":         {"ru": "🎟 Введите промокод:", "en": "🎟 Enter promo code:"},
+    "promo_ok_tokens":   {"ru": "✅ Промокод активирован!\n🎁 Вам зачислено: <b>{n} токенов</b>", "en": "✅ Promo code activated!\n🎁 You received: <b>{n} tokens</b>"},
+    "promo_ok_premium":  {"ru": "✅ Промокод активирован!\n👑 Премиум на <b>{n} дней</b> (до {date})!", "en": "✅ Promo code activated!\n👑 Premium for <b>{n} days</b> (until {date})!"},
+    "promo_not_found":   {"ru": "❌ Неверный или несуществующий промокод.", "en": "❌ Invalid or non-existent promo code."},
+    "promo_used":        {"ru": "❌ Вы уже активировали этот промокод!", "en": "❌ You have already activated this promo code!"},
+    "promo_limit":       {"ru": "❌ У этого промокода закончились активации.", "en": "❌ This promo code has run out of activations."},
+    "promo_empty":       {"ru": "❌ Промокод не указан.", "en": "❌ No promo code entered."},
+    "promo_bad_reward":  {"ru": "❌ Неизвестный тип награды у промокода.", "en": "❌ Unknown reward type for this promo code."},
+    # ── топ ───────────────────────────────────────────────────────────────
+    "top_menu":          {"ru": "🏆 <b>Выберите категорию топа:</b>", "en": "🏆 <b>Choose a leaderboard:</b>"},
+    "top_btn_refs":      {"ru": "👥 Топ по рефералам", "en": "👥 Top by referrals"},
+    "top_btn_lottery":   {"ru": "🎰 Топ по лотерее",   "en": "🎰 Top by lottery"},
+    "top_btn_roulette":  {"ru": "🎲 Топ по рулетке",   "en": "🎲 Top by roulette"},
+    "top_btn_back":      {"ru": "⬅️ Назад к выбору топов", "en": "⬅️ Back to leaderboards"},
+    "top_refs_title":    {"ru": "🏆 <b>Топ-10 по рефералам</b>",          "en": "🏆 <b>Top-10 by referrals</b>"},
+    "top_lot_title":     {"ru": "🏆 <b>Топ-10 по победам в лотерее</b>",  "en": "🏆 <b>Top-10 by lottery wins</b>"},
+    "top_rl_title":      {"ru": "🏆 <b>Топ-10 по победам в рулетке</b>",  "en": "🏆 <b>Top-10 by roulette wins</b>"},
+    "top_unit_refs":     {"ru": "реф.",   "en": "refs."},
+    "top_unit_lot":      {"ru": "побед",  "en": "wins"},
+    "top_unit_rl":       {"ru": "побед",  "en": "wins"},
+    "top_empty":         {"ru": "Пока пусто.", "en": "Empty for now."},
+    "top_reset_timer":   {"ru": "⏳ <b>Сброс топа:</b> через {d} дн. {h} ч.", "en": "⏳ <b>Leaderboard reset:</b> in {d}d {h}h"},
+    "top_reset_soon":    {"ru": "⏳ <b>Сброс топа:</b> скоро сброс...", "en": "⏳ <b>Leaderboard reset:</b> coming soon..."},
+    "top_reward_txt":    {"ru": "🎁 <b>Награда 1 места (на выбор):</b> Премиум на {pd} дней <u>ИЛИ</u> {yt} уникальных токена!", "en": "🎁 <b>1st place reward (choose):</b> Premium for {pd} days <u>OR</u> {yt} unique tokens!"},
+    # ── подписки ──────────────────────────────────────────────────────────
+    "subs_menu":         {"ru": "💳 <b>Подписки</b>\nВыбери тип подписки:", "en": "💳 <b>Subscriptions</b>\nChoose subscription type:"},
+    "sub_btn_premium":   {"ru": "👑 Премиум-подписка",   "en": "👑 Premium subscription"},
+    "sub_btn_unique":    {"ru": "💎 Уникальная подписка", "en": "💎 Unique subscription"},
+    "sub_btn_back":      {"ru": "⬅️ Назад",              "en": "⬅️ Back"},
+    "sub_prem_text":     {"ru": "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n\n<b>Преимущества:</b>\n• Покупай АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно в обычном магазине!\n\n💳 <b>Способ 1:</b> Заплатить 50 Звёзд\n(любым подарком на профиль @ucu52)\n\n📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 фото в комментарии в тт\nПодробнее: https://t.me/JmcDeveloper/18\n\n<i>Если была хотя бы одна дублированная фото — подписка не выдаётся.</i>\nГотово? Отправляй сюда: https://t.me/JmcDeveloper?direct\n<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>", "en": "👑 <b>Premium subscription for 1 MONTH (30 days)</b>\n\n<b>Benefits:</b>\n• Buy ANY items for free in the regular shop!\n\n💳 <b>Option 1:</b> Pay 50 Stars\n(any gift to @ucu52)\n\n📸 <b>Option 2 (100 photos):</b> Post 100 photos in TT comments\nDetails: https://t.me/JmcDeveloper/18\n\n<i>If even one photo is a duplicate — subscription is not granted.</i>\nDone? Send here: https://t.me/JmcDeveloper?direct\n<b>(MENTION IT'S FOR PREMIUM SUBSCRIPTION)</b>"},
+    "sub_unique_text":   {"ru": "💎 <b>Уникальная подписка на 1 МЕСЯЦ (30 дней)</b>\n\n<b>Преимущества:</b>\n• Покупай любые товары в 💎 Уникальном магазине бесплатно!\n• <i>Работает только для товаров без метки «только за токены».</i>\n\n💳 <b>Как купить:</b> Заплатить 100 Звёзд\n(любым подарком на профиль @ucu52)", "en": "💎 <b>Unique subscription for 1 MONTH (30 days)</b>\n\n<b>Benefits:</b>\n• Get any items in 💎 Unique Shop for free!\n• <i>Works only for items without the «tokens only» tag.</i>\n\n💳 <b>How to buy:</b> Pay 100 Stars\n(any gift to @ucu52)"},
+    "sub_btn_buy_stars_50":  {"ru": "⭐ Отправить Подарок 50 Stars",  "en": "⭐ Send Gift 50 Stars"},
+    "sub_btn_buy_stars_100": {"ru": "⭐ Отправить Подарок 100 Stars", "en": "⭐ Send Gift 100 Stars"},
+    # ── как получить токены ───────────────────────────────────────────────
+    "howto_menu":        {"ru": "🪙 <b>Как получить токены?</b>\nВыбери тип токена:", "en": "🪙 <b>How to get tokens?</b>\nChoose token type:"},
+    "howto_btn_tokens":  {"ru": "🪙 Обычные токены",   "en": "🪙 Regular tokens"},
+    "howto_btn_ytokens": {"ru": "💎 Уникальные токены", "en": "💎 Unique tokens"},
+    "howto_btn_ftokens": {"ru": "📦 Фулловые токены",   "en": "📦 Full tokens"},
+    "howto_btn_back":    {"ru": "⬅️ Назад",             "en": "⬅️ Back"},
+    "howto_tokens_text": {"ru": "🪙 <b>Как получить обычные токены?</b>\n\n1. Возьмите фото: https://t.me/JmcDeveloper/11\n\n2. Оставляйте его в комментариях под постами/ответами другим людям <u>(под тему сестра и брата)</u>.\n\n3. Отправляйте доказательства (скриншоты) в директ канала: https://t.me/JmcDeveloper?direct\n\n💰 <b>1 отправка фото в комментариях = 1 токен!</b>\n\n📖 Детально расписал тут: https://t.me/JmcDeveloper/18\n<i>(не выдам токены если не посмотрите 👆)</i>", "en": "🪙 <b>How to get regular tokens?</b>\n\n1. Take a photo: https://t.me/JmcDeveloper/11\n\n2. Post it in comments under posts/replies to others <u>(topic: sister and brother)</u>.\n\n3. Send proof (screenshots) to the channel DM: https://t.me/JmcDeveloper?direct\n\n💰 <b>1 photo posted in comments = 1 token!</b>\n\n📖 Detailed guide: https://t.me/JmcDeveloper/18\n<i>(tokens won't be given if you don't read this 👆)</i>"},
+    "howto_ytokens_text":{"ru": "💎 <b>Как получить уникальные токены?</b>\n\nИх можно только купить: <b>15 звёзд = 1 уникальный токен.</b>\n\n<b>Как купить?</b> Кинь любой подарок стоимостью 15 звёзд на аккаунт @ucu52.\n\n<b>Преимущества:</b>\n• Там выходят фулы на 1 день позже чем в стандартный магазин\n• Уникальные товары: аура, фулловые токены и другое", "en": "💎 <b>How to get unique tokens?</b>\n\nYou can only buy them: <b>15 Stars = 1 unique token.</b>\n\n<b>How to buy?</b> Send any gift worth 15 Stars to @ucu52.\n\n<b>Benefits:</b>\n• Items appear 1 day later than in the regular shop\n• Unique items: aura, full tokens and more"},
+    "howto_ftokens_text":{"ru": "📦 <b>Как получить фулловые токены?</b>\n\nИх можно купить в <b>💎 Уникальном магазине</b> за уникальные токены (или получить от администратора).\n\n<b>Преимущество:</b>\nПозволяет забрать абсолютно любой фулл в обычном магазине <b>бесплатно</b> — просто используй фулловый токен при покупке!", "en": "📦 <b>How to get full tokens?</b>\n\nYou can buy them in <b>💎 Unique Shop</b> for unique tokens (or receive them from admin).\n\n<b>Benefit:</b>\nLets you grab any item in the regular shop <b>for free</b> — just use a full token at checkout!"},
+}
+
+
+def t(key: str, lang: str = "ru", **kwargs) -> str:
+  """Возвращает перевод строки. Подставляет kwargs через .format()."""
+  s = STRINGS.get(key, {}).get(lang) or STRINGS.get(key, {}).get("ru", key)
+  if kwargs:
+    try:
+      s = s.format(**kwargs)
+    except KeyError:
+      pass
+  return s
+
+
+async def get_lang(user_id: int) -> str:
+  """Возвращает язык пользователя ('ru' или 'en')."""
+  async with connect() as db:
+    async with db.execute(
+        "SELECT lang FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+      row = await cur.fetchone()
+  return (row[0] if row and row[0] in ("ru", "en") else "ru")
+
+
+async def set_lang(user_id: int, lang: str) -> None:
+  async with connect() as db:
+    await ensure_user(db, user_id)
+    await db.execute(
+        "UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id)
+    )
+    await db.commit()
+
+
 def connect():
   """Подключение к БД с увеличенным ожиданием (против 'database is locked')."""
   return aiosqlite.connect(DB_NAME, timeout=30)
@@ -204,7 +462,10 @@ async def init_db():
             aura_expires TEXT DEFAULT NULL,
             lottery_wins INTEGER DEFAULT 0,
             exchanges INTEGER DEFAULT 0,
-            restricted_until TEXT DEFAULT NULL
+            restricted_until TEXT DEFAULT NULL,
+            u_premium INTEGER DEFAULT 0,
+            u_premium_expires TEXT DEFAULT NULL,
+            lang TEXT DEFAULT 'ru'
         );
     """
     )
@@ -233,7 +494,8 @@ async def init_db():
             command TEXT,
             description TEXT DEFAULT NULL,
             photo_id TEXT DEFAULT NULL,
-            token_buyers INTEGER DEFAULT 0
+            token_buyers INTEGER DEFAULT 0,
+            no_sub INTEGER DEFAULT 0
         );
     """
     )
@@ -284,7 +546,9 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS roulette_state (
             user_id INTEGER PRIMARY KEY,
             games INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0
+            wins INTEGER DEFAULT 0,
+            session_start INTEGER DEFAULT 0,
+            session_last_bet INTEGER DEFAULT 0
         );
     """
     )
@@ -342,6 +606,9 @@ async def init_db():
             "aura_percent": "INTEGER DEFAULT 0",
             "aura_expires": "TEXT DEFAULT NULL",
             "lottery_wins": "INTEGER DEFAULT 0",
+            "u_premium": "INTEGER DEFAULT 0",
+            "u_premium_expires": "TEXT DEFAULT NULL",
+            "lang": "TEXT DEFAULT 'ru'",
         },
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
@@ -354,6 +621,7 @@ async def init_db():
             "description": "TEXT DEFAULT NULL",
             "photo_id": "TEXT DEFAULT NULL",
             "token_buyers": "INTEGER DEFAULT 0",
+            "no_sub": "INTEGER DEFAULT 0",
         },
         "lottery_participants": {"paid": "INTEGER DEFAULT NULL"},
         "lottery_rounds": {"cost_fixed": "INTEGER DEFAULT 0"},
@@ -364,6 +632,8 @@ async def init_db():
         "roulette_state": {
             "games": "INTEGER DEFAULT 0",
             "wins": "INTEGER DEFAULT 0",
+            "session_start": "INTEGER DEFAULT 0",
+            "session_last_bet": "INTEGER DEFAULT 0",
         },
     }
     for table, columns in migrations.items():
@@ -771,24 +1041,26 @@ router.message.outer_middleware(SubscribeMiddleware())
 router.callback_query.outer_middleware(SubscribeMiddleware())
 
 
-def get_main_keyboard(user_id):
+def get_main_keyboard(user_id, lang: str = "ru"):
+  def b(key): return KeyboardButton(text=t(key, lang))
   kb = [
-      [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="🛒 Магазин")],
-      [KeyboardButton(text="💎 Уникальный магазин")],
-      [
-          KeyboardButton(text="👥 Реферальная система"),
-          KeyboardButton(text="🏆 Топ игроков"),
-      ],
-      [
-          KeyboardButton(text="🪙 Как получить токены?"),
-          KeyboardButton(text="👑 Премиум-подписка"),
-      ],
-      [KeyboardButton(text="🔄 Обмены"), KeyboardButton(text="🎰 Лотерея")],
-      [KeyboardButton(text="🎲 Рулетка")],
+      [b("btn_profile"),  b("btn_shop")],
+      [b("btn_ushop")],
+      [b("btn_refs"),     b("btn_top")],
+      [b("btn_howto"),    b("btn_subs")],
+      [b("btn_exchange"), b("btn_lottery")],
+      [b("btn_roulette")],
   ]
   if user_id == ADMIN_ID:
-    kb.append([KeyboardButton(text="⚙️ Админ-панель")])
+    kb.append([b("btn_admin")])
   return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+# Все возможные тексты кнопок меню (ru + en) — для диспатча в menu_router
+_ALL_MENU_TEXTS: set[str] = {t(k, lg) for k in (
+    "btn_profile","btn_shop","btn_ushop","btn_refs","btn_top",
+    "btn_howto","btn_subs","btn_exchange","btn_lottery","btn_roulette","btn_admin",
+) for lg in ("ru","en")} | {"🛍 Магазин"}
 
 
 # --- ВЫДАЧА ТОКЕНОВ, ПРЕМИУМА, ПРОМОКОДЫ ---
@@ -851,6 +1123,37 @@ async def apply_premium(db, user_id: int, days: int) -> datetime.datetime:
 async def grant_premium(target_id: int, days: int) -> datetime.datetime:
   async with connect() as db:
     new_expire = await apply_premium(db, target_id, days)
+    await db.commit()
+  return new_expire
+
+
+def u_premium_active(u_prem, expires_str) -> bool:
+  if u_prem != 1:
+    return False
+  exp = parse_dt(expires_str)
+  return exp is None or exp > datetime.datetime.now()
+
+
+async def grant_u_premium(target_id: int, days: int) -> datetime.datetime:
+  """Выдаёт/продлевает уникальную подписку."""
+  now = datetime.datetime.now()
+  async with connect() as db:
+    await ensure_user(db, target_id)
+    async with db.execute(
+        "SELECT u_premium, u_premium_expires FROM users WHERE user_id = ?",
+        (target_id,),
+    ) as cur:
+      row = await cur.fetchone()
+    base = now
+    if row and row[0] == 1:
+      cur_exp = parse_dt(row[1])
+      if cur_exp and cur_exp > now:
+        base = cur_exp
+    new_expire = base + datetime.timedelta(days=days)
+    await db.execute(
+        "UPDATE users SET u_premium = 1, u_premium_expires = ? WHERE user_id = ?",
+        (new_expire.strftime(DT_FORMAT), target_id),
+    )
     await db.commit()
   return new_expire
 
@@ -960,11 +1263,26 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
   if referrer_id and await is_subscribed(bot, user_id):
     await activate_referral(bot, user_id)
 
-  await message.answer(
-      "👋 Привет! Добро пожаловать в бота. Выбирай нужный раздел на клавиатуре"
-      " ниже:",
-      reply_markup=get_main_keyboard(user_id),
-  )
+  if existing_user is None:
+    # Новый пользователь — предлагаем выбрать язык
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="setlang_ru"),
+                InlineKeyboardButton(text="🇬🇧 English", callback_data="setlang_en"),
+            ]
+        ]
+    )
+    await message.answer(
+        t("choose_lang", "ru"),  # двуязычная фраза уже в словаре
+        reply_markup=kb,
+    )
+  else:
+    lang = await get_lang(user_id)
+    await message.answer(
+        t("welcome", lang),
+        reply_markup=get_main_keyboard(user_id, lang),
+    )
 
 
 @router.message(Command("cancel"))
@@ -1145,6 +1463,57 @@ async def cmd_untoken(message: Message, command: CommandObject):
       f"✅ У <code>{target_id}</code> забрано до <b>{amount}</b> токенов."
       f" Баланс: <b>{new_balance}</b>."
   )
+
+
+@router.message(Command("upremium"))
+async def cmd_upremium(message: Message, command: CommandObject, bot: Bot):
+  """Выдать/продлить уникальную подписку. /upremium [дни] [ID]"""
+  if await deny(message):
+    return
+  args = [a for a in (command.args or "").split() if a.lower() != "add"]
+  if len(args) != 2 or not all(a.isdigit() for a in args) or int(args[0]) <= 0:
+    await message.answer(
+        "ℹ️ Использование: <code>/upremium [дни] [ID]</code>\n"
+        "Пример: <code>/upremium 30 5681420389</code>"
+    )
+    return
+  days, target_id = int(args[0]), int(args[1])
+  try:
+    new_expire = await grant_u_premium(target_id, days)
+  except Exception as e:
+    logging.exception("Ошибка выдачи уник. подписки")
+    await message.answer(f"❌ Ошибка: {esc(e)}")
+    return
+  formatted = new_expire.strftime("%d.%m.%Y")
+  await message.answer(
+      f"✅ Уникальная подписка выдана <code>{target_id}</code> на {days} дн."
+      f" (до {formatted})."
+  )
+  await safe_send(
+      bot,
+      target_id,
+      f"💎 <b>Вам активирована Уникальная подписка на {days} дней!</b>\n"
+      f"📅 До <b>{formatted}</b>.\n\n"
+      "Теперь любые товары в 💎 Уникальном магазине доступны бесплатно!",
+  )
+
+
+@router.message(Command("uunpremium"))
+async def cmd_uunpremium(message: Message, command: CommandObject):
+  """Снять уникальную подписку. /uunpremium [ID]"""
+  if await deny(message):
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer("ℹ️ Использование: <code>/uunpremium [ID]</code>")
+    return
+  async with connect() as db:
+    await db.execute(
+        "UPDATE users SET u_premium = 0, u_premium_expires = NULL WHERE user_id = ?",
+        (args[0],),
+    )
+    await db.commit()
+  await message.answer(f"✅ Уникальная подписка у <code>{args[0]}</code> снята.")
 
 
 @router.message(Command("unpremium"))
@@ -1843,6 +2212,75 @@ async def back_to_tops(callback: CallbackQuery):
     )
   except Exception:
     pass
+  await callback.answer()
+
+
+# --- ПОДПИСКИ ---
+
+@router.callback_query(F.data == "sub_premium")
+async def sub_premium_cb(callback: CallbackQuery):
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="⭐ Отправить Подарок 50 Stars", url="https://t.me/ucu52")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="sub_back")],
+      ]
+  )
+  text = (
+      "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n\n"
+      "<b>Преимущества:</b>\n"
+      "• Покупай АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно в обычном магазине!\n\n"
+      "💳 <b>Способ 1:</b> Заплатить 50 Звёзд\n"
+      "(любым подарком на профиль @ucu52)\n\n"
+      "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 фото в комментарии в тт\n"
+      "Подробнее: https://t.me/JmcDeveloper/18\n\n"
+      "<i>Если была хотя бы одна дублированная фото — подписка не выдаётся.</i>\n"
+      "Готово? Отправляй сюда: https://t.me/JmcDeveloper?direct\n"
+      "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
+  )
+  try:
+    await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+  except Exception:
+    await callback.message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
+  await callback.answer()
+
+
+@router.callback_query(F.data == "sub_unique")
+async def sub_unique_cb(callback: CallbackQuery):
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="⭐ Отправить Подарок 100 Stars", url="https://t.me/ucu52")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="sub_back")],
+      ]
+  )
+  text = (
+      "💎 <b>Уникальная подписка на 1 МЕСЯЦ (30 дней)</b>\n\n"
+      "<b>Преимущества:</b>\n"
+      "• Покупай любые товары в 💎 Уникальном магазине бесплатно!\n"
+      "• <i>Работает только для товаров, которые продаются за уникальные"
+      " токены. Товары, помеченные как «только за уник. токены», нельзя"
+      " получить по подписке.</i>\n\n"
+      "💳 <b>Как купить:</b> Заплатить 100 Звёзд\n"
+      "(любым подарком на профиль @ucu52)"
+  )
+  try:
+    await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+  except Exception:
+    await callback.message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
+  await callback.answer()
+
+
+@router.callback_query(F.data == "sub_back")
+async def sub_back_cb(callback: CallbackQuery):
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="👑 Премиум-подписка", callback_data="sub_premium")],
+          [InlineKeyboardButton(text="💎 Уникальная подписка", callback_data="sub_unique")],
+      ]
+  )
+  try:
+    await callback.message.edit_text("💳 <b>Подписки</b>\nВыбери тип подписки:", reply_markup=kb)
+  except Exception:
+    await callback.message.answer("💳 <b>Подписки</b>\nВыбери тип подписки:", reply_markup=kb)
   await callback.answer()
 
 
@@ -2607,7 +3045,7 @@ async def back_to_shop(callback: CallbackQuery):
     if buyers_count == 0:
       btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
     else:
-      btn_text = f"📁 {title} — {price} токенов | 👥 {token_buyers} купили"
+      btn_text = f"📁 {title} — {price} токенов"
     keyboard_buttons.append(
         [InlineKeyboardButton(text=btn_text, callback_data=f"desc_{p_id}")]
     )
@@ -2861,29 +3299,47 @@ async def apply_unique_command(user_id: int, title: str, parsed) -> None:
 async def show_unique_product_desc(callback: CallbackQuery):
   """Показывает описание уникального товара и кнопки покупки."""
   up_id = int(callback.data.split("_")[1])
+  user_id = callback.from_user.id
+
   async with connect() as db:
     async with db.execute(
         "SELECT title, price, COALESCE(token_price,0), amount, description,"
-        " photo_id, COALESCE(token_buyers,0) FROM unique_products WHERE id = ?",
+        " photo_id, COALESCE(token_buyers,0), COALESCE(no_sub,0)"
+        " FROM unique_products WHERE id = ?",
         (up_id,),
     ) as cur:
       row = await cur.fetchone()
+    async with db.execute(
+        "SELECT COALESCE(u_premium,0), u_premium_expires FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      urow = await cur.fetchone()
+
   if not row or row[3] <= 0:
     await callback.answer("❌ Товар закончился или удален.", show_alert=True)
     return
-  title, y_price, t_price, amount, description, photo_id, token_buyers = row
+  title, y_price, t_price, amount, description, photo_id, token_buyers, no_sub = row
+  has_u_prem = urow and u_premium_active(urow[0], urow[1]) if urow else False
 
   cap = f"💎 <b>{esc(title)}</b>\n"
   if y_price > 0:
     cap += f"💎 Цена: <b>{y_price} уникальных токенов</b>\n"
   if t_price > 0:
     cap += f"🪙 Или: <b>{t_price} обычных токенов</b>\n"
+  if no_sub:
+    cap += "🔒 <i>Недоступно по подписке — только за токены</i>\n"
   cap += f"📦 Осталось: <b>{amount}</b>\n"
   cap += f"👥 Купили за токены: <b>{token_buyers}</b>\n"
   if description:
     cap += f"\n{description}"
 
   buttons = []
+  # Кнопка «по подписке» — если есть уник. подписка и товар не помечен no_sub
+  if has_u_prem and not no_sub:
+    buttons.append([InlineKeyboardButton(
+        text="💎 Получить по подписке (бесплатно)",
+        callback_data=f"usubget_{up_id}",
+    )])
   if y_price > 0:
     buttons.append([InlineKeyboardButton(
         text=f"💎 Купить за {y_price} уник. токенов",
@@ -2937,6 +3393,71 @@ async def back_to_ushop(callback: CallbackQuery):
         "💎 <b>Уникальный магазин</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
     )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usubget_"))
+async def process_usubget(callback: CallbackQuery):
+  """Получить уникальный товар бесплатно по уникальной подписке."""
+  user_id = callback.from_user.id
+  up_id = int(callback.data.split("_")[1])
+
+  async with connect() as db:
+    # Проверяем подписку
+    async with db.execute(
+        "SELECT COALESCE(u_premium,0), u_premium_expires FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      urow = await cur.fetchone()
+    if not urow or not u_premium_active(urow[0], urow[1]):
+      await callback.answer("❌ У вас нет активной уникальной подписки.", show_alert=True)
+      return
+
+    async with db.execute(
+        "SELECT title, amount, command, COALESCE(no_sub,0)"
+        " FROM unique_products WHERE id = ?",
+        (up_id,),
+    ) as cur:
+      prod = await cur.fetchone()
+    if not prod or prod[1] <= 0:
+      await callback.answer("❌ Товар закончился или удален.", show_alert=True)
+      return
+    title, _amount, command_str, no_sub = prod
+    if no_sub:
+      await callback.answer(
+          "❌ Этот товар недоступен по подписке — только за токены.",
+          show_alert=True,
+      )
+      return
+
+    parsed = parse_unique_command(command_str)
+    if parsed is None:
+      await callback.answer("❌ Команда товара настроена неверно. Напиши админу.", show_alert=True)
+      return
+
+    cur = await db.execute(
+        "UPDATE unique_products SET amount = amount - 1 WHERE id = ? AND amount > 0",
+        (up_id,),
+    )
+    if cur.rowcount == 0:
+      await db.rollback()
+      await callback.answer("❌ Товар закончился.", show_alert=True)
+      return
+    await db.commit()
+
+  try:
+    await apply_unique_command(user_id, title, parsed)
+  except Exception:
+    logging.exception("Ошибка выдачи уник. товара (по подписке)")
+    await callback.message.answer("⚠️ Ошибка при выдаче товара. Напиши админу.")
+    await callback.answer()
+    return
+
+  await callback.message.answer(
+      f"💎 <b>Получено по подписке!</b>\n"
+      f"Вы получили: <b>{esc(title)}</b> бесплатно по уникальной подписке.\n"
+      "Всё уже начислено в профиль."
+  )
   await callback.answer()
 
 
@@ -3095,7 +3616,7 @@ async def process_ubuy(callback: CallbackQuery):
             "👥 Реферальная система",
             "🏆 Топ игроков",
             "🪙 Как получить токены?",
-            "👑 Премиум-подписка",
+            "💳 Подписки",
             "🎰 Лотерея",
             "🔄 Обмены",
             "🎲 Рулетка",
@@ -3115,12 +3636,13 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       async with db.execute(
           "SELECT COALESCE(tokens, 0), COALESCE(y_tokens, 0),"
           " COALESCE(full_tokens, 0), is_premium, COALESCE(bought_folders, 0),"
-          " premium_expires, COALESCE(warns, 0), COALESCE(exchanges, 0)"
+          " premium_expires, COALESCE(warns, 0), COALESCE(exchanges, 0),"
+          " COALESCE(u_premium, 0), u_premium_expires"
           " FROM users WHERE user_id = ?",
           (user_id,),
       ) as cursor:
         (tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns,
-         exchanges) = await cursor.fetchone()
+         exchanges, u_prem, u_prem_expires) = await cursor.fetchone()
 
     prem_status = "❌ Не активна"
     if is_prem == 1:
@@ -3134,6 +3656,25 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       else:
         await remove_premium(user_id)
         prem_status = "❌ Не активна (истекла)"
+
+    # Уникальная подписка
+    u_prem_status = "❌ Нет"
+    if u_premium_active(u_prem, u_prem_expires):
+      u_exp = parse_dt(u_prem_expires)
+      if u_exp:
+        u_days_left = (u_exp - datetime.datetime.now()).days
+        u_prem_status = f"✅ До {u_exp.strftime('%d.%m.%Y')} ({u_days_left} дн.)"
+      else:
+        u_prem_status = "✅ Активна"
+    elif u_prem == 1:
+      # Истекла — сбрасываем
+      async with connect() as db:
+        await db.execute(
+            "UPDATE users SET u_premium = 0, u_premium_expires = NULL"
+            " WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
 
     aura = await get_user_aura(user_id)
     if aura:
@@ -3160,6 +3701,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         f"💎 Уникальные токены: {y_tokens}\n"
         f"📦 Фулловые токены: {full_tokens}\n"
         f"👑 Премиум-подписка: {prem_status}\n"
+        f"💎 Уникальная подписка: {u_prem_status}\n"
         f"✨ Активная аура: {aura_status}\n"
         f"📦 Собрано фулов: {bought} шт.\n"
         f"⚠️ Предупреждения: {warns}/{MAX_WARNS}\n"
@@ -3183,7 +3725,7 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       if buyers_count == 0:
         btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
       else:
-        btn_text = f"📁 {title} — {price} токенов | 👥 {token_buyers} купили"
+        btn_text = f"📁 {title} — {price} токенов"
       keyboard_buttons.append(
           [InlineKeyboardButton(text=btn_text, callback_data=f"desc_{p_id}")]
       )
@@ -3253,36 +3795,14 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         "🪙 <b>Как получить токены?</b>\nВыбери тип токена:", reply_markup=kb
     )
 
-  elif text == "👑 Премиум-подписка":
-    keyboard = InlineKeyboardMarkup(
+  elif text == "💳 Подписки":
+    kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⭐ Отправить Подарок 50 Stars",
-                    url="https://t.me/ucu52",
-                )
-            ]
+            [InlineKeyboardButton(text="👑 Премиум-подписка", callback_data="sub_premium")],
+            [InlineKeyboardButton(text="💎 Уникальная подписка", callback_data="sub_unique")],
         ]
     )
-    prem_text = (
-        "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n"
-        "<b>Преимущества:</b>\n"
-        "Дает право покупать АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно c обычного"
-        " магазина!\n\n"
-        "💳 <b>Способ 1:</b> Купить | Заплатить 50 Звезд\n"
-        "(любым подарком на профиль @ucu52)\n\n"
-        "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 Фото в коментарии в тт\n"
-        "подробнее про фото: https://t.me/JmcDeveloper/18\n\n"
-        "Вы можете получить премиум бесплатно за 100 фото в коменты!\n"
-        "<i>Если была хотя бы одна фото дублирована или уже принята как Токен"
-        " — подписка не выдается.</i>\n"
-        "Если вы сделали все хорошо, отправляйте сюда:"
-        " https://t.me/JmcDeveloper?direct\n"
-        "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
-    )
-    await message.answer(
-        prem_text, reply_markup=keyboard, disable_web_page_preview=True
-    )
+    await message.answer("💳 <b>Подписки</b>\nВыбери тип подписки:", reply_markup=kb)
 
   elif text == "🎰 Лотерея":
     lottery_text, lottery_kb = await build_lottery_view(user_id)
@@ -3720,6 +4240,7 @@ async def process_edit_product_select(callback: CallbackQuery, state: FSMContext
     await callback.answer()
     return
   p_id = int(callback.data.split("_")[1])
+  await state.clear()
   await state.update_data(product_id=p_id)
   async with connect() as db:
     async with db.execute(
@@ -4001,6 +4522,7 @@ async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext)
     await callback.answer()
     return
   p_id = int(callback.data.split("_")[1])
+  await state.clear()
   await state.update_data(product_id=p_id)
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -4011,10 +4533,31 @@ async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext)
           [InlineKeyboardButton(text="Команда", callback_data="uef_command")],
           [InlineKeyboardButton(text="📄 Описание", callback_data="uef_description")],
           [InlineKeyboardButton(text="🖼 Фото", callback_data="uef_photo")],
+          [InlineKeyboardButton(text="🔒 Переключить «Только токены»", callback_data=f"uef_nosub_toggle_{p_id}")],
       ]
   )
   await callback.message.answer("Что изменить в уникальном товаре?", reply_markup=kb)
   await callback.answer()
+
+
+@router.callback_query(F.data.startswith("uef_nosub_toggle_"))
+async def uef_nosub_toggle(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  p_id = int(callback.data.split("_")[3])
+  async with connect() as db:
+    async with db.execute(
+        "SELECT COALESCE(no_sub,0) FROM unique_products WHERE id = ?", (p_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    new_val = 0 if (row[0] if row else 0) else 1
+    await db.execute(
+        "UPDATE unique_products SET no_sub = ? WHERE id = ?", (new_val, p_id)
+    )
+    await db.commit()
+  status = "🔒 Только за токены (подписка не работает)" if new_val else "✅ Доступно по подписке"
+  await callback.answer(f"Статус: {status}", show_alert=True)
 
 
 @router.callback_query(
@@ -4888,17 +5431,33 @@ ROULETTE_MAX = 10
 _roulette_locks = {}
 
 
-def roulette_decide(current_tokens: int, roll_win: bool, aura_percent: int) -> bool:
-  # Базовый шанс победы 55%; аура добавляет или отнимает процент
-  # -100% → 55-100 = -45 → clamp до 0 (всегда луз)
-  # +100% → 55+100 = 155 → clamp до 100 (всегда win)
+def roulette_decide(
+    current_tokens: int,
+    roll_win: bool,
+    aura_percent: int,
+    session_start: int = 0,
+) -> bool:
+  """
+  session_start — баланс в начале сессии (до первой ставки в этой серии).
+  Если игрок вырос с 3 до 10+ токенов — шанс начинает падать.
+  Если вырос с 3 до 15+ — падает сильнее.
+  """
+  # Базовый шанс 55%; аура добавляет/отнимает (clamp 0..1)
   base_chance = max(0.0, min(1.0, 0.55 + aura_percent / 100.0))
-  roll_win = random.random() < base_chance
-  # Скрытый штраф: если накоплено >= 50 токенов — шанс победы падает до 30%
-  # (не применяется если аура уже опустила шанс ниже 30%)
+
+  # Скрытый штраф за накопление (порог 50)
   if current_tokens >= 50 and base_chance > 0.30:
-    return random.random() < 0.30
-  return roll_win
+    base_chance = 0.30
+
+  # Скрытый штраф за рост в сессии (3→10 или 3→15)
+  if session_start > 0:
+    growth = current_tokens - session_start
+    if growth >= 12:          # вырос на 12+ токенов за сессию
+      base_chance = min(base_chance, 0.35)
+    elif growth >= 7:          # вырос на 7+ токенов за сессию
+      base_chance = min(base_chance, 0.42)
+
+  return random.random() < base_chance
 
 
 async def roulette_play(user_id: int, bet: int) -> dict:
@@ -4928,11 +5487,29 @@ async def roulette_play(user_id: int, bet: int) -> dict:
       ) as c:
         current_bal = (await c.fetchone())[0]
 
-      win = roulette_decide(current_bal, random.random() < 0.5, aura_percent)
-
       await db.execute(
           "INSERT OR IGNORE INTO roulette_state (user_id) VALUES (?)", (user_id,)
       )
+      # Читаем session_start: если давно не играл (> 10 мин) — сбрасываем
+      now_ts = int(datetime.datetime.now().timestamp())
+      async with db.execute(
+          "SELECT COALESCE(session_start,0), COALESCE(session_last_bet,0)"
+          " FROM roulette_state WHERE user_id = ?",
+          (user_id,),
+      ) as c:
+        srow = await c.fetchone()
+      s_start, s_last = (srow[0], srow[1]) if srow else (0, 0)
+      # Сессия сбрасывается если прошло > 10 минут с последней ставки
+      if now_ts - s_last > 600 or s_start == 0:
+        s_start = current_bal + bet  # баланс до этой ставки
+      await db.execute(
+          "UPDATE roulette_state SET session_start = ?, session_last_bet = ?"
+          " WHERE user_id = ?",
+          (s_start, now_ts, user_id),
+      )
+
+      win = roulette_decide(current_bal, random.random() < 0.5, aura_percent, s_start)
+
       await db.execute(
           "UPDATE roulette_state SET games = COALESCE(games, 0) + 1, wins ="
           " COALESCE(wins, 0) + ? WHERE user_id = ?",
@@ -5203,7 +5780,8 @@ async def main():
     await dp.start_polling(bot)
   finally:
     for task in tasks:
-            task.cancel()
+      task.cancel()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+  asyncio.run(main())
