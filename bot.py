@@ -151,8 +151,8 @@ STRINGS: dict[str, dict[str, str]] = {
     # ── магазин ───────────────────────────────────────────────────────────
     "shop_empty":    {"ru": "📭 В магазине пока пусто. Либо же вы все раскупили!", "en": "📭 The shop is empty. Maybe you bought everything!"},
     "shop_title":    {"ru": "🛍 <b>Доступные фулы:</b>\n<i>(Нажми на нужный, чтобы посмотреть описание)</i>", "en": "🛍 <b>Available items:</b>\n<i>(Tap one to see description)</i>"},
-    "shop_first_buy":{"ru": "🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)", "en": "🔥 {title} — {price} tokens (FIRST PURCHASE -80%!)"},
-    "shop_item":     {"ru": "📁 {title} — {price} токенов", "en": "📁 {title} — {price} tokens"},
+    "shop_first_buy":{"ru": "🔥 {title}", "en": "🔥 {title}"},
+    "shop_item":     {"ru": "📁 {title}", "en": "📁 {title}"},
     "shop_desc_price_first": {"ru": "💰 Цена: <s>{price}</s> → <b>{final} токенов</b> (скидка 80%!)", "en": "💰 Price: <s>{price}</s> → <b>{final} tokens</b> (80% off!)"},
     "shop_desc_price":       {"ru": "💰 Цена: <b>{price} токенов</b>", "en": "💰 Price: <b>{price} tokens</b>"},
     "shop_desc_bought":      {"ru": "👥 Купили за токены: <b>{n}</b>", "en": "👥 Purchased with tokens: <b>{n}</b>"},
@@ -968,31 +968,25 @@ async def activate_referral(bot: Bot, user_id: int) -> None:
         (REF_BONUS, referrer_id),
     )
     await db.commit()
+  ref_lang = await get_lang(referrer_id)
   await safe_send(
       bot,
       referrer_id,
-      "🎉 По вашей рефке зарегистрировался новый пользователь!\n"
-      f"❤️ Вам начислено {REF_BONUS} токенов!",
+      t("ref_new_user", ref_lang, n=REF_BONUS),
   )
 
 
-def sub_keyboard() -> InlineKeyboardMarkup:
+def sub_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
-          [
-              InlineKeyboardButton(
-                  text="✅ Я подписался", callback_data="check_sub"
-              )
-          ],
+          [InlineKeyboardButton(text=t("sub_btn_subscribe", lang), url=CHANNEL_URL)],
+          [InlineKeyboardButton(text=t("sub_btn_check", lang), callback_data="check_sub")],
       ]
   )
 
 
-SUB_TEXT = (
-    "🔒 Чтобы пользоваться ботом, подпишись на наш канал и нажми «Я"
-    " подписался»."
-)
+def _sub_text(lang: str = "ru") -> str:
+  return t("sub_required", lang)
 
 
 class SubscribeMiddleware(BaseMiddleware):
@@ -1028,12 +1022,18 @@ class SubscribeMiddleware(BaseMiddleware):
       await activate_referral(bot, user.id)
       return await handler(event, data)
 
+    # Пытаемся определить язык (если пользователь уже есть в БД)
+    try:
+      _lang = await get_lang(user.id)
+    except Exception:
+      _lang = "ru"
+    sub_msg = _sub_text(_lang)
     if isinstance(event, CallbackQuery):
       if event.message:
-        await event.message.answer(SUB_TEXT, reply_markup=sub_keyboard())
+        await event.message.answer(sub_msg, reply_markup=sub_keyboard(_lang))
       await event.answer()
     else:
-      await event.answer(SUB_TEXT, reply_markup=sub_keyboard())
+      await event.answer(sub_msg, reply_markup=sub_keyboard(_lang))
     return None
 
 
@@ -1161,7 +1161,7 @@ async def grant_u_premium(target_id: int, days: int) -> datetime.datetime:
 async def apply_promocode(user_id: int, code_text: str) -> str:
   code_text = (code_text or "").strip()
   if not code_text:
-    return "❌ Промокод не указан."
+    return t("promo_empty", await get_lang(user_id))
   try:
     async with connect() as db:
       async with db.execute(
@@ -1171,27 +1171,26 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
       ) as cur:
         promo = await cur.fetchone()
       if not promo:
-        return "❌ Неверный или несуществующий промокод."
+        return t("promo_not_found", await get_lang(user_id))
 
       real_code, reward_type, reward_value, _max_uses, _used = promo
       try:
         val = int(reward_value)
       except (TypeError, ValueError):
-        return "❌ У промокода неверно задана награда."
+        return t("promo_bad_reward", await get_lang(user_id))
       if reward_type not in ("tokens", "premium"):
-        return "❌ Неизвестный тип награды у промокода."
+        return t("promo_bad_reward", await get_lang(user_id))
 
+      lang = await get_lang(user_id)
       await ensure_user(db, user_id)
-      # Активация: PRIMARY KEY не даст активировать дважды
       try:
         await db.execute(
             "INSERT INTO promo_activations (user_id, code) VALUES (?, ?)",
             (user_id, real_code),
         )
       except aiosqlite.IntegrityError:
-        return "❌ Вы уже активировали этот промокод!"
+        return t("promo_used", lang)
 
-      # Лимит активаций проверяем атомарно
       cur = await db.execute(
           "UPDATE promocodes SET used_count = COALESCE(used_count, 0) + 1"
           " WHERE code = ? AND (COALESCE(max_uses, 0) = 0 OR"
@@ -1200,7 +1199,7 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
       )
       if cur.rowcount == 0:
         await db.rollback()
-        return "❌ У этого промокода закончились активации."
+        return t("promo_limit", lang)
 
       if reward_type == "tokens":
         await db.execute(
@@ -1208,13 +1207,10 @@ async def apply_promocode(user_id: int, code_text: str) -> str:
             " user_id = ?",
             (val, user_id),
         )
-        reply = f"✅ Промокод активирован!\n🎁 Вам зачислено: <b>{val} токенов</b>"
+        reply = t("promo_ok_tokens", lang, n=val)
       else:
         new_expire = await apply_premium(db, user_id, val)
-        reply = (
-            f"✅ Промокод активирован!\n👑 Премиум на <b>{val} дней</b> "
-            f"(до {new_expire.strftime('%d.%m.%Y')})!"
-        )
+        reply = t("promo_ok_premium", lang, n=val, date=new_expire.strftime('%d.%m.%Y'))
       await db.commit()
     return reply
   except Exception as e:
@@ -1285,11 +1281,46 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
     )
 
 
+@router.callback_query(F.data.in_({"setlang_ru", "setlang_en"}))
+async def setlang_cb(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  lang = callback.data.split("_")[1]
+  await set_lang(user_id, lang)
+  try:
+    await callback.message.delete()
+  except Exception:
+    pass
+  await callback.message.answer(
+      t("lang_set_ru" if lang == "ru" else "lang_set_en", lang),
+  )
+  await callback.message.answer(
+      t("welcome", lang),
+      reply_markup=get_main_keyboard(user_id, lang),
+  )
+  await callback.answer()
+
+
+@router.message(Command("lang"))
+async def cmd_lang(message: Message):
+  """Позволяет сменить язык в любой момент."""
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(text="🇷🇺 Русский", callback_data="setlang_ru"),
+              InlineKeyboardButton(text="🇬🇧 English", callback_data="setlang_en"),
+          ]
+      ]
+  )
+  await message.answer(t("choose_lang", "ru"), reply_markup=kb)
+
+
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
   await state.clear()
+  lang = await get_lang(message.from_user.id)
   await message.answer(
-      "Отменено.", reply_markup=get_main_keyboard(message.from_user.id)
+      t("cancelled", lang),
+      reply_markup=get_main_keyboard(message.from_user.id, lang),
   )
 
 
@@ -1300,29 +1331,32 @@ async def cmd_promocode(
   await state.clear()
   user_id = message.from_user.id
   code_text = (command.args or "").strip()
+  lang = await get_lang(user_id)
   if code_text:
     reply = await apply_promocode(user_id, code_text)
-    await message.answer(reply, reply_markup=get_main_keyboard(user_id))
+    await message.answer(reply, reply_markup=get_main_keyboard(user_id, lang))
     return
-  await message.answer("🎟 Введите промокод:")
+  await message.answer(t("promo_ask", lang))
   await state.set_state(PromocodeState.code)
 
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(callback: CallbackQuery, bot: Bot):
-  if await is_subscribed(bot, callback.from_user.id):
-    await activate_referral(bot, callback.from_user.id)
+  uid = callback.from_user.id
+  lang = await get_lang(uid)
+  if await is_subscribed(bot, uid):
+    await activate_referral(bot, uid)
     try:
       await callback.message.delete()
     except Exception:
       pass
     await callback.message.answer(
-        "✅ Спасибо за подписку! Выбирай раздел в меню.",
-        reply_markup=get_main_keyboard(callback.from_user.id),
+        t("sub_thanks", lang),
+        reply_markup=get_main_keyboard(uid, lang),
     )
     await callback.answer()
   else:
-    await callback.answer("❌ Ты ещё не подписан на канал!", show_alert=True)
+    await callback.answer(t("sub_not_yet", lang), show_alert=True)
 
 
 # --- АДМИН-КОМАНДЫ: ВЫДАЧА, БАНЫ, ПРЕДУПРЕЖДЕНИЯ ---
@@ -2080,12 +2114,12 @@ async def cmd_restore(message: Message, bot: Bot):
 # --- ТОПЫ ---
 
 
-def tops_menu_keyboard() -> InlineKeyboardMarkup:
+def tops_menu_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="👥 Топ по рефералам", callback_data="top_refs")],
-          [InlineKeyboardButton(text="🎰 Топ по лотерее", callback_data="top_lottery")],
-          [InlineKeyboardButton(text="🎲 Топ по рулетке", callback_data="top_roulette")],
+          [InlineKeyboardButton(text=t("top_btn_refs", lang), callback_data="top_refs")],
+          [InlineKeyboardButton(text=t("top_btn_lottery", lang), callback_data="top_lottery")],
+          [InlineKeyboardButton(text=t("top_btn_roulette", lang), callback_data="top_roulette")],
       ]
   )
 
@@ -2143,22 +2177,22 @@ async def process_top_reward(callback: CallbackQuery):
 @router.callback_query(F.data.in_({"top_refs", "top_lottery", "top_roulette"}))
 async def show_specific_top(callback: CallbackQuery):
   top_type = callback.data.split("_")[1]
+  lang = await get_lang(callback.from_user.id)
   async with connect() as db:
     next_reset = await get_next_reset(db)
-
     if top_type == "refs":
       async with db.execute(REF_TOP_SQL, (10,)) as cursor:
         rows = await cursor.fetchall()
-      title = "🏆 <b>Топ-10 по рефералам</b>"
-      unit = "реф."
+      title = t("top_refs_title", lang)
+      unit = t("top_unit_refs", lang)
     elif top_type == "lottery":
       async with db.execute(
           "SELECT user_id, is_premium, COALESCE(lottery_wins, 0) AS lw FROM"
           " users WHERE lw > 0 ORDER BY lw DESC LIMIT 10"
       ) as cursor:
         rows = await cursor.fetchall()
-      title = "🏆 <b>Топ-10 по победам в лотерее</b>"
-      unit = "побед"
+      title = t("top_lot_title", lang)
+      unit = t("top_unit_lot", lang)
     else:
       async with db.execute(
           "SELECT u.user_id, u.is_premium, COALESCE(r.wins, 0) AS w FROM users"
@@ -2166,36 +2200,27 @@ async def show_specific_top(callback: CallbackQuery):
           " ORDER BY w DESC LIMIT 10"
       ) as cursor:
         rows = await cursor.fetchall()
-      title = "🏆 <b>Топ-10 по победам в рулетке</b>"
-      unit = "побед"
+      title = t("top_rl_title", lang)
+      unit = t("top_unit_rl", lang)
 
+  user_word = "Пользователь" if lang == "ru" else "User"
   items = [
-      f"{i}. Пользователь <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
+      f"{i}. {user_word} <code>{r[0]}</code>{' 👑' if r[1] == 1 else ''} —"
       f" <b>{r[2]}</b> {unit}"
       for i, r in enumerate(rows, 1)
   ]
-
   delta = next_reset - datetime.datetime.now()
   if delta.total_seconds() > 0:
-    timer_text = f"через {delta.days} дн. {delta.seconds // 3600} ч."
+    timer_text = t("top_reset_timer", lang, d=delta.days, h=delta.seconds // 3600)
   else:
-    timer_text = "скоро сброс..."
-
-  footer = (
-      f"⏳ <b>Сброс топа:</b> {timer_text}\n"
-      "🎁 <b>Награда 1 места (на выбор):</b> Премиум на"
-      f" {TOP_REWARD_PREMIUM_DAYS} дней <u>ИЛИ</u> {TOP_REWARD_YTOKENS}"
-      " уникальных токена!"
-  )
-  text = title + "\n\n" + ("\n".join(items) if items else "Пока пусто.") + f"\n\n{footer}"
+    timer_text = t("top_reset_soon", lang)
+  footer = timer_text + "\n" + t("top_reward_txt", lang,
+                                  pd=TOP_REWARD_PREMIUM_DAYS, yt=TOP_REWARD_YTOKENS)
+  text = title + "\n\n" + ("\n".join(items) if items else t("top_empty", lang)) + f"\n\n{footer}"
   kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="⬅️ Назад к выбору топов", callback_data="back_to_tops"
-              )
-          ]
-      ]
+      inline_keyboard=[[InlineKeyboardButton(
+          text=t("top_btn_back", lang), callback_data="back_to_tops"
+      )]]
   )
   try:
     await callback.message.edit_text(text, reply_markup=kb)
@@ -2206,9 +2231,10 @@ async def show_specific_top(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_tops")
 async def back_to_tops(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   try:
     await callback.message.edit_text(
-        "🏆 <b>Выберите категорию топа:</b>", reply_markup=tops_menu_keyboard()
+        t("top_menu", lang), reply_markup=tops_menu_keyboard(lang)
     )
   except Exception:
     pass
@@ -2219,24 +2245,14 @@ async def back_to_tops(callback: CallbackQuery):
 
 @router.callback_query(F.data == "sub_premium")
 async def sub_premium_cb(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="⭐ Отправить Подарок 50 Stars", url="https://t.me/ucu52")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="sub_back")],
+          [InlineKeyboardButton(text=t("sub_btn_buy_stars_50", lang), url="https://t.me/ucu52")],
+          [InlineKeyboardButton(text=t("sub_btn_back", lang), callback_data="sub_back")],
       ]
   )
-  text = (
-      "👑 <b>Премиум-подписка на 1 МЕСЯЦ (30 дней)</b>\n\n"
-      "<b>Преимущества:</b>\n"
-      "• Покупай АБСОЛЮТНО ЛЮБЫЕ фулы бесплатно в обычном магазине!\n\n"
-      "💳 <b>Способ 1:</b> Заплатить 50 Звёзд\n"
-      "(любым подарком на профиль @ucu52)\n\n"
-      "📸 <b>Способ 2 (за 100 фото):</b> Кинуть 100 фото в комментарии в тт\n"
-      "Подробнее: https://t.me/JmcDeveloper/18\n\n"
-      "<i>Если была хотя бы одна дублированная фото — подписка не выдаётся.</i>\n"
-      "Готово? Отправляй сюда: https://t.me/JmcDeveloper?direct\n"
-      "<b>(И СРАЗУ ГОВОРИТЕ ЧТО ДЛЯ ПРЕМИУМ ПОДПИСКИ)</b>"
-  )
+  text = t("sub_prem_text", lang)
   try:
     await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
   except Exception:
@@ -2246,22 +2262,14 @@ async def sub_premium_cb(callback: CallbackQuery):
 
 @router.callback_query(F.data == "sub_unique")
 async def sub_unique_cb(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="⭐ Отправить Подарок 100 Stars", url="https://t.me/ucu52")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="sub_back")],
+          [InlineKeyboardButton(text=t("sub_btn_buy_stars_100", lang), url="https://t.me/ucu52")],
+          [InlineKeyboardButton(text=t("sub_btn_back", lang), callback_data="sub_back")],
       ]
   )
-  text = (
-      "💎 <b>Уникальная подписка на 1 МЕСЯЦ (30 дней)</b>\n\n"
-      "<b>Преимущества:</b>\n"
-      "• Покупай любые товары в 💎 Уникальном магазине бесплатно!\n"
-      "• <i>Работает только для товаров, которые продаются за уникальные"
-      " токены. Товары, помеченные как «только за уник. токены», нельзя"
-      " получить по подписке.</i>\n\n"
-      "💳 <b>Как купить:</b> Заплатить 100 Звёзд\n"
-      "(любым подарком на профиль @ucu52)"
-  )
+  text = t("sub_unique_text", lang)
   try:
     await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
   except Exception:
@@ -2271,80 +2279,60 @@ async def sub_unique_cb(callback: CallbackQuery):
 
 @router.callback_query(F.data == "sub_back")
 async def sub_back_cb(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="👑 Премиум-подписка", callback_data="sub_premium")],
-          [InlineKeyboardButton(text="💎 Уникальная подписка", callback_data="sub_unique")],
+          [InlineKeyboardButton(text=t("sub_btn_premium", lang), callback_data="sub_premium")],
+          [InlineKeyboardButton(text=t("sub_btn_unique", lang), callback_data="sub_unique")],
       ]
   )
   try:
-    await callback.message.edit_text("💳 <b>Подписки</b>\nВыбери тип подписки:", reply_markup=kb)
+    await callback.message.edit_text(t("subs_menu", lang), reply_markup=kb)
   except Exception:
-    await callback.message.answer("💳 <b>Подписки</b>\nВыбери тип подписки:", reply_markup=kb)
+    await callback.message.answer(t("subs_menu", lang), reply_markup=kb)
   await callback.answer()
 
 
 # --- КАК ПОЛУЧИТЬ ТОКЕНЫ ---
 
-HOWTO_TEXTS = {
-    "howto_tokens": (
-        "🪙 <b>Как получить обычные токены?</b>\n\n"
-        "1. Возьмите фото: https://t.me/JmcDeveloper/11\n\n"
-        "2. Оставляйте его в комментариях под постами/ответами другим людям"
-        " <u>(под тему сестра и брата)</u>.\n\n"
-        "3. Отправляйте доказательства (скриншоты) в директ канала:"
-        " https://t.me/JmcDeveloper?direct\n\n"
-        "💰 <b>1 отправка фото в комментариях = 1 токен!</b>\n\n"
-        "📖 Детально расписал тут: https://t.me/JmcDeveloper/18\n"
-        "<i>(не выдам токены если не посмотрите 👆)</i>"
-    ),
-    "howto_ytokens": (
-        "💎 <b>Как получить уникальные токены?</b>\n\n"
-        "Их можно только купить: <b>15 звёзд = 1 уникальный токен.</b>\n\n"
-        "<b>Как купить?</b> Кинь любой подарок стоимостью 15 звёзд на аккаунт"
-        " @ucu52.\n\n"
-        "<b>Преимущества:</b>\n"
-        "• Там выходят фулы на 1 день позже чем в стандартный магазин\n"
-        "• Уникальные товары: аура, фулловые токены и другое"
-    ),
-    "howto_ftokens": (
-        "📦 <b>Как получить фулловые токены?</b>\n\n"
-        "Их можно купить в <b>💎 Уникальном магазине</b> за уникальные токены"
-        " (или получить от администратора).\n\n"
-        "<b>Преимущество:</b>\n"
-        "Позволяет забрать абсолютно любой фулл в обычном магазине <b>бесплатно</b>"
-        " — просто используй фулловый токен при покупке!"
-    ),
+
+_HOWTO_KEY_MAP = {
+    "howto_tokens": "howto_tokens_text",
+    "howto_ytokens": "howto_ytokens_text",
+    "howto_ftokens": "howto_ftokens_text",
 }
 
 
 @router.callback_query(F.data.in_({"howto_tokens", "howto_ytokens", "howto_ftokens"}))
 async def howto_cb(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="howto_back")]
+          [InlineKeyboardButton(text=t("howto_btn_back", lang), callback_data="howto_back")]
       ]
   )
-  await callback.message.edit_text(
-      HOWTO_TEXTS[callback.data],
-      reply_markup=kb,
-      disable_web_page_preview=True,
-  )
+  text = t(_HOWTO_KEY_MAP[callback.data], lang)
+  try:
+    await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+  except Exception:
+    await callback.message.answer(text, reply_markup=kb, disable_web_page_preview=True)
   await callback.answer()
 
 
 @router.callback_query(F.data == "howto_back")
 async def howto_back(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="🪙 Обычные токены", callback_data="howto_tokens")],
-          [InlineKeyboardButton(text="💎 Уникальные токены", callback_data="howto_ytokens")],
-          [InlineKeyboardButton(text="📦 Фулловые токены", callback_data="howto_ftokens")],
+          [InlineKeyboardButton(text=t("howto_btn_tokens", lang), callback_data="howto_tokens")],
+          [InlineKeyboardButton(text=t("howto_btn_ytokens", lang), callback_data="howto_ytokens")],
+          [InlineKeyboardButton(text=t("howto_btn_ftokens", lang), callback_data="howto_ftokens")],
       ]
   )
-  await callback.message.edit_text(
-      "🪙 <b>Как получить токены?</b>\nВыбери тип токена:", reply_markup=kb
-  )
+  try:
+    await callback.message.edit_text(t("howto_menu", lang), reply_markup=kb)
+  except Exception:
+    await callback.message.answer(t("howto_menu", lang), reply_markup=kb)
   await callback.answer()
 
 
@@ -2440,33 +2428,25 @@ async def lottery_stats(db, rnd) -> dict:
   return {"players": players, "pool": pool, "total": total, "cost": cost}
 
 
-def lottery_again_keyboard(user_notify: int = 1) -> InlineKeyboardMarkup:
-  toggle_text = (
-      "🔕 Отключить уведомления"
-      if user_notify == 1
-      else "🔔 Включить уведомления"
-  )
+def lottery_again_keyboard(user_notify: int = 1, lang: str = "ru") -> InlineKeyboardMarkup:
+  toggle_key = "lottery_btn_notif_off" if user_notify == 1 else "lottery_btn_notif_on"
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="🎰 Попытать удачу ещё раз", callback_data="lottery_open"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text=toggle_text, callback_data="lottery_toggle_notify"
-              )
-          ],
+          [InlineKeyboardButton(
+              text=t("lottery_btn_again", lang), callback_data="lottery_open"
+          )],
+          [InlineKeyboardButton(
+              text=t(toggle_key, lang), callback_data="lottery_toggle_notify"
+          )],
       ]
   )
 
 
-async def build_lottery_view(user_id: int):
+async def build_lottery_view(user_id: int, lang: str = "ru"):
   """Возвращает (текст, клавиатура) для экрана лотереи."""
   rnd = await get_current_round()
   if not rnd:
-    return "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", None
+    return t("lottery_soon", lang), None
 
   round_id, _, prize, ends_at_str, fixed = rnd
   ends_at = parse_dt(ends_at_str) or datetime.datetime.now()
@@ -2490,49 +2470,37 @@ async def build_lottery_view(user_id: int):
       user_notify = urow[0] if urow else 1
   cost = st["cost"]
 
+  rand_winner = ("Победитель выбирается случайно среди всех участников. "
+                 if lang == "ru" else
+                 "Winner is chosen randomly among all participants. ")
   text = (
-      "🎰 <b>Лотерея</b>\n\n"
-      f"🏆 Приз: <b>{st['total']} токенов</b>"
-      f" ({prize} + {st['pool']} от взносов)\n"
-      f"🎟 Участие: <b>{cost_text(cost)}</b>"
-      + ("" if fixed else " (растёт вместе с призом)")
-      + "\n"
-      f"👥 Участников: <b>{st['players']}</b> (минимум для розыгрыша:"
-      f" {lottery_min_players(prize)})\n"
-      f"⏱ До конца розыгрыша: <b>{hours} ч {minutes} мин</b>\n\n"
-      "Победитель выбирается случайно среди всех участников. "
-      + (
-          "Половина токенов за участие добавляется к призу."
-          if cost
-          else "Участие бесплатное."
-      )
+      f"{t('lottery_title', lang)}\n\n"
+      + t("lottery_prize", lang, total=st['total'], base=prize, pool=st['pool']) + "\n"
+      + t("lottery_cost", lang, cost=cost_text(cost))
+      + ("" if fixed else t("lottery_cost_auto", lang)) + "\n"
+      + t("lottery_players", lang, n=st['players'], min=lottery_min_players(prize)) + "\n"
+      + t("lottery_time", lang, h=hours, m=minutes) + "\n\n"
+      + rand_winner
+      + (t("lottery_desc_paid", lang) if cost else t("lottery_desc_free", lang))
   )
 
-  toggle_text = (
-      "🔕 Отключить уведомления"
-      if user_notify == 1
-      else "🔔 Включить уведомления"
-  )
+  toggle_key = "lottery_btn_notif_off" if user_notify == 1 else "lottery_btn_notif_on"
   toggle_row = [
-      InlineKeyboardButton(text=toggle_text, callback_data="lottery_toggle_notify")
+      InlineKeyboardButton(text=t(toggle_key, lang), callback_data="lottery_toggle_notify")
   ]
 
   if joined:
     return (
-        text + "\n\n✅ Ты уже участвуешь в этом розыгрыше!",
+        text + t("lottery_joined", lang),
         InlineKeyboardMarkup(inline_keyboard=[toggle_row]),
     )
 
-  join_row = [
-      InlineKeyboardButton(
-          text=(
-              "🎟 Участвовать (бесплатно)"
-              if cost == 0
-              else f"🎟 Участвовать ({cost} токен.)"
-          ),
-          callback_data=f"lottery_join_{round_id}_{cost}",
-      )
-  ]
+  join_btn_text = (
+      t("lottery_btn_free", lang)
+      if cost == 0
+      else t("lottery_btn_join", lang, cost=cost_text(cost))
+  )
+  join_row = [InlineKeyboardButton(text=join_btn_text, callback_data=f"lottery_join_{round_id}_{cost}")]
   return text, InlineKeyboardMarkup(inline_keyboard=[join_row, toggle_row])
 
 
@@ -2576,18 +2544,17 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
         )
       await db.commit()
       for uid in players:
+        ulang = await get_lang(uid)
+        refund_txt = (
+            t("lottery_refund", ulang, n=paid_map[uid])
+            if paid_map[uid] else ""
+        )
         await safe_send(
             bot,
             uid,
-            "😔 В розыгрыше не набралось нужное число участников"
-            f" ({len(players)} из {min_players}). Приз не разыгран."
-            + (
-                f" Тебе вернули <b>{paid_map[uid]} токен(ов)</b>."
-                if paid_map[uid]
-                else ""
-            )
-            + "\n\nХотите ещё попытать удачу?",
-            reply_markup=lottery_again_keyboard(notify_map[uid]),
+            t("lottery_no_players", ulang,
+              cur=len(players), min=min_players, refund=refund_txt),
+            reply_markup=lottery_again_keyboard(notify_map[uid], ulang),
         )
         await asyncio.sleep(0.05)
       return
@@ -2615,18 +2582,13 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
       await db.commit()
 
   for uid in players:
+    ulang = await get_lang(uid)
     if uid == winner:
-      text = (
-          "🎉 <b>Ты выиграл в лотерее!</b>\n🏆 Тебе начислено:"
-          f" <b>{prize} токенов</b>.\n\nХотите ещё попытать удачу?"
-      )
+      text = t("lottery_win", ulang, prize=prize)
     else:
-      text = (
-          "😔 В этот раз удача была не на твоей стороне. Победитель уже"
-          " получил приз.\n\nХотите ещё попытать удачу?"
-      )
+      text = t("lottery_lose", ulang)
     await safe_send(
-        bot, uid, text, reply_markup=lottery_again_keyboard(notify_map[uid])
+        bot, uid, text, reply_markup=lottery_again_keyboard(notify_map[uid], ulang)
     )
     await asyncio.sleep(0.05)
 
@@ -2751,7 +2713,8 @@ async def cmd_lottery(message: Message, command: CommandObject):
 
 @router.callback_query(F.data == "lottery_open")
 async def lottery_open(callback: CallbackQuery):
-  text, keyboard = await build_lottery_view(callback.from_user.id)
+  lang = await get_lang(callback.from_user.id)
+  text, keyboard = await build_lottery_view(callback.from_user.id, lang)
   await callback.message.answer(text, reply_markup=keyboard)
   await callback.answer()
 
@@ -2773,12 +2736,11 @@ async def lottery_toggle_notify(callback: CallbackQuery):
     )
     await db.commit()
 
-  status_str = "отключены 🔕" if new_val == 0 else "включены 🔔"
-  await callback.answer(
-      f"Уведомления о крупных лотереях {status_str}!", show_alert=True
-  )
+  lang = await get_lang(user_id)
+  notif_key = "lottery_notif_off" if new_val == 0 else "lottery_notif_on"
+  await callback.answer(t(notif_key, lang), show_alert=True)
   try:
-    text, kb = await build_lottery_view(user_id)
+    text, kb = await build_lottery_view(user_id, lang)
     await callback.message.edit_text(text, reply_markup=kb)
   except Exception:
     pass
@@ -2801,13 +2763,14 @@ async def lottery_join(callback: CallbackQuery):
     ) as cur:
       row = await cur.fetchone()
 
+    lang = await get_lang(user_id)
     if not row or row[5] == 1:
-      await callback.answer("⏳ Этот розыгрыш уже завершён.", show_alert=True)
+      await callback.answer(t("lottery_ended", lang), show_alert=True)
       return
     rnd = row[:5]
     ends_at = parse_dt(rnd[3]) or datetime.datetime.now()
     if ends_at <= datetime.datetime.now():
-      await callback.answer("⏳ Розыгрыш уже заканчивается.", show_alert=True)
+      await callback.answer(t("lottery_ending", lang), show_alert=True)
       return
 
     async with db.execute(
@@ -2815,7 +2778,7 @@ async def lottery_join(callback: CallbackQuery):
         (round_id, user_id),
     ) as cur:
       if await cur.fetchone():
-        await callback.answer("✅ Ты уже участвуешь!", show_alert=True)
+        await callback.answer(t("lottery_already", lang), show_alert=True)
         return
 
     st = await lottery_stats(db, rnd)
@@ -2823,7 +2786,6 @@ async def lottery_join(callback: CallbackQuery):
     if shown_cost is not None and shown_cost != cost:
       price_changed = True
     else:
-      # Списание токенов одним запросом: сработает, только если хватает токенов
       if cost > 0:
         cur = await db.execute(
             "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
@@ -2837,7 +2799,7 @@ async def lottery_join(callback: CallbackQuery):
       if charged == 0:
         await db.rollback()
         await callback.answer(
-            f"❌ Недостаточно токенов! Участие стоит {cost}.", show_alert=True
+            t("lottery_no_tokens", lang, n=cost), show_alert=True
         )
         return
       await db.execute(
@@ -2849,23 +2811,20 @@ async def lottery_join(callback: CallbackQuery):
 
   if price_changed:
     await callback.answer(
-        f"💱 Цена участия изменилась: теперь {cost_text(cost)}. Проверь и"
-        " нажми «Участвовать» ещё раз.",
+        t("lottery_price_changed", lang, cost=cost_text(cost)),
         show_alert=True,
     )
     try:
-      text, kb = await build_lottery_view(user_id)
+      text, kb = await build_lottery_view(user_id, lang)
       await callback.message.edit_text(text, reply_markup=kb)
     except Exception:
       pass
     return
 
-  await callback.answer("🎟 Ты в игре! Удачи!", show_alert=True)
-  await callback.message.answer(
-      "🎟 Ты участвуешь в лотерее!"
-      + (f" Списано: <b>{cost} токен(ов)</b>." if cost else " Участие бесплатное.")
-      + "\nРезультат придёт сюда, когда закончится розыгрыш."
-  )
+  in_word = "🎟 Ты в игре! Удачи!" if lang == "ru" else "🎟 You're in! Good luck!"
+  await callback.answer(in_word, show_alert=True)
+  charged_txt = t("lottery_charged", lang, n=cost) if cost else t("lottery_free_entry", lang)
+  await callback.message.answer(t("lottery_joined_msg", lang, charged=charged_txt))
   # Проверяем: не пересёк ли суммарный приз порог уведомления ПОСЛЕ этого взноса
   rnd_now = await get_current_round()
   if rnd_now and rnd_now[0] == round_id:
@@ -2908,7 +2867,8 @@ async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
     ) as cursor:
       product = await cursor.fetchone()
     if not product:
-      await callback.answer("❌ Этот товар был удален.", show_alert=True)
+      _lang_del = await get_lang(callback.from_user.id)
+      await callback.answer(t("shop_deleted", _lang_del), show_alert=True)
       return False
     title, price_raw, link, buyers_count = product
     final_price = await shop_price(user_id, parse_price(price_raw), buyers_count)
@@ -2927,13 +2887,13 @@ async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
     )
     if cur.rowcount == 0:
       await db.rollback()
+      lang = await get_lang(user_id)
       async with db.execute(
           "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
       ) as c:
         brow = await c.fetchone()
       await callback.answer(
-          f"❌ Недостаточно токенов!\nЦена: {final_price} токенов, а у вас:"
-          f" {brow[0] if brow else 0}.",
+          t("shop_no_tokens", lang, price=final_price, bal=brow[0] if brow else 0)[:200],
           show_alert=True,
       )
       return False
@@ -2964,27 +2924,21 @@ async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
       new_tokens = (await c.fetchone())[0]
     await db.commit()
 
+  lang = await get_lang(user_id)
   if ref_bonus > 0:
+    ref_lang = await get_lang(referrer_id)
     await safe_send(
         bot,
         referrer_id,
-        "💰 Реферальный бонус!\nВаш реферал совершил покупку.\n🎁 Вам"
-        f" начислено {ref_bonus} токенов (15% от покупки).",
+        t("ref_bonus_msg", ref_lang, n=ref_bonus),
     )
 
   if buyers_count == 0:
-    text = (
-        f"🎉 Поздравляем! Ты первый покупатель фулла {esc(title)}!\n🔥"
-        f" Применилась скидка 80%!\nСписано: {final_price} токенов.\n💲 Ваш"
-        f" остаток: {new_tokens} токенов.\n\n🔗 Твоя ссылка на скачивание"
-        f" (нажми, чтобы показать):\n{hidden_link(link)}"
-    )
+    text = t("shop_bought_first", lang, title=esc(title),
+             price=final_price, bal=new_tokens, link=hidden_link(link))
   else:
-    text = (
-        f"✅ Спасибо за покупку фула {esc(title)}!\n💰 Списано:"
-        f" {final_price} токенов. Остаток: {new_tokens} токенов.\n\n🔗 Твоя"
-        f" ссылка на скачивание (нажми, чтобы показать):\n{hidden_link(link)}"
-    )
+    text = t("shop_bought", lang, title=esc(title),
+             price=final_price, bal=new_tokens, link=hidden_link(link))
   await callback.message.answer(text, disable_web_page_preview=True)
   await callback.answer()
   return True
@@ -3002,25 +2956,27 @@ async def show_product_desc(callback: CallbackQuery):
     ) as cur:
       row = await cur.fetchone()
   if not row:
-    await callback.answer("❌ Товар не найден.", show_alert=True)
+    _lang_nd = await get_lang(callback.from_user.id)
+    await callback.answer(t("shop_deleted", _lang_nd), show_alert=True)
     return
   title, price, buyers_count, description, photo_id, token_buyers = row
   final_price = max(1, int(parse_price(price) * 0.2)) if buyers_count == 0 else parse_price(price)
   first_buy = buyers_count == 0
 
+  lang = await get_lang(callback.from_user.id)
   cap = f"📁 <b>{esc(title)}</b>\n"
   if first_buy:
-    cap += f"💰 Цена: <s>{price}</s> → <b>{final_price} токенов</b> (скидка 80%!)\n"
+    cap += t("shop_desc_price_first", lang, price=price, final=final_price) + "\n"
   else:
-    cap += f"💰 Цена: <b>{price} токенов</b>\n"
-  cap += f"👥 Купили за токены: <b>{token_buyers}</b>\n"
+    cap += t("shop_desc_price", lang, price=price) + "\n"
+  cap += t("shop_desc_bought", lang, n=token_buyers) + "\n"
   if description:
     cap += f"\n{description}"
 
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{p_id}")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_shop")],
+          [InlineKeyboardButton(text=t("shop_btn_buy", lang), callback_data=f"buy_{p_id}")],
+          [InlineKeyboardButton(text=t("shop_btn_back", lang), callback_data="back_to_shop")],
       ]
   )
   if photo_id:
@@ -3041,22 +2997,23 @@ async def back_to_shop(callback: CallbackQuery):
     await callback.answer("Магазин пуст.", show_alert=True)
     return
   keyboard_buttons = []
+  lang = await get_lang(callback.from_user.id)
   for p_id, title, price, buyers_count, token_buyers in products:
     if buyers_count == 0:
-      btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+      btn_text = t("shop_first_buy", lang, title=title, price=price)
     else:
-      btn_text = f"📁 {title} — {price} токенов"
+      btn_text = t("shop_item", lang, title=title, price=price)
     keyboard_buttons.append(
-        [InlineKeyboardButton(text=btn_text, callback_data=f"desc_{p_id}")]
+        [InlineKeyboardButton(text=btn_text[:60], callback_data=f"desc_{p_id}")]
     )
   try:
     await callback.message.edit_text(
-        "🛍 <b>Доступные фулы:</b>",
+        t("shop_title", lang),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
     )
   except Exception:
     await callback.message.answer(
-        "🛍 <b>Доступные фулы:</b>",
+        t("shop_title", lang),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
     )
   await callback.answer()
@@ -3065,8 +3022,9 @@ async def back_to_shop(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: CallbackQuery, bot: Bot):
   user_id = callback.from_user.id
+  lang = await get_lang(user_id)
   if await get_restriction(user_id):
-    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    await callback.answer(t("restricted_alert", lang)[:200], show_alert=True)
     return
   p_id = int(callback.data.split("_")[1])
 
@@ -3111,10 +3069,9 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
           (user_id,),
       )
       await db.commit()
+      lang = await get_lang(user_id)
       await callback.message.answer(
-          f"👑 Премиум-доступ применен!\n\n✅ Вы получили фулл"
-          f" {esc(title)} бесплатно по подписке!\n\n🔗 Ссылка (нажми, чтобы"
-          f" показать):\n{hidden_link(link)}",
+          t("shop_prem_free", lang, title=esc(title), link=hidden_link(link)),
           disable_web_page_preview=True,
       )
       await callback.answer()
@@ -3122,25 +3079,21 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
 
   if full_tokens > 0:
     final_price = await shop_price(user_id, parse_price(price_raw), buyers_count)
+    lang = await get_lang(user_id)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📦 Использовать Фулловый токен",
-                    callback_data=f"usefull_{p_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"🪙 Обычными ({final_price} токенов)",
-                    callback_data=f"usenorm_{p_id}",
-                )
-            ],
+            [InlineKeyboardButton(
+                text=t("shop_btn_usefull", lang),
+                callback_data=f"usefull_{p_id}",
+            )],
+            [InlineKeyboardButton(
+                text=t("shop_btn_usenorm", lang, price=final_price),
+                callback_data=f"usenorm_{p_id}",
+            )],
         ]
     )
     await callback.message.answer(
-        "❓ У вас есть фулловый токен. Использовать его или заплатить обычными"
-        f" токенами ({final_price} шт.)?",
+        t("shop_fulltoken_ask", lang, price=final_price),
         reply_markup=kb,
     )
     await callback.answer()
@@ -3151,8 +3104,9 @@ async def process_buy(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("usenorm_"))
 async def process_buy_norm(callback: CallbackQuery, bot: Bot):
+  _lang_norm = await get_lang(callback.from_user.id)
   if await get_restriction(callback.from_user.id):
-    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    await callback.answer(t("restricted_alert", _lang_norm)[:200], show_alert=True)
     return
   p_id = int(callback.data.split("_")[1])
   if await pay_with_tokens(callback, bot, p_id):
@@ -3165,8 +3119,10 @@ async def process_buy_norm(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("usefull_"))
 async def process_buy_full(callback: CallbackQuery):
   user_id = callback.from_user.id
+  user_id = callback.from_user.id
+  lang_res = await get_lang(user_id)
   if await get_restriction(user_id):
-    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    await callback.answer(t("restricted_alert", lang_res)[:200], show_alert=True)
     return
   p_id = int(callback.data.split("_")[1])
 
@@ -3176,7 +3132,8 @@ async def process_buy_full(callback: CallbackQuery):
     ) as cur:
       prod = await cur.fetchone()
     if not prod:
-      await callback.answer("❌ Товар не найден.", show_alert=True)
+      lang_res = await get_lang(user_id)
+      await callback.answer(t("shop_deleted", lang_res), show_alert=True)
       return
     title, link = prod
 
@@ -3188,9 +3145,8 @@ async def process_buy_full(callback: CallbackQuery):
     )
     if cur.rowcount == 0:
       await db.rollback()
-      await callback.answer(
-          "❌ У вас больше нет фулловых токенов.", show_alert=True
-      )
+      lang = await get_lang(user_id)
+      await callback.answer(t("shop_fulltoken_gone", lang), show_alert=True)
       return
     await db.execute(
         "UPDATE products SET buyers_count = buyers_count + 1 WHERE id = ?",
@@ -3202,9 +3158,9 @@ async def process_buy_full(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
   except Exception:
     pass
+  lang = await get_lang(user_id)
   await callback.message.answer(
-      f"✅ Успешная покупка фулла {esc(title)} за фулловый токен!\n\n🔗 Ссылка"
-      f" (нажми, чтобы показать):\n{hidden_link(link)}",
+      t("shop_fulltoken_used", lang, title=esc(title), link=hidden_link(link)),
       disable_web_page_preview=True,
   )
   await callback.answer()
@@ -3316,41 +3272,46 @@ async def show_unique_product_desc(callback: CallbackQuery):
       urow = await cur.fetchone()
 
   if not row or row[3] <= 0:
-    await callback.answer("❌ Товар закончился или удален.", show_alert=True)
+    _lang_us = await get_lang(callback.from_user.id)
+    await callback.answer(t("ushop_gone", _lang_us), show_alert=True)
     return
   title, y_price, t_price, amount, description, photo_id, token_buyers, no_sub = row
   has_u_prem = urow and u_premium_active(urow[0], urow[1]) if urow else False
 
+  lang = await get_lang(user_id)
   cap = f"💎 <b>{esc(title)}</b>\n"
   if y_price > 0:
-    cap += f"💎 Цена: <b>{y_price} уникальных токенов</b>\n"
+    yp_lbl = "💎 Цена:" if lang == "ru" else "💎 Price:"
+    yp_unit = "уникальных токенов" if lang == "ru" else "unique tokens"
+    cap += f"{yp_lbl} <b>{y_price} {yp_unit}</b>\n"
   if t_price > 0:
-    cap += f"🪙 Или: <b>{t_price} обычных токенов</b>\n"
+    tp_lbl = "🪙 Или:" if lang == "ru" else "🪙 Or:"
+    tp_unit = "обычных токенов" if lang == "ru" else "regular tokens"
+    cap += f"{tp_lbl} <b>{t_price} {tp_unit}</b>\n"
   if no_sub:
-    cap += "🔒 <i>Недоступно по подписке — только за токены</i>\n"
-  cap += f"📦 Осталось: <b>{amount}</b>\n"
-  cap += f"👥 Купили за токены: <b>{token_buyers}</b>\n"
+    cap += t("ushop_no_sub", lang) + "\n"
+  cap += t("ushop_amount", lang, n=amount) + "\n"
+  cap += t("ushop_bought", lang, n=token_buyers) + "\n"
   if description:
     cap += f"\n{description}"
 
   buttons = []
-  # Кнопка «по подписке» — если есть уник. подписка и товар не помечен no_sub
   if has_u_prem and not no_sub:
     buttons.append([InlineKeyboardButton(
-        text="💎 Получить по подписке (бесплатно)",
+        text=t("ushop_btn_sub", lang),
         callback_data=f"usubget_{up_id}",
     )])
   if y_price > 0:
     buttons.append([InlineKeyboardButton(
-        text=f"💎 Купить за {y_price} уник. токенов",
+        text=t("ushop_btn_ytokens", lang, n=y_price),
         callback_data=f"ubuy_{up_id}",
     )])
   if t_price > 0:
     buttons.append([InlineKeyboardButton(
-        text=f"🪙 Купить за {t_price} обычных токенов",
+        text=t("ushop_btn_tokens", lang, n=t_price),
         callback_data=f"utbuy_{up_id}",
     )])
-  buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_ushop")])
+  buttons.append([InlineKeyboardButton(text=t("shop_btn_back", lang), callback_data="back_to_ushop")])
   kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
   if photo_id:
@@ -3362,6 +3323,7 @@ async def show_unique_product_desc(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_ushop")
 async def back_to_ushop(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   async with connect() as db:
     async with db.execute(
         "SELECT id, title, price, COALESCE(token_price,0), amount,"
@@ -3369,28 +3331,23 @@ async def back_to_ushop(callback: CallbackQuery):
     ) as cursor:
       u_products = await cursor.fetchall()
   if not u_products:
-    await callback.answer("Уникальный магазин пуст.", show_alert=True)
+    await callback.answer(t("ushop_empty", lang), show_alert=True)
     return
+  stock_word = "ост." if lang == "ru" else "left"
   kb_buttons = []
   for up_id, title, price, token_price, amount, token_buyers in u_products:
-    prices = []
-    if price > 0:
-      prices.append(f"{price} 💎")
-    if token_price > 0:
-      prices.append(f"{token_price} 🪙")
-    price_str = " / ".join(prices) if prices else "бесплатно"
-    btn_text = (f"{title} — {price_str} (ост.: {amount}) | 👥 {token_buyers}")[:60]
+    btn_text = (f"💎 {title} ({stock_word}: {amount})")[:60]
     kb_buttons.append(
         [InlineKeyboardButton(text=btn_text, callback_data=f"udesc_{up_id}")]
     )
   try:
     await callback.message.edit_text(
-        "💎 <b>Уникальный магазин</b>",
+        t("ushop_title", lang),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
     )
   except Exception:
     await callback.message.answer(
-        "💎 <b>Уникальный магазин</b>",
+        t("ushop_title", lang),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
     )
   await callback.answer()
@@ -3398,19 +3355,18 @@ async def back_to_ushop(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("usubget_"))
 async def process_usubget(callback: CallbackQuery):
-  """Получить уникальный товар бесплатно по уникальной подписке."""
   user_id = callback.from_user.id
   up_id = int(callback.data.split("_")[1])
+  lang = await get_lang(user_id)
 
   async with connect() as db:
-    # Проверяем подписку
     async with db.execute(
         "SELECT COALESCE(u_premium,0), u_premium_expires FROM users WHERE user_id = ?",
         (user_id,),
     ) as cur:
       urow = await cur.fetchone()
     if not urow or not u_premium_active(urow[0], urow[1]):
-      await callback.answer("❌ У вас нет активной уникальной подписки.", show_alert=True)
+      await callback.answer(t("ushop_no_uprem", lang), show_alert=True)
       return
 
     async with db.execute(
@@ -3420,19 +3376,16 @@ async def process_usubget(callback: CallbackQuery):
     ) as cur:
       prod = await cur.fetchone()
     if not prod or prod[1] <= 0:
-      await callback.answer("❌ Товар закончился или удален.", show_alert=True)
+      await callback.answer(t("ushop_gone", lang), show_alert=True)
       return
     title, _amount, command_str, no_sub = prod
     if no_sub:
-      await callback.answer(
-          "❌ Этот товар недоступен по подписке — только за токены.",
-          show_alert=True,
-      )
+      await callback.answer(t("ushop_no_sub_err", lang), show_alert=True)
       return
 
     parsed = parse_unique_command(command_str)
     if parsed is None:
-      await callback.answer("❌ Команда товара настроена неверно. Напиши админу.", show_alert=True)
+      await callback.answer(t("ushop_bad_cmd", lang), show_alert=True)
       return
 
     cur = await db.execute(
@@ -3441,7 +3394,7 @@ async def process_usubget(callback: CallbackQuery):
     )
     if cur.rowcount == 0:
       await db.rollback()
-      await callback.answer("❌ Товар закончился.", show_alert=True)
+      await callback.answer(t("ushop_gone", lang), show_alert=True)
       return
     await db.commit()
 
@@ -3449,23 +3402,19 @@ async def process_usubget(callback: CallbackQuery):
     await apply_unique_command(user_id, title, parsed)
   except Exception:
     logging.exception("Ошибка выдачи уник. товара (по подписке)")
-    await callback.message.answer("⚠️ Ошибка при выдаче товара. Напиши админу.")
+    await callback.message.answer(t("ushop_error", lang))
     await callback.answer()
     return
 
-  await callback.message.answer(
-      f"💎 <b>Получено по подписке!</b>\n"
-      f"Вы получили: <b>{esc(title)}</b> бесплатно по уникальной подписке.\n"
-      "Всё уже начислено в профиль."
-  )
+  await callback.message.answer(t("ushop_bought_sub", lang, title=esc(title)))
   await callback.answer()
 
 
 @router.callback_query(F.data.startswith("utbuy_"))
 async def process_utbuy(callback: CallbackQuery):
-  """Покупка уникального товара за обычные токены."""
   user_id = callback.from_user.id
   up_id = int(callback.data.split("_")[1])
+  lang = await get_lang(user_id)
 
   async with connect() as db:
     async with db.execute(
@@ -3475,16 +3424,17 @@ async def process_utbuy(callback: CallbackQuery):
     ) as cur:
       prod = await cur.fetchone()
     if not prod or prod[2] <= 0:
-      await callback.answer("❌ Товар закончился или удален.", show_alert=True)
+      await callback.answer(t("ushop_gone", lang), show_alert=True)
       return
-    title, t_price, _amount, command_str = prod
-    if t_price <= 0:
-      await callback.answer("❌ Этот товар нельзя купить за обычные токены.", show_alert=True)
+    title, tp, _amount, command_str = prod
+    if tp <= 0:
+      not_avail = "❌ Этот товар нельзя купить за обычные токены." if lang == "ru" else "❌ This item cannot be purchased with regular tokens."
+      await callback.answer(not_avail, show_alert=True)
       return
 
     parsed = parse_unique_command(command_str)
     if parsed is None:
-      await callback.answer("❌ Команда товара настроена неверно. Напиши админу.", show_alert=True)
+      await callback.answer(t("ushop_bad_cmd", lang), show_alert=True)
       return
 
     cur = await db.execute(
@@ -3493,25 +3443,22 @@ async def process_utbuy(callback: CallbackQuery):
     )
     if cur.rowcount == 0:
       await db.rollback()
-      await callback.answer("❌ Товар закончился.", show_alert=True)
+      await callback.answer(t("ushop_gone", lang), show_alert=True)
       return
 
     await ensure_user(db, user_id)
     cur = await db.execute(
         "UPDATE users SET tokens = tokens - ? WHERE user_id = ?"
         " AND COALESCE(tokens, 0) >= ?",
-        (t_price, user_id, t_price),
+        (tp, user_id, tp),
     )
     if cur.rowcount == 0:
       await db.rollback()
-      await callback.answer(
-          f"❌ Недостаточно токенов! Нужно: {t_price}.", show_alert=True
-      )
+      await callback.answer(t("ushop_no_tokens_t", lang, n=tp), show_alert=True)
       return
 
     await db.execute(
-        "UPDATE unique_products SET token_buyers = COALESCE(token_buyers,0) + 1"
-        " WHERE id = ?",
+        "UPDATE unique_products SET token_buyers = COALESCE(token_buyers,0) + 1 WHERE id = ?",
         (up_id,),
     )
     await db.commit()
@@ -3520,14 +3467,11 @@ async def process_utbuy(callback: CallbackQuery):
     await apply_unique_command(user_id, title, parsed)
   except Exception:
     logging.exception("Ошибка выдачи уник. товара (за токены)")
-    await callback.message.answer("⚠️ Ошибка при выдаче товара. Напиши админу.")
+    await callback.message.answer(t("ushop_error", lang))
     await callback.answer()
     return
 
-  await callback.message.answer(
-      f"🪙 <b>Успешная покупка!</b>\nВы приобрели: <b>{esc(title)}</b> за"
-      f" {t_price} обычных токенов.\nВсё уже начислено в профиль."
-  )
+  await callback.message.answer(t("ushop_bought_t", lang, title=esc(title), n=tp))
   await callback.answer()
 
 
@@ -3535,6 +3479,7 @@ async def process_utbuy(callback: CallbackQuery):
 async def process_ubuy(callback: CallbackQuery):
   user_id = callback.from_user.id
   up_id = int(callback.data.split("_")[1])
+  lang = await get_lang(user_id)
 
   async with connect() as db:
     async with db.execute(
@@ -3543,27 +3488,22 @@ async def process_ubuy(callback: CallbackQuery):
     ) as cur:
       prod = await cur.fetchone()
     if not prod or prod[2] <= 0:
-      await callback.answer("❌ Товар закончился или удален.", show_alert=True)
+      await callback.answer(t("ushop_gone", lang), show_alert=True)
       return
     title, price, _amount, command_str = prod
 
     parsed = parse_unique_command(command_str)
     if parsed is None:
-      await callback.answer(
-          "❌ У товара неверно настроена команда. Напиши админу.",
-          show_alert=True,
-      )
+      await callback.answer(t("ushop_bad_cmd", lang), show_alert=True)
       return
 
-    # Товар списываем первым и только если он ещё есть
     cur = await db.execute(
-        "UPDATE unique_products SET amount = amount - 1"
-        " WHERE id = ? AND amount > 0",
+        "UPDATE unique_products SET amount = amount - 1 WHERE id = ? AND amount > 0",
         (up_id,),
     )
     if cur.rowcount == 0:
       await db.rollback()
-      await callback.answer("❌ Товар закончился.", show_alert=True)
+      await callback.answer(t("ushop_gone", lang), show_alert=True)
       return
 
     await ensure_user(db, user_id)
@@ -3574,14 +3514,10 @@ async def process_ubuy(callback: CallbackQuery):
     )
     if cur.rowcount == 0:
       await db.rollback()
-      await callback.answer(
-          f"❌ Недостаточно уникальных токенов! Нужно: {price}.",
-          show_alert=True,
-      )
+      await callback.answer(t("ushop_no_tokens_y", lang, n=price), show_alert=True)
       return
     await db.execute(
-        "UPDATE unique_products SET token_buyers = COALESCE(token_buyers,0) + 1"
-        " WHERE id = ?",
+        "UPDATE unique_products SET token_buyers = COALESCE(token_buyers,0) + 1 WHERE id = ?",
         (up_id,),
     )
     await db.commit()
@@ -3590,46 +3526,25 @@ async def process_ubuy(callback: CallbackQuery):
     await apply_unique_command(user_id, title, parsed)
   except Exception:
     logging.exception("Ошибка выдачи товара уник. магазина")
-    await callback.message.answer(
-        "⚠️ Произошла ошибка при выдаче товара. Напиши админу."
-    )
+    await callback.message.answer(t("ushop_error", lang))
     await callback.answer()
     return
 
-  await callback.message.answer(
-      f"💎 <b>Успешная покупка!</b>\nВы приобрели: <b>{esc(title)}</b> за"
-      f" {price} уникальных токенов.\nВсё уже начислено в профиль."
-  )
+  await callback.message.answer(t("ushop_bought_y", lang, title=esc(title), n=price))
   await callback.answer()
 
 
 # --- ГЛАВНОЕ МЕНЮ ---
 
 
-@router.message(
-    F.text.in_(
-        {
-            "👤 Мой Профиль",
-            "🛒 Магазин",
-            "🛍 Магазин",
-            "💎 Уникальный магазин",
-            "👥 Реферальная система",
-            "🏆 Топ игроков",
-            "🪙 Как получить токены?",
-            "💳 Подписки",
-            "🎰 Лотерея",
-            "🔄 Обмены",
-            "🎲 Рулетка",
-            "⚙️ Админ-панель",
-        }
-    )
-)
+@router.message(F.text.func(lambda txt: txt in _ALL_MENU_TEXTS))
 async def menu_router(message: Message, bot: Bot, state: FSMContext):
   await state.clear()
   user_id = message.from_user.id
   text = message.text
+  lang = await get_lang(user_id)
 
-  if text == "👤 Мой Профиль":
+  if text == t("btn_profile", lang):
     async with connect() as db:
       await ensure_user(db, user_id)
       await db.commit()
@@ -3644,30 +3559,29 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         (tokens, y_tokens, full_tokens, is_prem, bought, prem_expires, warns,
          exchanges, u_prem, u_prem_expires) = await cursor.fetchone()
 
-    prem_status = "❌ Не активна"
+    prem_status = t("profile_prem_no", lang)
     if is_prem == 1:
       if premium_active(is_prem, prem_expires):
         exp_date = parse_dt(prem_expires)
         if exp_date:
           days_left = (exp_date - datetime.datetime.now()).days
-          prem_status = f"✅ До {exp_date.strftime('%d.%m.%Y')} ({days_left} дн.)"
+          prem_status = t("profile_prem_active", lang, date=exp_date.strftime('%d.%m.%Y'), days=days_left)
         else:
-          prem_status = "✅ Активна"
+          prem_status = "✅ " + ("Активна" if lang == "ru" else "Active")
       else:
         await remove_premium(user_id)
-        prem_status = "❌ Не активна (истекла)"
+        prem_status = t("profile_prem_expired", lang)
 
     # Уникальная подписка
-    u_prem_status = "❌ Нет"
+    u_prem_status = t("profile_prem_no", lang)
     if u_premium_active(u_prem, u_prem_expires):
       u_exp = parse_dt(u_prem_expires)
       if u_exp:
         u_days_left = (u_exp - datetime.datetime.now()).days
-        u_prem_status = f"✅ До {u_exp.strftime('%d.%m.%Y')} ({u_days_left} дн.)"
+        u_prem_status = t("profile_prem_active", lang, date=u_exp.strftime('%d.%m.%Y'), days=u_days_left)
       else:
-        u_prem_status = "✅ Активна"
+        u_prem_status = "✅ " + ("Активна" if lang == "ru" else "Active")
     elif u_prem == 1:
-      # Истекла — сбрасываем
       async with connect() as db:
         await db.execute(
             "UPDATE users SET u_premium = 0, u_premium_expires = NULL"
@@ -3679,37 +3593,33 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
     aura = await get_user_aura(user_id)
     if aura:
       aura_days = (aura["expires"] - datetime.datetime.now()).days
-      aura_status = (
-          f"✨ <b>{esc(aura['name'])}</b> ({aura['percent']}% бонусов, ещё"
-          f" {aura_days} дн.)"
-      )
+      aura_status = t("profile_aura_active", lang,
+                      name=esc(aura['name']), pct=aura['percent'], days=aura_days)
     else:
-      aura_status = "❌ Нет"
+      aura_status = t("profile_aura_no", lang)
 
     keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎟 Ввести промокод", callback_data="enter_promocode"
-                )
-            ]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(
+            text=t("btn_promo", lang), callback_data="enter_promocode"
+        )]]
     )
+    units = "шт." if lang == "ru" else "pcs."
     await message.answer(
-        f"👤 <b>Ваш Профиль</b>\n\n🆔 Ваш ID: <code>{user_id}</code>\n"
-        f"💲 Баланс токенов: {tokens}\n"
-        f"💎 Уникальные токены: {y_tokens}\n"
-        f"📦 Фулловые токены: {full_tokens}\n"
-        f"👑 Премиум-подписка: {prem_status}\n"
-        f"💎 Уникальная подписка: {u_prem_status}\n"
-        f"✨ Активная аура: {aura_status}\n"
-        f"📦 Собрано фулов: {bought} шт.\n"
-        f"⚠️ Предупреждения: {warns}/{MAX_WARNS}\n"
-        f"🔄 Обменов проведено: {exchanges}",
+        f"{t('profile_title', lang)}\n\n"
+        f"{t('profile_id', lang)}: <code>{user_id}</code>\n"
+        f"{t('profile_tokens', lang)}: {tokens}\n"
+        f"{t('profile_ytokens', lang)}: {y_tokens}\n"
+        f"{t('profile_ftokens', lang)}: {full_tokens}\n"
+        f"{t('profile_premium', lang)}: {prem_status}\n"
+        f"{t('profile_upremium', lang)}: {u_prem_status}\n"
+        f"{t('profile_aura', lang)}: {aura_status}\n"
+        f"{t('profile_bought', lang)}: {bought} {units}\n"
+        f"{t('profile_warns', lang)}: {warns}/{MAX_WARNS}\n"
+        f"{t('profile_exchanges', lang)}: {exchanges}",
         reply_markup=keyboard,
     )
 
-  elif text in ("🛒 Магазин", "🛍 Магазин"):
+  elif text in (t("btn_shop", lang), "🛍 Магазин", t("btn_shop", "ru"), t("btn_shop", "en")):
     async with connect() as db:
       async with db.execute(
           "SELECT id, title, price, buyers_count, token_buyers FROM products"
@@ -3717,25 +3627,24 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         products = await cursor.fetchall()
 
     if not products:
-      await message.answer("📭 В магазине пока пусто. Либо же вы все раскупили!")
+      await message.answer(t("shop_empty", lang))
       return
 
     keyboard_buttons = []
-    for p_id, title, price, buyers_count, token_buyers in products:
+    for p_id, ptitle, price, buyers_count, token_buyers in products:
       if buyers_count == 0:
-        btn_text = f"🔥 {title} — {price} токенов (ПЕРВАЯ ПОКУПКА -80%!)"
+        btn_text = t("shop_first_buy", lang, title=ptitle, price=price)
       else:
-        btn_text = f"📁 {title} — {price} токенов"
+        btn_text = t("shop_item", lang, title=ptitle, price=price)
       keyboard_buttons.append(
-          [InlineKeyboardButton(text=btn_text, callback_data=f"desc_{p_id}")]
+          [InlineKeyboardButton(text=btn_text[:60], callback_data=f"desc_{p_id}")]
       )
     await message.answer(
-        "🛍 <b>Доступные фулы:</b>\n<i>(Нажми на нужный, чтобы посмотреть"
-        " описание)</i>",
+        t("shop_title", lang),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
     )
 
-  elif text == "💎 Уникальный магазин":
+  elif text in (t("btn_ushop", lang), t("btn_ushop", "ru"), t("btn_ushop", "en")):
     async with connect() as db:
       async with db.execute(
           "SELECT id, title, price, COALESCE(token_price,0), amount,"
@@ -3744,78 +3653,67 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
         u_products = await cursor.fetchall()
 
     if not u_products:
-      await message.answer("📭 Уникальный магазин пуст.")
+      await message.answer(t("ushop_empty", lang))
       return
 
+    stock_word = "ост." if lang == "ru" else "left"
     kb_buttons = []
-    for up_id, title, price, token_price, amount, token_buyers in u_products:
-      prices = []
-      if price > 0:
-        prices.append(f"{price} 💎")
-      if token_price > 0:
-        prices.append(f"{token_price} 🪙")
-      price_str = " / ".join(prices) if prices else "бесплатно"
-      btn_text = (
-          f"{title} — {price_str} (ост.: {amount}) | 👥 {token_buyers}"
-      )[:60]
+    for up_id, utitle, price, token_price, amount, token_buyers in u_products:
+      btn_text = (f"💎 {utitle} ({stock_word}: {amount})")[:60]
       kb_buttons.append(
           [InlineKeyboardButton(text=btn_text, callback_data=f"udesc_{up_id}")]
       )
     await message.answer(
-        "💎 <b>Уникальный магазин</b>\nНажми на товар для описания и покупки:",
+        t("ushop_title", lang),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
     )
 
-  elif text == "👥 Реферальная система":
+  elif text in (t("btn_refs", lang), t("btn_refs", "ru"), t("btn_refs", "en")):
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     await message.answer(
-        "👥 <b>Реферальная система</b>\n\nПриглашай друзей по своей ссылке:\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"🎁 За каждого приглашенного (после подписки на канал) —"
-        f" <b>{REF_BONUS} токенов</b>!\n"
-        "💰 А также вы получаете <b>15% дохода</b> от трат ваших рефералов"
-        " токенами в обычном магазине!"
+        f"{t('ref_title', lang)}\n\n"
+        f"{t('ref_link_txt', lang)}\n<code>{ref_link}</code>\n\n"
+        f"{t('ref_bonus_txt', lang, n=REF_BONUS)}\n"
+        f"{t('ref_income_txt', lang)}"
     )
 
-  elif text == "🏆 Топ игроков":
+  elif text in (t("btn_top", lang), t("btn_top", "ru"), t("btn_top", "en")):
     await message.answer(
-        "🏆 <b>Выберите категорию топа:</b>", reply_markup=tops_menu_keyboard()
+        t("top_menu", lang), reply_markup=tops_menu_keyboard(lang)
     )
 
-  elif text == "🪙 Как получить токены?":
+  elif text in (t("btn_howto", lang), t("btn_howto", "ru"), t("btn_howto", "en")):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🪙 Обычные токены", callback_data="howto_tokens")],
-            [InlineKeyboardButton(text="💎 Уникальные токены", callback_data="howto_ytokens")],
-            [InlineKeyboardButton(text="📦 Фулловые токены", callback_data="howto_ftokens")],
+            [InlineKeyboardButton(text=t("howto_btn_tokens", lang), callback_data="howto_tokens")],
+            [InlineKeyboardButton(text=t("howto_btn_ytokens", lang), callback_data="howto_ytokens")],
+            [InlineKeyboardButton(text=t("howto_btn_ftokens", lang), callback_data="howto_ftokens")],
         ]
     )
-    await message.answer(
-        "🪙 <b>Как получить токены?</b>\nВыбери тип токена:", reply_markup=kb
-    )
+    await message.answer(t("howto_menu", lang), reply_markup=kb)
 
-  elif text == "💳 Подписки":
+  elif text in (t("btn_subs", lang), t("btn_subs", "ru"), t("btn_subs", "en")):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👑 Премиум-подписка", callback_data="sub_premium")],
-            [InlineKeyboardButton(text="💎 Уникальная подписка", callback_data="sub_unique")],
+            [InlineKeyboardButton(text=t("sub_btn_premium", lang), callback_data="sub_premium")],
+            [InlineKeyboardButton(text=t("sub_btn_unique", lang), callback_data="sub_unique")],
         ]
     )
-    await message.answer("💳 <b>Подписки</b>\nВыбери тип подписки:", reply_markup=kb)
+    await message.answer(t("subs_menu", lang), reply_markup=kb)
 
-  elif text == "🎰 Лотерея":
-    lottery_text, lottery_kb = await build_lottery_view(user_id)
+  elif text in (t("btn_lottery", lang), t("btn_lottery", "ru"), t("btn_lottery", "en")):
+    lottery_text, lottery_kb = await build_lottery_view(user_id, lang)
     await message.answer(lottery_text, reply_markup=lottery_kb)
 
-  elif text == "🔄 Обмены":
-    await message.answer(await ex_menu_text(), reply_markup=exchange_menu_kb())
+  elif text in (t("btn_exchange", lang), t("btn_exchange", "ru"), t("btn_exchange", "en")):
+    await message.answer(await ex_menu_text(lang), reply_markup=exchange_menu_kb(lang))
 
-  elif text == "🎲 Рулетка":
+  elif text in (t("btn_roulette", lang), t("btn_roulette", "ru"), t("btn_roulette", "en")):
     await state.set_state(RouletteState.bet)
-    await message.answer(await roulette_intro_text(user_id))
+    await message.answer(await roulette_intro_text(user_id, lang))
 
-  elif text == "⚙️ Админ-панель":
+  elif text in (t("btn_admin", lang), t("btn_admin", "ru"), t("btn_admin", "en")):
     if user_id != ADMIN_ID:
       await message.answer("⛔️ У тебя нет доступа!")
       return
@@ -3850,16 +3748,18 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 async def promo_check(message: Message, state: FSMContext):
   user_id = message.from_user.id
   code_text = txt(message)
+  lang = await get_lang(user_id)
   await state.clear()
   reply = await apply_promocode(user_id, code_text)
-  await message.answer(reply, reply_markup=get_main_keyboard(user_id))
+  await message.answer(reply, reply_markup=get_main_keyboard(user_id, lang))
 
 
 @router.callback_query(F.data == "enter_promocode")
 async def promo_prompt(callback: CallbackQuery, state: FSMContext):
   await state.clear()
+  lang = await get_lang(callback.from_user.id)
   await state.set_state(PromocodeState.code)
-  await callback.message.answer("🎟 Введите промокод:")
+  await callback.message.answer(t("promo_ask", lang))
   await callback.answer()
 
 
@@ -4841,31 +4741,31 @@ async def ex_show(event, text, kb=None):
     await event.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-def exchange_menu_kb() -> InlineKeyboardMarkup:
+def exchange_menu_kb(lang: str = "ru") -> InlineKeyboardMarkup:
   return ex_kb([
-      [("➕ Выставить обмен", "ex:new"), ("📋 Все обмены", "ex:all")],
-      [("🔍 Поиск", "ex:search"), ("📦 Мои обмены", "ex:my")],
+      [(t("ex_btn_new", lang), "ex:new"), (t("ex_btn_all", lang), "ex:all")],
+      [(t("ex_btn_search", lang), "ex:search"), (t("ex_btn_my", lang), "ex:my")],
   ])
 
 
-async def ex_menu_text() -> str:
-  return (
-      "🔄 <b>Обмены ссылками</b>\nВыставляй свой обмен или бери чужой."
-      f" Чтобы провести обмен, нужно заплатить {EXCHANGE_COST} токен."
-  )
+async def ex_menu_text(lang: str = "ru") -> str:
+  return t("ex_menu_text", lang, n=EXCHANGE_COST)
 
 
 @router.callback_query(F.data == "ex:menu")
 async def ex_menu_cb(callback: CallbackQuery, state: FSMContext):
   await state.clear()
-  await ex_show(callback, await ex_menu_text(), exchange_menu_kb())
+  lang = await get_lang(callback.from_user.id)
+  await ex_show(callback, await ex_menu_text(lang), exchange_menu_kb(lang))
   await callback.answer()
 
 
 @router.callback_query(F.data == "ex:cancel")
 async def ex_cancel(callback: CallbackQuery, state: FSMContext):
   await state.clear()
-  await ex_show(callback, "Отменено.", ex_kb([[("⬅️ В обмены", "ex:menu")]]))
+  lang = await get_lang(callback.from_user.id)
+  await ex_show(callback, t("cancelled", lang),
+                ex_kb([[( t("ex_btn_back", lang), "ex:menu")]]))
   await callback.answer()
 
 
@@ -4880,8 +4780,9 @@ async def ex_noop(callback: CallbackQuery):
 @router.callback_query(F.data == "ex:new")
 async def ex_new(callback: CallbackQuery, state: FSMContext):
   uid = callback.from_user.id
+  lang = await get_lang(uid)
   if await get_restriction(uid):
-    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    await callback.answer(t("restricted_alert", lang)[:200], show_alert=True)
     return
   cnt = await ex_one(
       "SELECT COUNT(*) n FROM ex_offers WHERE owner_id = ? AND status = 'open'",
@@ -4889,52 +4790,54 @@ async def ex_new(callback: CallbackQuery, state: FSMContext):
   )
   if cnt["n"] >= MAX_OPEN_OFFERS:
     await callback.answer(
-        f"У тебя уже {MAX_OPEN_OFFERS} открытых обменов. Удали лишний.",
-        show_alert=True,
+        t("ex_too_many", lang, n=MAX_OPEN_OFFERS), show_alert=True,
     )
     return
   await state.set_state(NewOfferState.give)
   await ex_show(
       callback,
-      "Что ты <b>отдаёшь</b>? (например: Пантера)",
-      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+      t("ex_give_ask", lang),
+      ex_kb([[(t("ex_btn_cancel", lang), "ex:cancel")]]),
   )
   await callback.answer()
 
 
 @router.message(StateFilter(NewOfferState.give))
 async def ex_new_give(message: Message, state: FSMContext):
+  lang = await get_lang(message.from_user.id)
   text = txt(message)[:60]
   if not text:
-    await message.answer("Напиши текстом, что ты отдаёшь.")
+    await message.answer(t("ex_give_ask", lang))
     return
   await state.update_data(give=text)
   await state.set_state(NewOfferState.want)
   await message.answer(
-      "Что хочешь <b>получить</b>? (например: Сердцеед)",
-      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
+      t("ex_want_ask", lang),
+      reply_markup=ex_kb([[(t("ex_btn_cancel", lang), "ex:cancel")]]),
   )
 
 
 @router.message(StateFilter(NewOfferState.want))
 async def ex_new_want(message: Message, state: FSMContext):
+  lang = await get_lang(message.from_user.id)
   text = txt(message)[:60]
   if not text:
-    await message.answer("Напиши текстом, что хочешь получить.")
+    await message.answer(t("ex_want_ask", lang))
     return
   await state.update_data(want=text)
   await state.set_state(NewOfferState.link)
   await message.answer(
-      f"Отправь <b>свою ссылку</b> для обмена.\n{LINK_RULE}",
-      reply_markup=ex_kb([[("❌ Отмена", "ex:cancel")]]),
+      t("ex_link_ask", lang, rule=t("ex_link_rule", lang)),
+      reply_markup=ex_kb([[(t("ex_btn_cancel", lang), "ex:cancel")]]),
   )
 
 
 @router.message(StateFilter(NewOfferState.link))
 async def ex_new_link(message: Message, state: FSMContext):
+  lang = await get_lang(message.from_user.id)
   link = txt(message)
   if not LINK_RE.match(link):
-    await message.answer(LINK_ERROR)
+    await message.answer(t("ex_link_error", lang))
     return
   data = await state.get_data()
   await state.clear()
@@ -4951,10 +4854,8 @@ async def ex_new_link(message: Message, state: FSMContext):
       ),
   )
   await message.answer(
-      f"✅ Обмен #{offer_id} выставлен: <b>{esc(data['give'])}</b> →"
-      f" <b>{esc(data['want'])}</b>.\nТебе придёт уведомление, когда кто-то"
-      " возьмётся за него.",
-      reply_markup=ex_kb([[("🔄 Обмены", "ex:menu")]]),
+      t("ex_created", lang, id=offer_id, give=esc(data['give']), want=esc(data['want'])),
+      reply_markup=ex_kb([[(t("btn_exchange", lang), "ex:menu")]]),
   )
 
 
@@ -5030,12 +4931,12 @@ async def ex_list_cb(callback: CallbackQuery):
 
 @router.callback_query(F.data == "ex:search")
 async def ex_search(callback: CallbackQuery, state: FSMContext):
+  lang = await get_lang(callback.from_user.id)
   await state.set_state(ExSearchState.query)
   await ex_show(
       callback,
-      "Напиши слово (или два): <b>Пантера</b>, <b>Сердцеед</b>\n"
-      "Или ID человека / номер обмена — только цифры.",
-      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+      t("ex_search_ask", lang),
+      ex_kb([[(t("ex_btn_cancel", lang), "ex:cancel")]]),
   )
   await callback.answer()
 
@@ -5056,59 +4957,51 @@ async def ex_view(callback: CallbackQuery):
   uid = callback.from_user.id
   admin = uid == ADMIN_ID
   o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  lang = await get_lang(uid)
   if not o or o["status"] not in ("open", "taken"):
-    await callback.answer("Этот обмен уже недоступен.", show_alert=True)
+    await callback.answer(t("ex_unavail", lang), show_alert=True)
     return
 
   report_kb = ex_kb([
-      [("🚨 Пожаловаться", f"ex:confirm_rep:{offer_id}")],
-      [("⬅️ Назад", "ex:menu")],
+      [(t("ex_btn_complain", lang), f"ex:confirm_rep:{offer_id}")],
+      [(t("ex_btn_back", lang), "ex:menu")],
   ])
-
   if o["status"] == "open":
-    text = (
-        f"🔄 <b>Обмен #{o['id']}</b>\nОтдаёт: <b>{esc(o['give'])}</b>\nХочет:"
-        f" <b>{esc(o['want'])}</b>\nСтоимость обмена: {EXCHANGE_COST} токен"
-    )
+    text = t("ex_view_open", lang, id=o['id'], give=esc(o['give']),
+             want=esc(o['want']), n=EXCHANGE_COST)
     if admin:
+      admin_lbl = "🛠 <b>Admin:</b>" if lang == "en" else "🛠 <b>Админ:</b>"
       text += (
-          "\n\n🛠 <b>Админ:</b>\n"
-          f"🆔 Обменщик: <code>{o['owner_id']}</code>\n"
-          f"🔗 Ссылка:\n{esc(o['owner_link'])}"
+          f"\n\n{admin_lbl}\n"
+          f"🆔 ID: <code>{o['owner_id']}</code>\n"
+          f"🔗 Link:\n{esc(o['owner_link'])}"
       )
     if o["owner_id"] == uid or admin:
-      kb = ex_kb(
-          [[("🗑 Удалить", f"ex:del:{offer_id}")], [("⬅️ Назад", "ex:list:0")]]
-      )
+      kb = ex_kb([
+          [(t("ex_btn_delete", lang), f"ex:del:{offer_id}")],
+          [("⬅️", "ex:list:0")],
+      ])
     else:
       kb = ex_kb([
-          [("🤝 Провести обмен", f"ex:take:{offer_id}")],
-          [("⬅️ Назад", "ex:list:0")],
+          [(t("ex_btn_take", lang), f"ex:take:{offer_id}")],
+          [("⬅️", "ex:list:0")],
       ])
   elif uid == o["owner_id"]:
-    text = (
-        f"✅ <b>Обмен #{o['id']} завершен!</b>\n"
-        f"🆔 ID обменщика: <code>{o['taker_id']}</code>\n"
-        f"🔗 Ссылка взявшегося:\n{esc(o['taker_link'])}"
-    )
+    text = t("ex_view_done_own", lang, id=o['id'], uid=o['taker_id'], link=esc(o['taker_link']))
     kb = report_kb
   elif uid == o["taker_id"]:
-    text = (
-        f"✅ <b>Обмен #{o['id']} завершен!</b>\n"
-        f"🆔 ID владельца: <code>{o['owner_id']}</code>\n"
-        f"🔗 Ссылка владельца:\n{esc(o['owner_link'])}"
-    )
+    text = t("ex_view_done_take", lang, id=o['id'], uid=o['owner_id'], link=esc(o['owner_link']))
     kb = report_kb
   elif admin:
     text = (
-        f"✅ <b>Обмен #{o['id']} (завершён)</b>\n"
+        f"✅ <b>Exchange #{o['id']} (done)</b>\n"
         f"{esc(o['give'])} → {esc(o['want'])}\n\n"
-        f"👤 Владелец: <code>{o['owner_id']}</code>\n{esc(o['owner_link'])}\n\n"
-        f"🤝 Взял: <code>{o['taker_id']}</code>\n{esc(o['taker_link'])}"
+        f"👤 Owner: <code>{o['owner_id']}</code>\n{esc(o['owner_link'])}\n\n"
+        f"🤝 Taker: <code>{o['taker_id']}</code>\n{esc(o['taker_link'])}"
     )
-    kb = ex_kb([[("⬅️ Назад", "ex:list:0")]])
+    kb = ex_kb([[("⬅️", "ex:list:0")]])
   else:
-    await callback.answer("Этот обмен уже недоступен.", show_alert=True)
+    await callback.answer(t("ex_unavail", lang), show_alert=True)
     return
 
   await ex_show(callback, text, kb)
@@ -5119,6 +5012,7 @@ async def ex_view(callback: CallbackQuery):
 async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
   await state.clear()
   uid = callback.from_user.id
+  lang = await get_lang(uid)
   rows = await ex_all(
       "SELECT * FROM ex_offers WHERE (owner_id = ? OR taker_id = ?) AND status"
       " IN ('open', 'taken') ORDER BY id DESC LIMIT 10",
@@ -5127,8 +5021,8 @@ async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
   if not rows:
     await ex_show(
         callback,
-        "📦 У вас нет активных обменов.",
-        ex_kb([[("⬅️ В обмены", "ex:menu")]]),
+        t("ex_my_empty", lang),
+        ex_kb([[(t("ex_btn_back", lang), "ex:menu")]]),
     )
     await callback.answer()
     return
@@ -5138,8 +5032,8 @@ async def ex_my_cb(callback: CallbackQuery, state: FSMContext):
         f"ex:view:{r['id']}")]
       for r in rows
   ]
-  buttons.append([("⬅️ В обмены", "ex:menu")])
-  await ex_show(callback, "📦 <b>Ваши обмены:</b>", ex_kb(buttons))
+  buttons.append([(t("ex_btn_back", lang), "ex:menu")])
+  await ex_show(callback, t("ex_my_title", lang), ex_kb(buttons))
   await callback.answer()
 
 
@@ -5152,10 +5046,11 @@ async def ex_delete_offer(callback: CallbackQuery):
       " 'open' AND (owner_id = ? OR ? = ?)",
       (offer_id, uid, uid, ADMIN_ID),
   )
+  lang = await get_lang(callback.from_user.id)
   if not rc:
-    await callback.answer("Нельзя удалить этот обмен.", show_alert=True)
+    await callback.answer(t("ex_unavail", lang), show_alert=True)
     return
-  await ex_show(callback, "🗑 Обмен удален.", ex_kb([[("🔄 Обмены", "ex:menu")]]))
+  await ex_show(callback, t("ex_deleted", lang), ex_kb([[(t("btn_exchange", lang), "ex:menu")]]))
   await callback.answer()
 
 
@@ -5166,47 +5061,55 @@ async def ex_delete_offer(callback: CallbackQuery):
 async def ex_take(callback: CallbackQuery, state: FSMContext):
   offer_id = int(callback.data.split(":")[2])
   uid = callback.from_user.id
+  lang = await get_lang(uid)
   o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
   if not o or o["status"] != "open":
-    await callback.answer("Этот обмен уже забрали или удалили.", show_alert=True)
+    await callback.answer(t("ex_taken", lang), show_alert=True)
     return
   if o["owner_id"] == uid:
-    await callback.answer("Это твой обмен.", show_alert=True)
+    await callback.answer(t("ex_own", lang), show_alert=True)
     return
   if await get_restriction(uid):
-    await callback.answer(RESTRICTED_ALERT, show_alert=True)
+    await callback.answer(t("restricted_alert", lang)[:200], show_alert=True)
     return
   bal = await ex_one(
       "SELECT COALESCE(tokens, 0) t FROM users WHERE user_id = ?", (uid,)
   )
   if not bal or bal["t"] < EXCHANGE_COST:
-    await callback.answer(
-        f"Нужно {EXCHANGE_COST} токен для обмена.", show_alert=True
-    )
+    await callback.answer(t("ex_no_tokens", lang, n=EXCHANGE_COST), show_alert=True)
     return
   await state.set_state(ExTakeState.link)
   await state.update_data(offer_id=offer_id)
+  give_txt = (
+      f"Exchange #{offer_id}: <b>{esc(o['give'])}</b> → <b>{esc(o['want'])}</b>\n\n"
+      if lang == "en" else
+      f"Обмен #{offer_id}: <b>{esc(o['give'])}</b> → <b>{esc(o['want'])}</b>\n\n"
+  )
+  cost_note = (
+      f"Send <b>your link</b>. {EXCHANGE_COST} token will be charged.\n"
+      if lang == "en" else
+      f"Отправь <b>свою ссылку</b>. Спишется {EXCHANGE_COST} токен.\n"
+  )
   await ex_show(
       callback,
-      f"Обмен #{offer_id}: <b>{esc(o['give'])}</b> → <b>{esc(o['want'])}</b>\n\n"
-      "Отправь <b>свою ссылку</b>. После этого спишется"
-      f" {EXCHANGE_COST} токен и ты получишь ссылку обменщика.\n{LINK_RULE}",
-      ex_kb([[("❌ Отмена", "ex:cancel")]]),
+      give_txt + cost_note + t("ex_link_rule", lang),
+      ex_kb([[(t("ex_btn_cancel", lang), "ex:cancel")]]),
   )
   await callback.answer()
 
 
 @router.message(StateFilter(ExTakeState.link))
 async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
+  uid = message.from_user.id
+  lang = await get_lang(uid)
   link = txt(message)
   if not LINK_RE.match(link):
-    await message.answer(LINK_ERROR)
+    await message.answer(t("ex_link_error", lang))
     return
-  uid = message.from_user.id
   offer_id = (await state.get_data())["offer_id"]
   await state.clear()
   if await get_restriction(uid):
-    await message.answer(RESTRICTED_TEXT)
+    await message.answer(t("restricted_text", lang, appeal=t("appeal", lang)))
     return
 
   now_ts = int(datetime.datetime.now().timestamp())
@@ -5216,9 +5119,8 @@ async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
       (uid, link, now_ts, offer_id, uid),
   )
   if not rc:
-    await message.answer("Не успел — этот обмен уже забрали.")
+    await message.answer(t("ex_too_late", lang))
     return
-  # Списание токена: только если хватает
   rc, _ = await ex_exec(
       "UPDATE users SET tokens = tokens - ? WHERE user_id = ? AND"
       " COALESCE(tokens, 0) >= ?",
@@ -5230,7 +5132,7 @@ async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
         " taker_link = NULL, taken = NULL WHERE id = ?",
         (offer_id,),
     )
-    await message.answer(f"Не хватает токенов (нужно {EXCHANGE_COST}).")
+    await message.answer(t("ex_no_balance", lang, n=EXCHANGE_COST))
     return
 
   o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
@@ -5239,20 +5141,22 @@ async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
       " WHERE user_id IN (?, ?)",
       (o["owner_id"], uid),
   )
-  report_kb = ex_kb([[("🚨 Пожаловаться", f"ex:confirm_rep:{offer_id}")]])
+  report_kb = ex_kb([[(t("ex_btn_complain", lang), f"ex:confirm_rep:{offer_id}")]])
   await message.answer(
-      f"🤝 <b>Обмен #{offer_id}</b>: {esc(o['give'])} → {esc(o['want'])}\n"
-      f"Ссылка обменщика (ID <code>{o['owner_id']}</code>):\n"
-      f"{esc(o['owner_link'])}\n\nСписано {EXCHANGE_COST} токен.",
+      t("ex_done_taker", lang, id=offer_id, give=esc(o['give']),
+        want=esc(o['want']), owner=o['owner_id'],
+        link=esc(o['owner_link']), n=EXCHANGE_COST),
       reply_markup=report_kb,
       disable_web_page_preview=True,
   )
+  owner_lang = await get_lang(o["owner_id"])
+  owner_report_kb = ex_kb([[(t("ex_btn_complain", owner_lang), f"ex:confirm_rep:{offer_id}")]])
   await safe_send(
       bot,
       o["owner_id"],
-      f"🔔 ID <code>{uid}</code> взялся за твой обмен #{offer_id}:"
-      f" {esc(o['give'])} → {esc(o['want'])}\nЕго ссылка:\n{esc(link)}",
-      reply_markup=report_kb,
+      t("ex_notif_owner", owner_lang, uid=uid, id=offer_id,
+        give=esc(o['give']), want=esc(o['want']), link=esc(link)),
+      reply_markup=owner_report_kb,
       disable_web_page_preview=True,
   )
 
@@ -5263,17 +5167,14 @@ async def ex_take_link(message: Message, state: FSMContext, bot: Bot):
 @router.callback_query(F.data.startswith("ex:confirm_rep:"))
 async def ex_confirm_report(callback: CallbackQuery):
   offer_id = int(callback.data.split(":")[2])
-  text = (
-      "⚠️ <b>Вы уверены, что хотите подать жалобу на этого пользователя?</b>"
-      "\n\n• При ложной жалобе вы получите <b>1 предупреждение</b>.\n• Если"
-      " вас реально обманули (ссылка неверная или закрыта ключом) — смело"
-      " отправляйте жалобу."
-  )
+  lang = await get_lang(callback.from_user.id)
+  yes_txt = "✅ Да, отправить жалобу" if lang == "ru" else "✅ Yes, file complaint"
+  no_txt  = t("ex_btn_cancel", lang)
   kb = ex_kb([
-      [("✅ Да, отправить жалобу", f"ex:rep:{offer_id}")],
-      [("❌ Отмена", f"ex:view:{offer_id}")],
+      [(yes_txt, f"ex:rep:{offer_id}")],
+      [(no_txt, f"ex:view:{offer_id}")],
   ])
-  await ex_show(callback, text, kb)
+  await ex_show(callback, t("ex_complain_confirm", lang), kb)
   await callback.answer()
 
 
@@ -5293,6 +5194,7 @@ async def ex_report(callback: CallbackQuery, bot: Bot):
     await callback.answer("Ошибка доступа.", show_alert=True)
     return
 
+  lang = await get_lang(uid)
   try:
     _, report_id = await ex_exec(
         "INSERT INTO ex_reports (offer_id, complainer_id, accused_id, created)"
@@ -5300,9 +5202,7 @@ async def ex_report(callback: CallbackQuery, bot: Bot):
         (offer_id, uid, accused, int(datetime.datetime.now().timestamp())),
     )
   except aiosqlite.IntegrityError:
-    await callback.answer(
-        "Ты уже отправил жалобу по этому обмену.", show_alert=True
-    )
+    await callback.answer(t("ex_complain_dup", lang), show_alert=True)
     return
 
   until = datetime.datetime.now() + datetime.timedelta(hours=RESTRICT_HOURS)
@@ -5310,17 +5210,16 @@ async def ex_report(callback: CallbackQuery, bot: Bot):
       "UPDATE users SET restricted_until = ? WHERE user_id = ?",
       (until.strftime(DT_FORMAT), accused),
   )
-  await callback.answer("🚨 Жалоба отправлена админу.", show_alert=True)
+  await callback.answer(t("ex_complain_sent", lang), show_alert=True)
   try:
     await callback.message.edit_reply_markup(reply_markup=None)
   except Exception:
     pass
-
+  accused_lang = await get_lang(accused)
   await safe_send(
       bot,
       accused,
-      f"🚨 На вас подана жалоба по обмену #{offer_id}. Обмены и покупки в"
-      " магазине временно ограничены до решения администратора.",
+      t("ex_restricted_notif", accused_lang, id=offer_id),
   )
   sent = await safe_send(
       bot,
@@ -5528,83 +5427,63 @@ async def roulette_play(user_id: int, bet: int) -> dict:
   return {"win": win, "balance": balance}
 
 
-def roulette_result_kb(bet: int) -> InlineKeyboardMarkup:
+def roulette_result_kb(bet: int, lang: str = "ru") -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text=f"🔁 Сыграть снова ({bet} токен.)",
-                  callback_data=f"rl_again_{bet}",
-              )
-          ],
-          [InlineKeyboardButton(text="💰 Другая ставка", callback_data="rl_new")],
+          [InlineKeyboardButton(
+              text=t("roulette_btn_again", lang, n=bet),
+              callback_data=f"rl_again_{bet}",
+          )],
+          [InlineKeyboardButton(text=t("roulette_btn_new", lang), callback_data="rl_new")],
       ]
   )
 
 
-async def roulette_intro_text(user_id: int) -> str:
+async def roulette_intro_text(user_id: int, lang: str = "ru") -> str:
   async with connect() as db:
     async with db.execute(
         "SELECT COALESCE(tokens, 0) FROM users WHERE user_id = ?", (user_id,)
     ) as cur:
       row = await cur.fetchone()
   balance = row[0] if row else 0
-  return (
-      "🎲 <b>Рулетка 50/50</b>\n\n"
-      "Ставишь токены — и либо удваиваешь их, либо теряешь.\n"
-      "Выиграл: получаешь ставку ×2 (ставка 4 → на баланс вернётся 8).\n"
-      "Проиграл: ставка сгорает.\n\n"
-      f"💰 Ставка: от <b>{ROULETTE_MIN}</b> до <b>{ROULETTE_MAX}</b> токенов.\n"
-      f"Твой баланс: <b>{balance}</b> токенов.\n\n"
-      "✍️ Напиши в чат, сколько токенов ставишь:"
-  )
+  return t("roulette_intro", lang, min=ROULETTE_MIN, max=ROULETTE_MAX, bal=balance)
 
 
-def roulette_result_text(bet: int, res: dict) -> str:
+def roulette_result_text(bet: int, res: dict, lang: str = "ru") -> str:
   if res["win"]:
-    return (
-        f"🎉 <b>Победа!</b> Ставка {bet} → <b>+{bet}</b> токенов.\n"
-        f"Баланс: <b>{res['balance']}</b>"
-    )
-  return (
-      f"💥 <b>Проигрыш.</b> Ставка {bet} токенов сгорела.\n"
-      f"Баланс: <b>{res['balance']}</b>"
-  )
+    return t("roulette_win", lang, bet=bet, bal=res["balance"])
+  return t("roulette_lose", lang, bet=bet, bal=res["balance"])
 
 
 @router.message(StateFilter(RouletteState.bet))
 async def roulette_bet(message: Message, state: FSMContext):
   raw = txt(message)
+  lang = await get_lang(message.from_user.id)
   if not raw.isdigit() or not ROULETTE_MIN <= int(raw) <= ROULETTE_MAX:
-    await message.answer(
-        f"Напиши число от {ROULETTE_MIN} до {ROULETTE_MAX} — сколько токенов"
-        " ставишь."
-    )
+    await message.answer(t("roulette_bad_bet", lang, min=ROULETTE_MIN, max=ROULETTE_MAX))
     return
   bet = int(raw)
   res = await roulette_play(message.from_user.id, bet)
   if "error" in res:
-    await message.answer(
-        f"❌ Не хватает токенов. Баланс: <b>{res['balance']}</b>. Напиши"
-        " ставку поменьше или нажми другую кнопку меню."
-    )
+    await message.answer(t("roulette_no_tokens", lang, bal=res["balance"]))
     return
   await state.clear()
   await message.answer(
-      roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
+      roulette_result_text(bet, res, lang), reply_markup=roulette_result_kb(bet, lang)
   )
 
 
 @router.callback_query(F.data.startswith("rl_again_"))
 async def roulette_again(callback: CallbackQuery):
   bet = int(callback.data.split("_")[2])
+  lang = await get_lang(callback.from_user.id)
   if not ROULETTE_MIN <= bet <= ROULETTE_MAX:
     await callback.answer()
     return
   res = await roulette_play(callback.from_user.id, bet)
   if "error" in res:
     await callback.answer(
-        f"❌ Не хватает токенов. Баланс: {res['balance']}", show_alert=True
+        t("roulette_no_tokens", lang, bal=res["balance"])[:200], show_alert=True
     )
     return
   await callback.answer()
@@ -5613,15 +5492,16 @@ async def roulette_again(callback: CallbackQuery):
   except Exception:
     pass
   await callback.message.answer(
-      roulette_result_text(bet, res), reply_markup=roulette_result_kb(bet)
+      roulette_result_text(bet, res, lang), reply_markup=roulette_result_kb(bet, lang)
   )
 
 
 @router.callback_query(F.data == "rl_new")
 async def roulette_new(callback: CallbackQuery, state: FSMContext):
+  lang = await get_lang(callback.from_user.id)
   await state.set_state(RouletteState.bet)
   await callback.answer()
-  await callback.message.answer(await roulette_intro_text(callback.from_user.id))
+  await callback.message.answer(await roulette_intro_text(callback.from_user.id, lang))
 
 
 # --- ГЛОБАЛЬНЫЙ ЛОВЕЦ ОШИБОК ---
