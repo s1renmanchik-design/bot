@@ -65,7 +65,7 @@ MAX_WARNS = 3
 PERM_BAN = "2999-12-31 00:00:00"
 
 # Рефералы
-REF_BONUS = 7  # токенов пригласившему за подписавшегося реферала
+REF_BONUS = 3  # токенов пригласившему за подписавшегося реферала
 
 # Топы
 TOP_RESET_DAYS = 14
@@ -5337,24 +5337,27 @@ def roulette_decide(
     session_start: int = 0,
 ) -> bool:
   """
-  session_start — баланс в начале сессии (до первой ставки в этой серии).
-  Если игрок вырос с 3 до 10+ токенов — шанс начинает падать.
-  Если вырос с 3 до 15+ — падает сильнее.
+  Базовый шанс 52% — долгосрок чуть в плюс, но очень медленно.
+  Скрытые штрафы не дают сильно разгуляться.
   """
-  # Базовый шанс 55%; аура добавляет/отнимает (clamp 0..1)
-  base_chance = max(0.0, min(1.0, 0.55 + aura_percent / 100.0))
+  # Базовый шанс 52%; аура добавляет/отнимает (clamp 0..1)
+  base_chance = max(0.0, min(1.0, 0.52 + aura_percent / 100.0))
 
-  # Скрытый штраф за накопление (порог 50)
-  if current_tokens >= 50 and base_chance > 0.30:
-    base_chance = 0.30
+  # Скрытый штраф за накопление: порог 20 токенов → шанс падает до 42%
+  if current_tokens >= 20 and base_chance > 0.42:
+    base_chance = 0.42
 
-  # Скрытый штраф за рост в сессии (3→10 или 3→15)
+  # При 40+ токенах — ещё жёстче: 32%
+  if current_tokens >= 40 and base_chance > 0.32:
+    base_chance = 0.32
+
+  # Скрытый штраф за рост в сессии
   if session_start > 0:
     growth = current_tokens - session_start
-    if growth >= 12:          # вырос на 12+ токенов за сессию
-      base_chance = min(base_chance, 0.35)
-    elif growth >= 7:          # вырос на 7+ токенов за сессию
-      base_chance = min(base_chance, 0.42)
+    if growth >= 10:          # вырос на 10+ токенов за сессию → 36%
+      base_chance = min(base_chance, 0.36)
+    elif growth >= 5:          # вырос на 5+ токенов за сессию → 44%
+      base_chance = min(base_chance, 0.44)
 
   return random.random() < base_chance
 
