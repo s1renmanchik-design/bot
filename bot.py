@@ -336,6 +336,13 @@ async def get_lang(user_id: int) -> str:
   return (row[0] if row and row[0] in ("ru", "en") else "ru")
 
 
+def localize(ru_val, en_val, lang: str) -> str:
+  """Возвращает en_val если lang='en' и en_val заполнен, иначе ru_val."""
+  if lang == "en" and en_val:
+    return en_val
+  return ru_val or ""
+
+
 async def set_lang(user_id: int, lang: str) -> None:
   async with connect() as db:
     await ensure_user(db, user_id)
@@ -474,10 +481,12 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
+            title_en TEXT DEFAULT NULL,
             price TEXT,
             link TEXT,
             buyers_count INTEGER DEFAULT 0,
             description TEXT DEFAULT NULL,
+            description_en TEXT DEFAULT NULL,
             photo_id TEXT DEFAULT NULL,
             token_buyers INTEGER DEFAULT 0
         );
@@ -488,11 +497,13 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS unique_products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
+            title_en TEXT DEFAULT NULL,
             price INTEGER,
             token_price INTEGER DEFAULT 0,
             amount INTEGER,
             command TEXT,
             description TEXT DEFAULT NULL,
+            description_en TEXT DEFAULT NULL,
             photo_id TEXT DEFAULT NULL,
             token_buyers INTEGER DEFAULT 0,
             no_sub INTEGER DEFAULT 0
@@ -613,12 +624,16 @@ async def init_db():
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
             "description": "TEXT DEFAULT NULL",
+            "description_en": "TEXT DEFAULT NULL",
+            "title_en": "TEXT DEFAULT NULL",
             "photo_id": "TEXT DEFAULT NULL",
             "token_buyers": "INTEGER DEFAULT 0",
         },
         "unique_products": {
             "token_price": "INTEGER DEFAULT 0",
             "description": "TEXT DEFAULT NULL",
+            "description_en": "TEXT DEFAULT NULL",
+            "title_en": "TEXT DEFAULT NULL",
             "photo_id": "TEXT DEFAULT NULL",
             "token_buyers": "INTEGER DEFAULT 0",
             "no_sub": "INTEGER DEFAULT 0",
@@ -652,19 +667,23 @@ async def init_db():
 
 class AddProduct(StatesGroup):
   title = State()
+  title_en = State()
   price = State()
   link = State()
   description = State()
+  description_en = State()
   photo = State()
 
 
 class AddUniqueProduct(StatesGroup):
   title = State()
+  title_en = State()
   price = State()
   token_price = State()
   amount = State()
   command = State()
   description = State()
+  description_en = State()
   photo = State()
 
 
@@ -2948,18 +2967,20 @@ async def pay_with_tokens(callback: CallbackQuery, bot: Bot, p_id: int) -> bool:
 async def show_product_desc(callback: CallbackQuery):
   """Показывает описание товара (фото + текст) и кнопку «Купить»."""
   p_id = int(callback.data.split("_")[1])
+  _lang_desc = await get_lang(callback.from_user.id)
   async with connect() as db:
     async with db.execute(
-        "SELECT title, price, buyers_count, description, photo_id, token_buyers"
-        " FROM products WHERE id = ?",
+        "SELECT title, title_en, price, buyers_count, description,"
+        " description_en, photo_id, token_buyers FROM products WHERE id = ?",
         (p_id,),
     ) as cur:
       row = await cur.fetchone()
   if not row:
-    _lang_nd = await get_lang(callback.from_user.id)
-    await callback.answer(t("shop_deleted", _lang_nd), show_alert=True)
+    await callback.answer(t("shop_deleted", _lang_desc), show_alert=True)
     return
-  title, price, buyers_count, description, photo_id, token_buyers = row
+  _title_ru, _title_en, price, buyers_count, _desc_ru, _desc_en, photo_id, token_buyers = row
+  title = localize(_title_ru, _title_en, _lang_desc)
+  description = localize(_desc_ru, _desc_en, _lang_desc)
   final_price = max(1, int(parse_price(price) * 0.2)) if buyers_count == 0 else parse_price(price)
   first_buy = buyers_count == 0
 
@@ -2988,21 +3009,23 @@ async def show_product_desc(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_shop")
 async def back_to_shop(callback: CallbackQuery):
+  lang = await get_lang(callback.from_user.id)
   async with connect() as db:
     async with db.execute(
-        "SELECT id, title, price, buyers_count, token_buyers FROM products"
+        "SELECT id, title, COALESCE(title_en,''), price, buyers_count,"
+        " token_buyers FROM products"
     ) as cursor:
       products = await cursor.fetchall()
   if not products:
-    await callback.answer("Магазин пуст.", show_alert=True)
+    await callback.answer(t("shop_empty", lang), show_alert=True)
     return
   keyboard_buttons = []
-  lang = await get_lang(callback.from_user.id)
-  for p_id, title, price, buyers_count, token_buyers in products:
+  for p_id, _tru, _ten, price, buyers_count, token_buyers in products:
+    ptitle = localize(_tru, _ten, lang)
     if buyers_count == 0:
-      btn_text = t("shop_first_buy", lang, title=title, price=price)
+      btn_text = t("shop_first_buy", lang, title=ptitle, price=price)
     else:
-      btn_text = t("shop_item", lang, title=title, price=price)
+      btn_text = t("shop_item", lang, title=ptitle, price=price)
     keyboard_buttons.append(
         [InlineKeyboardButton(text=btn_text[:60], callback_data=f"desc_{p_id}")]
     )
@@ -3257,10 +3280,12 @@ async def show_unique_product_desc(callback: CallbackQuery):
   up_id = int(callback.data.split("_")[1])
   user_id = callback.from_user.id
 
+  lang = await get_lang(user_id)
   async with connect() as db:
     async with db.execute(
-        "SELECT title, price, COALESCE(token_price,0), amount, description,"
-        " photo_id, COALESCE(token_buyers,0), COALESCE(no_sub,0)"
+        "SELECT title, COALESCE(title_en,''), price, COALESCE(token_price,0),"
+        " amount, description, COALESCE(description_en,''), photo_id,"
+        " COALESCE(token_buyers,0), COALESCE(no_sub,0)"
         " FROM unique_products WHERE id = ?",
         (up_id,),
     ) as cur:
@@ -3271,14 +3296,13 @@ async def show_unique_product_desc(callback: CallbackQuery):
     ) as cur:
       urow = await cur.fetchone()
 
-  if not row or row[3] <= 0:
-    _lang_us = await get_lang(callback.from_user.id)
-    await callback.answer(t("ushop_gone", _lang_us), show_alert=True)
+  if not row or row[4] <= 0:
+    await callback.answer(t("ushop_gone", lang), show_alert=True)
     return
-  title, y_price, t_price, amount, description, photo_id, token_buyers, no_sub = row
+  _tru, _ten, y_price, t_price, amount, _dru, _den, photo_id, token_buyers, no_sub = row
+  title = localize(_tru, _ten, lang)
+  description = localize(_dru, _den, lang)
   has_u_prem = urow and u_premium_active(urow[0], urow[1]) if urow else False
-
-  lang = await get_lang(user_id)
   cap = f"💎 <b>{esc(title)}</b>\n"
   if y_price > 0:
     yp_lbl = "💎 Цена:" if lang == "ru" else "💎 Price:"
@@ -3622,7 +3646,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text in (t("btn_shop", lang), "🛍 Магазин", t("btn_shop", "ru"), t("btn_shop", "en")):
     async with connect() as db:
       async with db.execute(
-          "SELECT id, title, price, buyers_count, token_buyers FROM products"
+          "SELECT id, title, COALESCE(title_en,''), price, buyers_count,"
+          " token_buyers FROM products"
       ) as cursor:
         products = await cursor.fetchall()
 
@@ -3631,7 +3656,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
       return
 
     keyboard_buttons = []
-    for p_id, ptitle, price, buyers_count, token_buyers in products:
+    for p_id, _tru, _ten, price, buyers_count, token_buyers in products:
+      ptitle = localize(_tru, _ten, lang)
       if buyers_count == 0:
         btn_text = t("shop_first_buy", lang, title=ptitle, price=price)
       else:
@@ -3647,8 +3673,9 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
   elif text in (t("btn_ushop", lang), t("btn_ushop", "ru"), t("btn_ushop", "en")):
     async with connect() as db:
       async with db.execute(
-          "SELECT id, title, price, COALESCE(token_price,0), amount,"
-          " COALESCE(token_buyers,0) FROM unique_products WHERE amount > 0"
+          "SELECT id, title, COALESCE(title_en,''), price,"
+          " COALESCE(token_price,0), amount, COALESCE(token_buyers,0)"
+          " FROM unique_products WHERE amount > 0"
       ) as cursor:
         u_products = await cursor.fetchall()
 
@@ -3658,7 +3685,8 @@ async def menu_router(message: Message, bot: Bot, state: FSMContext):
 
     stock_word = "ост." if lang == "ru" else "left"
     kb_buttons = []
-    for up_id, utitle, price, token_price, amount, token_buyers in u_products:
+    for up_id, _utru, _uten, price, token_price, amount, token_buyers in u_products:
+      utitle = localize(_utru, _uten, lang)
       btn_text = (f"💎 {utitle} ({stock_word}: {amount})")[:60]
       kb_buttons.append(
           [InlineKeyboardButton(text=btn_text, callback_data=f"udesc_{up_id}")]
@@ -4043,6 +4071,17 @@ async def process_product_title(message: Message, state: FSMContext):
     await message.answer("❌ Введи название текстом.")
     return
   await state.update_data(title=txt(message))
+  await message.answer(
+      "🇬🇧 Введи название на <b>английском</b> (EN).\n"
+      "Или напиши <code>-</code> чтобы пропустить:"
+  )
+  await state.set_state(AddProduct.title_en)
+
+
+@router.message(StateFilter(AddProduct.title_en))
+async def process_product_title_en(message: Message, state: FSMContext):
+  raw = txt(message)
+  await state.update_data(title_en=None if raw == "-" else raw)
   await message.answer("💰 Введи цену в токенах (число, например: 15):")
   await state.set_state(AddProduct.price)
 
@@ -4080,6 +4119,17 @@ async def process_product_description(message: Message, state: FSMContext):
   desc = txt(message)
   await state.update_data(description=None if desc == "-" else desc)
   await message.answer(
+      "🇬🇧 Введи описание на <b>английском</b> (EN).\n"
+      "Или напиши <code>-</code> чтобы пропустить:"
+  )
+  await state.set_state(AddProduct.description_en)
+
+
+@router.message(StateFilter(AddProduct.description_en))
+async def process_product_description_en(message: Message, state: FSMContext):
+  raw = txt(message)
+  await state.update_data(description_en=None if raw == "-" else raw)
+  await message.answer(
       "🖼 Отправь фото для товара (как изображение, не файл).\n"
       "Или напиши <code>-</code> чтобы пропустить."
   )
@@ -4098,14 +4148,16 @@ async def process_product_photo(message: Message, state: FSMContext):
   await state.clear()
   async with connect() as db:
     await db.execute(
-        "INSERT INTO products (title, price, link, buyers_count, description,"
-        " photo_id) VALUES (?, ?, ?, 0, ?, ?)",
-        (data["title"], data["price"], data["link"],
-         data.get("description"), photo_id),
+        "INSERT INTO products (title, title_en, price, link, buyers_count,"
+        " description, description_en, photo_id)"
+        " VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+        (data["title"], data.get("title_en"), data["price"], data["link"],
+         data.get("description"), data.get("description_en"), photo_id),
     )
     await db.commit()
+  en_note = f" / {esc(data['title_en'])}" if data.get("title_en") else ""
   await message.answer(
-      f"✅ Фулл добавлен в магазин!\n\n📌 Название: {esc(data['title'])}\n"
+      f"✅ Фулл добавлен в магазин!\n\n📌 Название: {esc(data['title'])}{en_note}\n"
       f"💰 Цена: {esc(data['price'])} токенов\n🔗 Ссылка: {esc(data['link'])}\n"
       "🎁 Активирована скидка 80% для первого покупателя!"
   )
@@ -4152,10 +4204,12 @@ async def process_edit_product_select(callback: CallbackQuery, state: FSMContext
     return
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="📝 Название", callback_data="ef_title")],
+          [InlineKeyboardButton(text="📝 Название (RU)", callback_data="ef_title")],
+          [InlineKeyboardButton(text="📝 Название (EN)", callback_data="ef_title_en")],
           [InlineKeyboardButton(text="💰 Цена", callback_data="ef_price")],
           [InlineKeyboardButton(text="🔗 Ссылка", callback_data="ef_link")],
-          [InlineKeyboardButton(text="📄 Описание", callback_data="ef_description")],
+          [InlineKeyboardButton(text="📄 Описание (RU)", callback_data="ef_description")],
+          [InlineKeyboardButton(text="📄 Описание (EN)", callback_data="ef_description_en")],
           [InlineKeyboardButton(text="🖼 Фото", callback_data="ef_photo")],
       ]
   )
@@ -4169,13 +4223,17 @@ async def process_edit_product_select(callback: CallbackQuery, state: FSMContext
 
 
 @router.callback_query(
-    F.data.in_({"ef_title", "ef_price", "ef_link", "ef_description", "ef_photo"})
+    F.data.in_({
+        "ef_title", "ef_title_en", "ef_price", "ef_link",
+        "ef_description", "ef_description_en", "ef_photo"
+    })
 )
 async def process_edit_product_field(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
-  field = callback.data.split("_")[1]
+  # ef_title_en → field = "title_en", ef_description_en → "description_en"
+  field = callback.data[3:]  # strip "ef_"
   await state.update_data(field=field)
   if field == "photo":
     await state.set_state(EditProduct.photo)
@@ -4186,10 +4244,12 @@ async def process_edit_product_field(callback: CallbackQuery, state: FSMContext)
   else:
     await state.set_state(EditProduct.new_value)
     hints = {
-        "title": "новое название",
-        "price": "новую цену (число)",
-        "link": "новую ссылку",
-        "description": "новое описание (или <code>-</code> чтобы удалить)",
+        "title":          "новое название (RU)",
+        "title_en":       "новое название на английском (EN)",
+        "price":          "новую цену (число)",
+        "link":           "новую ссылку",
+        "description":    "новое описание (RU) (или <code>-</code> чтобы удалить)",
+        "description_en": "новое описание на английском (EN) (или <code>-</code> чтобы удалить)",
     }
     await callback.message.answer(
         f"✍️ Введи {hints.get(field, 'новое значение')}:"
@@ -4204,13 +4264,15 @@ async def process_edit_product_save(message: Message, state: FSMContext):
   data = await state.get_data()
   p_id, field = data["product_id"], data["field"]
   new_val = txt(message)
-  if field not in ("title", "price", "link", "description") or not new_val:
+  if field not in ("title", "title_en", "price", "link",
+                   "description", "description_en") or not new_val:
     await message.answer("❌ Неверное значение.")
     return
   if field == "price" and not new_val.isdigit():
     await message.answer("❌ Цена — целое число.")
     return
-  db_val = None if (field == "description" and new_val == "-") else new_val
+  db_val = None if (field in ("description", "description_en", "title_en")
+                    and new_val == "-") else new_val
   await state.clear()
   async with connect() as db:
     await db.execute(
@@ -4310,6 +4372,17 @@ async def process_u_title(message: Message, state: FSMContext):
     await message.answer("❌ Введи название текстом.")
     return
   await state.update_data(title=txt(message))
+  await message.answer(
+      "🇬🇧 Введи название на <b>английском</b> (EN).\n"
+      "Или напиши <code>-</code> чтобы пропустить:"
+  )
+  await state.set_state(AddUniqueProduct.title_en)
+
+
+@router.message(StateFilter(AddUniqueProduct.title_en))
+async def process_u_title_en(message: Message, state: FSMContext):
+  raw = txt(message)
+  await state.update_data(title_en=None if raw == "-" else raw)
   await message.answer("💰 Введите цену в <b>уникальных токенах</b> (например: 10):")
   await state.set_state(AddUniqueProduct.price)
 
@@ -4366,6 +4439,17 @@ async def process_u_description(message: Message, state: FSMContext):
   desc = txt(message)
   await state.update_data(description=None if desc == "-" else desc)
   await message.answer(
+      "🇬🇧 Введи описание на <b>английском</b> (EN).\n"
+      "Или напиши <code>-</code> чтобы пропустить:"
+  )
+  await state.set_state(AddUniqueProduct.description_en)
+
+
+@router.message(StateFilter(AddUniqueProduct.description_en))
+async def process_u_description_en(message: Message, state: FSMContext):
+  raw = txt(message)
+  await state.update_data(description_en=None if raw == "-" else raw)
+  await message.answer(
       "🖼 Отправь фото для товара (как изображение, не файл).\n"
       "Или напиши <code>-</code> чтобы пропустить."
   )
@@ -4384,13 +4468,18 @@ async def process_u_photo(message: Message, state: FSMContext):
   await state.clear()
   async with connect() as db:
     await db.execute(
-        "INSERT INTO unique_products (title, price, token_price, amount,"
-        " command, description, photo_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (data["title"], data["price"], data.get("token_price", 0),
-         data["amount"], data["command"], data.get("description"), photo_id),
+        "INSERT INTO unique_products (title, title_en, price, token_price,"
+        " amount, command, description, description_en, photo_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (data["title"], data.get("title_en"), data["price"],
+         data.get("token_price", 0), data["amount"], data["command"],
+         data.get("description"), data.get("description_en"), photo_id),
     )
     await db.commit()
-  await message.answer("✅ Товар добавлен в уникальный магазин!")
+  en_note = f" / {esc(data['title_en'])}" if data.get("title_en") else ""
+  await message.answer(
+      f"✅ Товар добавлен в уникальный магазин!\n📌 {esc(data['title'])}{en_note}"
+  )
 
 
 @router.callback_query(F.data == "ued_list")
@@ -4426,12 +4515,14 @@ async def process_edit_unique_select(callback: CallbackQuery, state: FSMContext)
   await state.update_data(product_id=p_id)
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="Название", callback_data="uef_title")],
+          [InlineKeyboardButton(text="📝 Название (RU)", callback_data="uef_title")],
+          [InlineKeyboardButton(text="📝 Название (EN)", callback_data="uef_title_en")],
           [InlineKeyboardButton(text="Цена 💎", callback_data="uef_price")],
           [InlineKeyboardButton(text="Цена 🪙 токены", callback_data="uef_token_price")],
           [InlineKeyboardButton(text="Количество", callback_data="uef_amount")],
           [InlineKeyboardButton(text="Команда", callback_data="uef_command")],
-          [InlineKeyboardButton(text="📄 Описание", callback_data="uef_description")],
+          [InlineKeyboardButton(text="📄 Описание (RU)", callback_data="uef_description")],
+          [InlineKeyboardButton(text="📄 Описание (EN)", callback_data="uef_description_en")],
           [InlineKeyboardButton(text="🖼 Фото", callback_data="uef_photo")],
           [InlineKeyboardButton(text="🔒 Переключить «Только токены»", callback_data=f"uef_nosub_toggle_{p_id}")],
       ]
@@ -4462,15 +4553,15 @@ async def uef_nosub_toggle(callback: CallbackQuery):
 
 @router.callback_query(
     F.data.in_({
-        "uef_title", "uef_price", "uef_token_price", "uef_amount",
-        "uef_command", "uef_description", "uef_photo"
+        "uef_title", "uef_title_en", "uef_price", "uef_token_price",
+        "uef_amount", "uef_command", "uef_description", "uef_description_en",
+        "uef_photo"
     })
 )
 async def process_edit_unique_field(callback: CallbackQuery, state: FSMContext):
   if callback.from_user.id != ADMIN_ID:
     await callback.answer()
     return
-  # callback.data = "uef_token_price" → field = "token_price"
   field = callback.data[4:]  # strip "uef_"
   await state.update_data(field=field)
   if field == "photo":
@@ -4482,12 +4573,14 @@ async def process_edit_unique_field(callback: CallbackQuery, state: FSMContext):
   else:
     await state.set_state(EditUniqueProduct.new_value)
     hints = {
-        "title": "новое название",
-        "price": "новую цену в уникальных токенах (число)",
-        "token_price": "новую цену в обычных токенах (0 = нельзя купить за токены)",
-        "amount": "новое количество (число)",
-        "command": "новую команду",
-        "description": "новое описание (или <code>-</code> чтобы удалить)",
+        "title":          "новое название (RU)",
+        "title_en":       "новое название на английском (EN) (или <code>-</code> чтобы удалить)",
+        "price":          "новую цену в уникальных токенах (число)",
+        "token_price":    "новую цену в обычных токенах (0 = нельзя за токены)",
+        "amount":         "новое количество (число)",
+        "command":        "новую команду",
+        "description":    "новое описание (RU) (или <code>-</code> чтобы удалить)",
+        "description_en": "новое описание на английском (EN) (или <code>-</code> чтобы удалить)",
     }
     hint = ("\n\n" + UNIQUE_COMMAND_HELP) if field == "command" else ""
     await callback.message.answer(
@@ -4503,7 +4596,8 @@ async def process_edit_unique_save(message: Message, state: FSMContext):
   data = await state.get_data()
   p_id, field = data["product_id"], data["field"]
   new_val = txt(message)
-  valid_fields = ("title", "price", "token_price", "amount", "command", "description")
+  valid_fields = ("title", "title_en", "price", "token_price", "amount",
+                  "command", "description", "description_en")
   if field not in valid_fields or not new_val:
     await message.answer("❌ Неверное значение.")
     return
@@ -4512,7 +4606,7 @@ async def process_edit_unique_save(message: Message, state: FSMContext):
       await message.answer("❌ Это поле должно быть числом.")
       return
     value = int(new_val)
-  elif field == "description":
+  elif field in ("description", "description_en", "title_en"):
     value = None if new_val == "-" else new_val
   else:
     value = new_val
