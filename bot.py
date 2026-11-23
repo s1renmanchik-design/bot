@@ -224,6 +224,12 @@ STRINGS: dict[str, dict[str, str]] = {
     "lottery_price_changed": {"ru": "💱 Цена участия изменилась: теперь {cost}. Проверь и нажми «Участвовать» ещё раз.", "en": "💱 Entry price changed: now {cost}. Check and tap join again."},
     "lottery_soon":      {"ru": "⏳ Новый розыгрыш скоро начнётся. Загляни чуть позже!", "en": "⏳ A new draw will start soon. Check back later!"},
     "lottery_btn_again": {"ru": "🎰 Попытать удачу ещё раз", "en": "🎰 Try again"},
+    "lottery_btn_auto_on":  {"ru": "🤖 Авто-участие: ВКЛ", "en": "🤖 Auto-join: ON"},
+    "lottery_btn_auto_off": {"ru": "🤖 Авто-участие: ВЫКЛ", "en": "🤖 Auto-join: OFF"},
+    "lottery_auto_enabled":  {"ru": "🤖 Авто-участие включено! Бот будет автоматически регистрировать вас в каждой лотерее (с задержкой 5 сек). Убедитесь что у вас хватает токенов.", "en": "🤖 Auto-join enabled! The bot will automatically enter you in each lottery (with a 5s delay). Make sure you have enough tokens."},
+    "lottery_auto_disabled": {"ru": "🤖 Авто-участие отключено.", "en": "🤖 Auto-join disabled."},
+    "lottery_last_winner":   {"ru": "🏆 Последний победитель: <code>{uid}</code> выиграл <b>{prize} токенов</b> в розыгрыше #{rid}", "en": "🏆 Last winner: <code>{uid}</code> won <b>{prize} tokens</b> in draw #{rid}"},
+    "lottery_no_winner_yet": {"ru": "🏆 Победителей ещё не было.", "en": "🏆 No winners yet."},
     # ── рулетка ───────────────────────────────────────────────────────────
     "roulette_intro":    {"ru": "🎲 <b>Рулетка 50/50</b>\n\nСтавишь токены — и либо удваиваешь их, либо теряешь.\nВыиграл: получаешь ставку ×2 (ставка 4 → на баланс вернётся 8).\nПроиграл: ставка сгорает.\n\n💰 Ставка: от <b>{min}</b> до <b>{max}</b> токенов.\nТвой баланс: <b>{bal}</b> токенов.\n\n✍️ Напиши в чат, сколько токенов ставишь:", "en": "🎲 <b>Roulette 50/50</b>\n\nBet tokens — either double them or lose them.\nWin: get bet ×2 (bet 4 → receive 8).\nLose: bet is gone.\n\n💰 Bet: from <b>{min}</b> to <b>{max}</b> tokens.\nYour balance: <b>{bal}</b> tokens.\n\n✍️ Type how many tokens you want to bet:"},
     "roulette_win":      {"ru": "🎉 <b>Победа!</b> Ставка {bet} → <b>+{bet}</b> токенов.\nБаланс: <b>{bal}</b>", "en": "🎉 <b>Win!</b> Bet {bet} → <b>+{bet}</b> tokens.\nBalance: <b>{bal}</b>"},
@@ -267,6 +273,15 @@ STRINGS: dict[str, dict[str, str]] = {
     "ex_link_error":     {"ru": "❌ Неверная ссылка. ⚠️ Ссылка должна быть с mega.nz или cloud.mail.ru", "en": "❌ Invalid link. ⚠️ Link must be from mega.nz or cloud.mail.ru"},
     "ex_complain_confirm": {"ru": "⚠️ <b>Вы уверены, что хотите подать жалобу на этого пользователя?</b>\n\n• При ложной жалобе вы получите <b>1 предупреждение</b>.\n• Если вас реально обманули — смело отправляйте жалобу.", "en": "⚠️ <b>Are you sure you want to file a complaint against this user?</b>\n\n• A false complaint will give you <b>1 warning</b>.\n• If you were genuinely scammed — go ahead and complain."},
     "ex_complain_sent":  {"ru": "🚨 Жалоба отправлена админу.", "en": "🚨 Complaint sent to admin."},
+    "ex_verified_badge": {"ru": "✅ <b>Ссылка обменщика проверена админом!</b>", "en": "✅ <b>Owner's link verified by admin!</b>"},
+    "ex_btn_verify":     {"ru": "✅ Верифицировать ссылку", "en": "✅ Verify link"},
+    "ex_btn_unverify":   {"ru": "❌ Снять верификацию",   "en": "❌ Remove verification"},
+    "ex_verified_ok":    {"ru": "✅ Ссылка верифицирована.", "en": "✅ Link verified."},
+    "ex_unverified_ok":  {"ru": "✅ Верификация снята.",    "en": "✅ Verification removed."},
+    "ex_tab_open":       {"ru": "📋 Открытые",    "en": "📋 Open"},
+    "ex_tab_done":       {"ru": "✅ Завершённые", "en": "✅ Completed"},
+    "ex_tab_mine":       {"ru": "📦 Мои обмены", "en": "📦 My exchanges"},
+    "ex_done_title":     {"ru": "✅ <b>Завершённые обмены</b>", "en": "✅ <b>Completed exchanges</b>"},
     "ex_complain_dup":   {"ru": "Ты уже отправил жалобу по этому обмену.", "en": "You already filed a complaint for this exchange."},
     "ex_restricted_notif": {"ru": "🚨 На вас подана жалоба по обмену #{id}. Обмены и покупки в магазине временно ограничены до решения администратора.", "en": "🚨 A complaint was filed against you for exchange #{id}. Exchanges and purchases are temporarily restricted."},
     # ── промокод ──────────────────────────────────────────────────────────
@@ -472,7 +487,8 @@ async def init_db():
             restricted_until TEXT DEFAULT NULL,
             u_premium INTEGER DEFAULT 0,
             u_premium_expires TEXT DEFAULT NULL,
-            lang TEXT DEFAULT 'ru'
+            lang TEXT DEFAULT 'ru',
+            auto_lottery INTEGER DEFAULT 0
         );
     """
     )
@@ -569,7 +585,19 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER, give TEXT, want TEXT, owner_link TEXT,
             search TEXT, status TEXT DEFAULT 'open',
-            taker_id INTEGER, taker_link TEXT, created INTEGER, taken INTEGER
+            taker_id INTEGER, taker_link TEXT, created INTEGER, taken INTEGER,
+            verified INTEGER DEFAULT 0
+        );
+    """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lottery_last_winner (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            winner_id INTEGER,
+            prize INTEGER,
+            round_id INTEGER,
+            finished_at TEXT
         );
     """
     )
@@ -620,6 +648,10 @@ async def init_db():
             "u_premium": "INTEGER DEFAULT 0",
             "u_premium_expires": "TEXT DEFAULT NULL",
             "lang": "TEXT DEFAULT 'ru'",
+            "auto_lottery": "INTEGER DEFAULT 0",
+        },
+        "ex_offers": {
+            "verified": "INTEGER DEFAULT 0",
         },
         "products": {
             "buyers_count": "INTEGER DEFAULT 0",
@@ -1278,26 +1310,16 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
   if referrer_id and await is_subscribed(bot, user_id):
     await activate_referral(bot, user_id)
 
-  if existing_user is None:
-    # Новый пользователь — предлагаем выбрать язык
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="setlang_ru"),
-                InlineKeyboardButton(text="🇬🇧 English", callback_data="setlang_en"),
-            ]
-        ]
-    )
-    await message.answer(
-        t("choose_lang", "ru"),  # двуязычная фраза уже в словаре
-        reply_markup=kb,
-    )
-  else:
-    lang = await get_lang(user_id)
-    await message.answer(
-        t("welcome", lang),
-        reply_markup=get_main_keyboard(user_id, lang),
-    )
+  # Всегда показываем выбор языка при /start
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(text="🇷🇺 Русский", callback_data="setlang_ru"),
+              InlineKeyboardButton(text="🇬🇧 English", callback_data="setlang_en"),
+          ]
+      ]
+  )
+  await message.answer(t("choose_lang", "ru"), reply_markup=kb)
 
 
 @router.callback_query(F.data.in_({"setlang_ru", "setlang_en"}))
@@ -1935,6 +1957,36 @@ async def uref_remove(target_id: int, count):
   return removed, taken, balance
 
 
+@router.message(Command("exverify"))
+async def cmd_exverify(message: Message, command: CommandObject):
+  """Верифицировать ссылку обменщика: /exverify [offer_id]"""
+  if await deny(message):
+    return
+  args = parse_args(command, 1)
+  if not args:
+    await message.answer("ℹ️ Использование: <code>/exverify [ID обмена]</code>")
+    return
+  offer_id = args[0]
+  async with connect() as db:
+    async with db.execute(
+        "SELECT id, give, want, owner_id, verified FROM ex_offers WHERE id = ?",
+        (offer_id,),
+    ) as cur:
+      row = await cur.fetchone()
+    if not row:
+      await message.answer("❌ Обмен не найден.")
+      return
+    new_v = 0 if row[4] else 1
+    await db.execute(
+        "UPDATE ex_offers SET verified = ? WHERE id = ?", (new_v, offer_id)
+    )
+    await db.commit()
+  status = "✅ Верифицирован" if new_v else "❌ Верификация снята"
+  await message.answer(
+      f"{status} — обмен #{offer_id}: <b>{esc(row[1])}</b> → <b>{esc(row[2])}</b>"
+  )
+
+
 @router.message(Command("uref"))
 async def cmd_uref(message: Message, command: CommandObject):
   if await deny(message):
@@ -2422,6 +2474,17 @@ async def create_lottery_round(bot: Bot = None) -> None:
     task = asyncio.create_task(notify_big_lottery(bot, cost, prize))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
+  if bot is not None:
+    # Получаем id только что созданного тиража
+    async with connect() as db:
+      async with db.execute(
+          "SELECT id FROM lottery_rounds WHERE finished=0 ORDER BY id DESC LIMIT 1"
+      ) as cur:
+        new_row = await cur.fetchone()
+    if new_row:
+      task = asyncio.create_task(auto_join_round(bot, new_row[0]))
+      _bg_tasks.add(task)
+      task.add_done_callback(_bg_tasks.discard)
 
 
 async def get_current_round():
@@ -2482,16 +2545,40 @@ async def build_lottery_view(user_id: int, lang: str = "ru"):
     ) as cur:
       joined = await cur.fetchone() is not None
     async with db.execute(
-        "SELECT COALESCE(notify_lottery, 1) FROM users WHERE user_id = ?",
+        "SELECT COALESCE(notify_lottery, 1), COALESCE(auto_lottery, 0)"
+        " FROM users WHERE user_id = ?",
         (user_id,),
     ) as cur:
       urow = await cur.fetchone()
       user_notify = urow[0] if urow else 1
+      user_auto = urow[1] if urow else 0
+    # Last winner
+    async with db.execute(
+        "SELECT winner_id, prize, round_id FROM lottery_last_winner WHERE id = 1"
+    ) as cur:
+      wrow = await cur.fetchone()
   cost = st["cost"]
 
   rand_winner = ("Победитель выбирается случайно среди всех участников. "
                  if lang == "ru" else
                  "Winner is chosen randomly among all participants. ")
+
+  # Last winner line
+  if wrow:
+    last_w_line = "\n" + t("lottery_last_winner", lang,
+                            uid=wrow[0], prize=wrow[1], rid=wrow[2])
+  else:
+    last_w_line = "\n" + t("lottery_no_winner_yet", lang)
+
+  auto_desc = (
+      "\n\n🤖 <b>Авто-участие:</b> бот автоматически регистрирует тебя"
+      " в каждой лотерее с задержкой 5 сек (ставка списывается только если"
+      " хватает токенов)."
+      if lang == "ru" else
+      "\n\n🤖 <b>Auto-join:</b> the bot automatically enters you in every"
+      " lottery with a 5s delay (tokens are deducted only if you have enough)."
+  )
+
   text = (
       f"{t('lottery_title', lang)}\n\n"
       + t("lottery_prize", lang, total=st['total'], base=prize, pool=st['pool']) + "\n"
@@ -2501,17 +2588,23 @@ async def build_lottery_view(user_id: int, lang: str = "ru"):
       + t("lottery_time", lang, h=hours, m=minutes) + "\n\n"
       + rand_winner
       + (t("lottery_desc_paid", lang) if cost else t("lottery_desc_free", lang))
+      + last_w_line
+      + auto_desc
   )
 
   toggle_key = "lottery_btn_notif_off" if user_notify == 1 else "lottery_btn_notif_on"
   toggle_row = [
       InlineKeyboardButton(text=t(toggle_key, lang), callback_data="lottery_toggle_notify")
   ]
+  auto_key = "lottery_btn_auto_on" if user_auto == 1 else "lottery_btn_auto_off"
+  auto_row = [
+      InlineKeyboardButton(text=t(auto_key, lang), callback_data="lottery_toggle_auto")
+  ]
 
   if joined:
     return (
         text + t("lottery_joined", lang),
-        InlineKeyboardMarkup(inline_keyboard=[toggle_row]),
+        InlineKeyboardMarkup(inline_keyboard=[toggle_row, auto_row]),
     )
 
   join_btn_text = (
@@ -2520,7 +2613,7 @@ async def build_lottery_view(user_id: int, lang: str = "ru"):
       else t("lottery_btn_join", lang, cost=cost_text(cost))
   )
   join_row = [InlineKeyboardButton(text=join_btn_text, callback_data=f"lottery_join_{round_id}_{cost}")]
-  return text, InlineKeyboardMarkup(inline_keyboard=[join_row, toggle_row])
+  return text, InlineKeyboardMarkup(inline_keyboard=[join_row, toggle_row, auto_row])
 
 
 async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
@@ -2598,6 +2691,15 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
           " lottery_wins = COALESCE(lottery_wins, 0) + 1 WHERE user_id = ?",
           (prize, winner),
       )
+      await db.execute(
+          "INSERT INTO lottery_last_winner (id, winner_id, prize, round_id,"
+          " finished_at) VALUES (1, ?, ?, ?, ?)"
+          " ON CONFLICT(id) DO UPDATE SET winner_id=excluded.winner_id,"
+          " prize=excluded.prize, round_id=excluded.round_id,"
+          " finished_at=excluded.finished_at",
+          (winner, prize, round_id,
+           datetime.datetime.now().strftime(DT_FORMAT)),
+      )
       await db.commit()
 
   for uid in players:
@@ -2610,6 +2712,74 @@ async def finish_lottery_round(bot: Bot, round_id: int, prize: int) -> None:
         bot, uid, text, reply_markup=lottery_again_keyboard(notify_map[uid], ulang)
     )
     await asyncio.sleep(0.05)
+
+
+async def auto_join_round(bot: Bot, round_id: int) -> None:
+  """Автоматически добавляет в тираж всех пользователей с auto_lottery=1.
+  Между каждым участником — задержка 5 секунд."""
+  async with connect() as db:
+    async with db.execute(
+        "SELECT user_id FROM users WHERE auto_lottery = 1"
+        " AND (banned_until IS NULL OR banned_until <= ?)"
+        " AND (restricted_until IS NULL OR restricted_until <= ?)",
+        (datetime.datetime.now().strftime(DT_FORMAT),
+         datetime.datetime.now().strftime(DT_FORMAT)),
+    ) as cur:
+      users = [r[0] for r in await cur.fetchall()]
+
+  for uid in users:
+    await asyncio.sleep(5)  # КД между участниками
+    try:
+      async with connect() as db:
+        # Проверяем: тираж ещё идёт?
+        async with db.execute(
+            "SELECT id, entry_cost, prize, ends_at, COALESCE(cost_fixed,0),"
+            " finished FROM lottery_rounds WHERE id = ?",
+            (round_id,),
+        ) as cur:
+          row = await cur.fetchone()
+        if not row or row[5] == 1:
+          break
+        ends_at = parse_dt(row[3]) or datetime.datetime.now()
+        if ends_at <= datetime.datetime.now():
+          break
+        rnd = row[:5]
+
+        # Уже участвует?
+        async with db.execute(
+            "SELECT 1 FROM lottery_participants WHERE round_id = ? AND user_id = ?",
+            (round_id, uid),
+        ) as cur:
+          if await cur.fetchone():
+            continue
+
+        st = await lottery_stats(db, rnd)
+        cost = st["cost"]
+
+        if cost > 0:
+          cur = await db.execute(
+              "UPDATE users SET tokens = tokens - ? WHERE user_id = ?"
+              " AND COALESCE(tokens, 0) >= ?",
+              (cost, uid, cost),
+          )
+          if cur.rowcount == 0:
+            continue  # не хватает токенов — пропускаем
+        else:
+          await ensure_user(db, uid)
+
+        await db.execute(
+            "INSERT INTO lottery_participants (round_id, user_id, paid)"
+            " VALUES (?, ?, ?)",
+            (round_id, uid, cost),
+        )
+        await db.commit()
+
+      lang = await get_lang(uid)
+      charged_txt = t("lottery_charged", lang, n=cost) if cost else t("lottery_free_entry", lang)
+      await safe_send(bot, uid,
+                      "🤖 " + t("lottery_joined_msg", lang, charged=charged_txt))
+    except Exception:
+      logging.exception("auto_join_round uid=%s", uid)
 
 
 async def lottery_loop(bot: Bot):
@@ -2758,6 +2928,32 @@ async def lottery_toggle_notify(callback: CallbackQuery):
   lang = await get_lang(user_id)
   notif_key = "lottery_notif_off" if new_val == 0 else "lottery_notif_on"
   await callback.answer(t(notif_key, lang), show_alert=True)
+  try:
+    text, kb = await build_lottery_view(user_id, lang)
+    await callback.message.edit_text(text, reply_markup=kb)
+  except Exception:
+    pass
+
+
+@router.callback_query(F.data == "lottery_toggle_auto")
+async def lottery_toggle_auto(callback: CallbackQuery):
+  user_id = callback.from_user.id
+  lang = await get_lang(user_id)
+  async with connect() as db:
+    await ensure_user(db, user_id)
+    async with db.execute(
+        "SELECT COALESCE(auto_lottery, 0) FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cur:
+      row = await cur.fetchone()
+    new_val = 0 if (row[0] if row else 0) == 1 else 1
+    await db.execute(
+        "UPDATE users SET auto_lottery = ? WHERE user_id = ?",
+        (new_val, user_id),
+    )
+    await db.commit()
+  key = "lottery_auto_enabled" if new_val == 1 else "lottery_auto_disabled"
+  await callback.answer(t(key, lang)[:200], show_alert=True)
   try:
     text, kb = await build_lottery_view(user_id, lang)
     await callback.message.edit_text(text, reply_markup=kb)
@@ -4837,8 +5033,9 @@ async def ex_show(event, text, kb=None):
 
 def exchange_menu_kb(lang: str = "ru") -> InlineKeyboardMarkup:
   return ex_kb([
-      [(t("ex_btn_new", lang), "ex:new"), (t("ex_btn_all", lang), "ex:all")],
-      [(t("ex_btn_search", lang), "ex:search"), (t("ex_btn_my", lang), "ex:my")],
+      [(t("ex_btn_new", lang), "ex:new"), (t("ex_tab_open", lang), "ex:all")],
+      [(t("ex_btn_search", lang), "ex:search"), (t("ex_tab_mine", lang), "ex:my")],
+      [(t("ex_tab_done", lang), "ex:done")],
   ])
 
 
@@ -4958,8 +5155,8 @@ async def ex_new_link(message: Message, state: FSMContext):
 
 async def ex_render_list(event, user_id: int, page: int):
   q = EX_SEARCH.get(user_id)
-  admin = user_id == ADMIN_ID
-  where = "status IN ('open', 'taken')" if admin else "status = 'open'"
+  # Список открытых обменов — завершённые вынесены в отдельную вкладку ex:done
+  where = "status = 'open'"
   args = []
   if q:
     if q.isdigit():
@@ -5001,9 +5198,11 @@ async def ex_render_list(event, user_id: int, page: int):
   nav.append((f"{page + 1}/{pages}", "ex:noop"))
   if page < pages - 1:
     nav.append(("➡️", f"ex:list:{page + 1}"))
+  _list_lang = await get_lang(user_id) if hasattr(get_lang, '__call__') else "ru"
+  _list_lang = "ru"  # fallback; будет перезаписан ниже
   buttons.append(nav)
   buttons.append([("🔍 Поиск", "ex:search"), ("🧹 Сбросить", "ex:all")])
-  buttons.append([("⬅️ В обмены", "ex:menu")])
+  buttons.append([("✅ Завершённые", "ex:done"), ("⬅️ В обмены", "ex:menu")])
   await ex_show(event, head, ex_kb(buttons))
 
 
@@ -5060,9 +5259,12 @@ async def ex_view(callback: CallbackQuery):
       [(t("ex_btn_complain", lang), f"ex:confirm_rep:{offer_id}")],
       [(t("ex_btn_back", lang), "ex:menu")],
   ])
+  verified = bool(o["verified"]) if "verified" in o.keys() else False
   if o["status"] == "open":
     text = t("ex_view_open", lang, id=o['id'], give=esc(o['give']),
              want=esc(o['want']), n=EXCHANGE_COST)
+    if verified:
+      text += "\n\n" + t("ex_verified_badge", lang)
     if admin:
       admin_lbl = "🛠 <b>Admin:</b>" if lang == "en" else "🛠 <b>Админ:</b>"
       text += (
@@ -5071,10 +5273,12 @@ async def ex_view(callback: CallbackQuery):
           f"🔗 Link:\n{esc(o['owner_link'])}"
       )
     if o["owner_id"] == uid or admin:
-      kb = ex_kb([
-          [(t("ex_btn_delete", lang), f"ex:del:{offer_id}")],
-          [("⬅️", "ex:list:0")],
-      ])
+      rows_kb = [[( t("ex_btn_delete", lang), f"ex:del:{offer_id}")]]
+      if admin:
+        v_key = "ex_btn_unverify" if verified else "ex_btn_verify"
+        rows_kb.append([(t(v_key, lang), f"ex:verify:{offer_id}")])
+      rows_kb.append([("⬅️", "ex:list:0")])
+      kb = ex_kb(rows_kb)
     else:
       kb = ex_kb([
           [(t("ex_btn_take", lang), f"ex:take:{offer_id}")],
@@ -5099,6 +5303,93 @@ async def ex_view(callback: CallbackQuery):
     return
 
   await ex_show(callback, text, kb)
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ex:verify:"))
+async def ex_verify_cb(callback: CallbackQuery):
+  if callback.from_user.id != ADMIN_ID:
+    await callback.answer()
+    return
+  offer_id = int(callback.data.split(":")[2])
+  lang = await get_lang(callback.from_user.id)
+  async with connect() as db:
+    async with db.execute(
+        "SELECT verified FROM ex_offers WHERE id = ?", (offer_id,)
+    ) as cur:
+      row = await cur.fetchone()
+    if row is None:
+      await callback.answer("❌ Обмен не найден.", show_alert=True)
+      return
+    new_v = 0 if row[0] else 1
+    await db.execute(
+        "UPDATE ex_offers SET verified = ? WHERE id = ?", (new_v, offer_id)
+    )
+    await db.commit()
+  status_key = "ex_verified_ok" if new_v else "ex_unverified_ok"
+  await callback.answer(t(status_key, lang), show_alert=True)
+  # Обновить карточку
+  o = await ex_one("SELECT * FROM ex_offers WHERE id = ?", (offer_id,))
+  if o:
+    verified = bool(new_v)
+    text = t("ex_view_open", lang, id=o['id'], give=esc(o['give']),
+             want=esc(o['want']), n=EXCHANGE_COST)
+    if verified:
+      text += "\n\n" + t("ex_verified_badge", lang)
+    admin_lbl = "🛠 <b>Админ:</b>"
+    text += (
+        f"\n\n{admin_lbl}\n"
+        f"🆔 ID: <code>{o['owner_id']}</code>\n"
+        f"🔗 Link:\n{esc(o['owner_link'])}"
+    )
+    v_key = "ex_btn_unverify" if verified else "ex_btn_verify"
+    rows_kb = [
+        [(t("ex_btn_delete", lang), f"ex:del:{offer_id}")],
+        [(t(v_key, lang), f"ex:verify:{offer_id}")],
+        [("⬅️", "ex:list:0")],
+    ]
+    try:
+      await callback.message.edit_text(
+          text, reply_markup=ex_kb(rows_kb), disable_web_page_preview=True
+      )
+    except Exception:
+      pass
+
+
+@router.callback_query(F.data == "ex:done")
+async def ex_done_cb(callback: CallbackQuery, state: FSMContext):
+  """Вкладка завершённых обменов."""
+  await state.clear()
+  uid = callback.from_user.id
+  lang = await get_lang(uid)
+  if uid == ADMIN_ID:
+    rows = await ex_all(
+        "SELECT * FROM ex_offers WHERE status = 'taken'"
+        " ORDER BY id DESC LIMIT 15"
+    )
+  else:
+    rows = await ex_all(
+        "SELECT * FROM ex_offers WHERE (owner_id = ? OR taker_id = ?)"
+        " AND status = 'taken' ORDER BY id DESC LIMIT 15",
+        (uid, uid),
+    )
+  if not rows:
+    empty_txt = "📭 Завершённых обменов нет." if lang == "ru" else "📭 No completed exchanges."
+    await ex_show(
+        callback,
+        empty_txt,
+        ex_kb([[(t("ex_btn_back", lang), "ex:menu")]]),
+    )
+    await callback.answer()
+    return
+
+  title = t("ex_done_title", lang)
+  buttons = [
+      [(f"✅ #{r['id']} {r['give']} → {r['want']}"[:60], f"ex:view:{r['id']}")]
+      for r in rows
+  ]
+  buttons.append([(t("ex_btn_back", lang), "ex:menu")])
+  await ex_show(callback, title, ex_kb(buttons))
   await callback.answer()
 
 
@@ -5750,6 +6041,7 @@ async def main():
       asyncio.create_task(top_reset_loop(bot)),
       asyncio.create_task(lottery_loop(bot)),
   ]
+  # auto_join_round запускается внутри create_lottery_round через _bg_tasks
 
   await bot.delete_webhook(drop_pending_updates=True)
   print(f"Бот успешно запущен, веб-сервер слушает порт {PORT}!")
