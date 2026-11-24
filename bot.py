@@ -1957,6 +1957,79 @@ async def uref_remove(target_id: int, count):
   return removed, taken, balance
 
 
+@router.message(Command("info"))
+async def cmd_info(message: Message):
+  if await deny(message):
+    return
+  await message.answer(
+      "📋 <b>Все админ-команды</b>\n\n"
+
+      "━━━ 🪙 Токены ━━━\n"
+      "<code>/t [сколько] [ID]</code> — выдать обычные токены\n"
+      "<code>/untoken [ID] [сколько]</code> — забрать обычные токены\n"
+      "<code>/ytoken add [ID] [сколько]</code> — выдать уникальные токены\n"
+      "<code>/ytoken del [ID] [сколько]</code> — забрать уникальные токены\n"
+      "<code>/ftoken add [ID] [сколько]</code> — выдать фулловые токены\n"
+      "<code>/ftoken del [ID] [сколько]</code> — забрать фулловые токены\n"
+      "<code>/all token [сколько]</code> — выдать токены всем пользователям\n\n"
+
+      "━━━ 👑 Подписки ━━━\n"
+      "<code>/p [дни] [ID]</code> — выдать Премиум-подписку\n"
+      "<code>/unpremium [ID]</code> — снять Премиум-подписку\n"
+      "<code>/upremium [дни] [ID]</code> — выдать Уникальную подписку\n"
+      "<code>/uunpremium [ID]</code> — снять Уникальную подписку\n\n"
+
+      "━━━ ✨ Аура ━━━\n"
+      "<code>/aura add [ID] [lottery/roulette/shop] [%] [срок] [Название]</code>\n"
+      "Срок: число дней (<code>30</code>) или часов (<code>12h</code>)\n"
+      "Процент может быть отрицательным: <code>-50</code>\n"
+      "Пример: <code>/aura add 123 shop -50 30 Скидочник</code>\n"
+      "<code>/aura del [ID]</code> — удалить ауру\n\n"
+
+      "━━━ ⚠️ Модерация ━━━\n"
+      "<code>/ban [ID] [дни] [причина]</code> — забанить (0 = навсегда)\n"
+      "<code>/unban [ID]</code> — разбанить\n"
+      "<code>/warn [ID] [причина]</code> — выдать предупреждение\n"
+      "<code>/unwarn [ID]</code> — снять предупреждение\n\n"
+
+      "━━━ 👥 Рефералы ━━━\n"
+      "<code>/uref [ID]</code> — список рефералов и доход\n"
+      "<code>/uref add [ID] [число]</code> — добавить рефералов\n"
+      "<code>/uref del [ID] [число|all]</code> — убрать рефералов\n\n"
+
+      "━━━ 🎰 Лотерея ━━━\n"
+      "<code>/lottery</code> — показать текущие настройки\n"
+      "<code>/lottery prize [токены]</code> — изменить главный приз\n"
+      "<code>/lottery cost [токены|auto]</code> — изменить цену входа\n"
+      "<code>/lottery time [часы|Xm]</code> — изменить время до конца\n\n"
+
+      "━━━ 🔄 Обмены ━━━\n"
+      "<code>/exverify [ID обмена]</code> — верифицировать/снять верификацию ссылки\n\n"
+
+      "━━━ 🔎 Инфо об аккаунте ━━━\n"
+      "<code>/check [ID]</code> — полная инфо об аккаунте пользователя\n\n"
+
+      "━━━ 🎟 Промокоды ━━━\n"
+      "Создаются через ⚙️ Админ-панель → 🎟 Создать промокод\n\n"
+
+      "━━━ 📢 Рассылка ━━━\n"
+      "Через ⚙️ Админ-панель → 📢 Сделать рассылку\n\n"
+
+      "━━━ 💾 База данных ━━━\n"
+      "<code>/restore</code> — восстановить БД (отправь файл bot.db с этой подписью)\n"
+      "Авто-бэкап каждые 5 мин приходит в этот чат\n\n"
+
+      "━━━ 🌐 Язык ━━━\n"
+      "<code>/lang</code> — показать выбор языка (работает для всех пользователей)\n\n"
+
+      "━━━ ℹ️ Прочее ━━━\n"
+      "<code>/start</code> — показать выбор языка и меню\n"
+      "<code>/promocode [код]</code> — активировать промокод\n"
+      "<code>/cancel</code> — отменить текущее действие",
+      disable_web_page_preview=True,
+  )
+
+
 @router.message(Command("exverify"))
 async def cmd_exverify(message: Message, command: CommandObject):
   """Верифицировать ссылку обменщика: /exverify [offer_id]"""
